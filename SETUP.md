@@ -48,22 +48,30 @@ which `lc0` converts to ONNX:
    says `Policy: Attention` and `Value: WDL` — those are the tensor names
    `policy.cpp` expects.
 
-## 4. Get the NNUE weights
+## 4. Get the NNUE weights (and policy ONNX shortcut)
 
-The HalfKP-512x2-32-32 value net. Two options:
+Both the trained NNUE and the converted Lc0 policy are bundled in the repo's
+GitHub Release. `gh` (already auth'd if you cloned via `gh repo clone`):
 
-**Option A — Kaggle dataset** (recommended for a clean clone):
 ```bash
-pip install --user kaggle
-# Drop your kaggle.json into ~/.kaggle/ (see kaggle.com/settings -> API)
-kaggle datasets download -p data/ simbae11/eclipse-models
-unzip data/eclipse-models.zip -d data/
+gh release download v0.1.0 --pattern '*.nnue' --pattern 'policy.onnx' -D data/
+mv data/eclipse_v2_1.58M.nnue data/eclipse.nnue   # what UCI EvalFile expects
 ```
 
-**Option B — copy from another machine:**
+Alternatively grab them via plain HTTPS (no auth needed for public releases;
+this repo is private, so use `gh` until/unless you make it public):
+```
+https://github.com/SimbaE1/eclipse-chess-engine/releases/tag/v0.1.0
+```
+
+If you'd rather scp from another machine you've already built on:
 ```bash
 scp m1-air:/Users/ezra/TCEC/eclipse/data/eclipse.nnue data/
+scp m1-air:/Users/ezra/TCEC/eclipse/data/policy.onnx data/
 ```
+
+With the release in `data/`, you can skip step 3 (policy conversion) entirely —
+`policy.onnx` is the same artifact `lc0 leela2onnx` would produce.
 
 ## 5. Verify
 
