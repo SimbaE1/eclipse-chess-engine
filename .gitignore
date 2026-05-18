@@ -1,0 +1,25 @@
+# Build artifacts
+build/
+build-*/
+out/
+*.o
+*.obj
+*.a
+*.exe
+.cache/
+compile_commands.json
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Trained weights and training data (downloaded separately - see SETUP.md)
+data/
+# But DO commit benchmark PGNs (small text files documenting strength runs)
+!data/
+data/*
+!data/.gitkeep
+!data/*.pgn

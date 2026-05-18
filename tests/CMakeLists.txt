@@ -1,0 +1,16 @@
+function(eclipse_add_test name)
+    add_executable(${name} ${name}.cpp)
+    target_link_libraries(${name}
+        PRIVATE eclipse_core eclipse_warnings)
+    target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+eclipse_add_test(test_types)
+eclipse_add_test(test_bitboard)
+eclipse_add_test(test_attacks)
+eclipse_add_test(test_position)
+eclipse_add_test(test_perft)
+eclipse_add_test(test_search)
+eclipse_add_test(test_nnue)
+eclipse_add_test(test_eval_comparison)
