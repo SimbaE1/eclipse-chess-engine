@@ -62,6 +62,14 @@ struct Node {
     // as a visit that returned -1.0 from this child's perspective, which is
     // what dissuades other workers from selecting the same path while it's
     // in flight.
+    //
+    // Sign convention: Q() returns the child's W/N from the CHILD's STM
+    // perspective (= the parent's opponent). When the parent picks among its
+    // children it wants to MAXIMIZE its own expected outcome, which is the
+    // NEGATION of the child's. Hence the `-q` in the formula. Forgetting this
+    // negation makes the engine play moves that maximize the opponent's
+    // expected outcome — for example, refusing to capture a hanging piece
+    // because doing so makes the opponent's Q drop sharply.
     float puct_score(std::int32_t parent_n, float cpuct) const noexcept {
         const auto n  = N.load(std::memory_order_relaxed);
         const auto vl = virtual_loss.load(std::memory_order_relaxed);
@@ -74,8 +82,8 @@ struct Node {
             const float w_eff = W() - static_cast<float>(vl);
             q = w_eff / static_cast<float>(n_eff);
         }
-        return q + cpuct * P * std::sqrt(static_cast<float>(parent_n)) /
-                              (1.0f + static_cast<float>(n_eff));
+        return -q + cpuct * P * std::sqrt(static_cast<float>(parent_n)) /
+                               (1.0f + static_cast<float>(n_eff));
     }
 
     void apply_virtual_loss() noexcept {

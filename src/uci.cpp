@@ -102,6 +102,16 @@ void cmd_setoption(const std::vector<std::string>& tok) {
     } else if (name == "PolicyFile") {
         if (value.empty() || value == "<empty>") return;
         policy::load(value);
+    } else if (name == "PolicyMode") {
+        // "nnue" (default): each child is scored with NNUE static eval and
+        // priors come from softmax of the score differential. Microseconds
+        // per expansion. "onnx": legacy Lc0 transformer path; slower by ~3
+        // orders of magnitude but available for A/B testing.
+        if (value == "nnue" || value == "NNUE") {
+            policy::set_mode(policy::Mode::Nnue);
+        } else if (value == "onnx" || value == "ONNX") {
+            policy::set_mode(policy::Mode::Onnx);
+        }
     } else if (name == "Threads") {
         const int n = std::atoi(value.c_str());
         g_search_info.threads = std::clamp(n, 1, 128);

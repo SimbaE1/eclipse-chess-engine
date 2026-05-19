@@ -10,9 +10,18 @@
 
 namespace eclipse::policy {
 
-// Initialize the policy head (load weights if needed).
-// For now, this is a placeholder for the Lc0 distilled net.
+// Initialize the ONNX policy head (load weights if needed).
+// Only consulted when set_mode(Mode::Onnx) has been called.
 bool load(const std::string& path);
+
+// Source of move priors. Onnx routes through the Lc0 transformer
+// (~80ms per call, dominates NPS); Nnue runs the NNUE static eval on each
+// child (microseconds total) and softmaxes the resulting score differential.
+// The latter is the default — the whole point of NNUE+MCTS is to keep the
+// per-expansion cost bounded by a fast static eval.
+enum class Mode { Nnue, Onnx };
+void set_mode(Mode m) noexcept;
+Mode get_mode() noexcept;
 
 // Returns a probability distribution over all legal moves in the position.
 // The map keys are legal moves, and values are probabilities in [0, 1].

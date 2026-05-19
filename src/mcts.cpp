@@ -123,17 +123,21 @@ Move MCTS::search() {
     // its Q is good) and prior (PUCT exploration tilts visits toward priors
     // early). Tie-broken by Q to avoid picking a fluky-high-prior move that
     // happened to share visits with a better one.
+    //
+    // child->Q() is from the child's STM (= our opponent's) perspective, so a
+    // LOWER child Q is BETTER for us. Tie-break and final-score display both
+    // negate to report from our perspective.
     Node* best_child = nullptr;
     for (const auto& child : root->children) {
         if (!best_child) { best_child = child.get(); continue; }
         const auto cn = child->N.load(std::memory_order_relaxed);
         const auto bn = best_child->N.load(std::memory_order_relaxed);
-        if (cn > bn || (cn == bn && child->Q() > best_child->Q())) {
+        if (cn > bn || (cn == bn && child->Q() < best_child->Q())) {
             best_child = child.get();
         }
     }
     if (best_child) {
-        search_info.best_score = static_cast<Score>(best_child->Q() * 400.0f);
+        search_info.best_score = static_cast<Score>(-best_child->Q() * 400.0f);
         log_search_summary(*best_child, best_child->N.load(std::memory_order_relaxed));
         return best_child->move;
     }
@@ -186,10 +190,12 @@ void MCTS::worker_loop() {
                 const auto snap = snapshot_root_topk<3>(*root);
                 if (snap.filled > 0 && elapsed_ms > 0) {
                     // Main info line: nodes/nps/time/pv of best (most-visited).
+                    // Negate the child Q: it is stored from the child's STM
+                    // (our opponent's) perspective; UCI score is from us.
                     std::cout << "info nodes " << seen
                               << " nps "  << (seen * 1000 / elapsed_ms)
                               << " time " << elapsed_ms
-                              << " score cp " << static_cast<int>(snap.slots[0].q * 400.0f)
+                              << " score cp " << static_cast<int>(-snap.slots[0].q * 400.0f)
                               << " pv "   << snap.slots[0].m.to_uci()
                               << std::endl;
                     // Diagnostic line: top-3 root children with N / Q / prior.

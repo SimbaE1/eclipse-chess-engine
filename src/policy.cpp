@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "policy.hpp"
 #include "movegen.hpp"
+#include "nnue.hpp"
+#include "types.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -19,6 +21,10 @@ namespace {
 Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "EclipsePolicy");
 Ort::SessionOptions session_options;
 std::unique_ptr<Ort::Session> session;
+
+// Default to NNUE-derived priors; the ONNX path stays available for A/B and
+// can be re-enabled via the UCI `PolicyMode onnx` option.
+Mode g_mode = Mode::Nnue;
 
 const int kInputPlanes = 112;
 const int kBoardSize = 8;
@@ -273,7 +279,80 @@ RootInfo get_root_info(const Position& pos) {
     return result;
 }
 
+namespace {
+
+// Softmax temperature in centipawns. T=200 puts a 1-pawn improvement at
+// e^0.5 ≈ 1.65x prior weight and a queen-worth swing (~900cp) at e^4.5 ≈ 90x,
+// which roughly matches the spread Lc0's policy net gives in tactical
+// positions while keeping quiet moves close-to-uniform.
+constexpr float kPolicyTempCp   = 200.0f;
+// Clamp evaluations before the softmax so mate scores (which NNUE returns
+// near ±kMateScore) don't blow up exp(). 2000cp is "completely winning" —
+// any higher and the prior is effectively 1.0 anyway.
+constexpr float kMaxAbsPriorCp  = 2000.0f;
+
+std::map<Move, float> get_policy_nnue_impl(const Position& pos) {
+    MoveList moves;
+    Position temp = pos;
+    generate_legal_moves(temp, moves);
+
+    std::map<Move, float> distribution;
+    if (moves.size == 0) return distribution;
+
+    // Prime the accumulator so each do_move stays on the incremental fast
+    // path. If NNUE isn't loaded, evaluate() falls back to material eval and
+    // acc.computed stays false — that's fine, do_move just skips the
+    // accumulator update and refresh-on-read handles it lazily.
+    (void) nnue::evaluate(temp);
+
+    std::vector<float> evals(moves.size);
+    for (std::size_t i = 0; i < moves.size; ++i) {
+        StateInfo st;
+        temp.do_move(moves[i], st);
+        // nnue::evaluate returns the score from side-to-move's perspective.
+        // After do_move, side-to-move is the opponent, so we negate to get
+        // the score from *our* (the caller's) perspective. Higher = better.
+        const float v = -static_cast<float>(nnue::evaluate(temp));
+        evals[i] = std::clamp(v, -kMaxAbsPriorCp, kMaxAbsPriorCp);
+        temp.undo_move(moves[i], st);
+    }
+
+    // Numerically-stable softmax: subtract max before exp.
+    float max_v = evals[0];
+    for (float v : evals) if (v > max_v) max_v = v;
+
+    float sum = 0.0f;
+    for (float& v : evals) {
+        v = std::exp((v - max_v) / kPolicyTempCp);
+        sum += v;
+    }
+
+    if (sum > 0.0f) {
+        for (std::size_t i = 0; i < moves.size; ++i) {
+            distribution[moves[i]] = evals[i] / sum;
+        }
+    } else {
+        const float uniform = 1.0f / static_cast<float>(moves.size);
+        for (const Move m : moves) distribution[m] = uniform;
+    }
+    return distribution;
+}
+
+std::map<Move, float> get_policy_onnx_impl(const Position& pos);
+
+}  // namespace
+
+void set_mode(Mode m) noexcept { g_mode = m; }
+Mode get_mode() noexcept       { return g_mode; }
+
 std::map<Move, float> get_policy(const Position& pos) {
+    if (g_mode == Mode::Nnue) return get_policy_nnue_impl(pos);
+    return get_policy_onnx_impl(pos);
+}
+
+namespace {
+
+std::map<Move, float> get_policy_onnx_impl(const Position& pos) {
     if (!session || uci_to_idx.empty()) {
         // Fallback to uniform if no session or no map
         MoveList moves;
@@ -366,5 +445,6 @@ std::map<Move, float> get_policy(const Position& pos) {
     return distribution;
 }
 
-}  // namespace eclipse::policy
+}  // namespace
 
+}  // namespace eclipse::policy
