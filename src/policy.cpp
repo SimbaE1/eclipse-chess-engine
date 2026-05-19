@@ -155,14 +155,21 @@ void tensorize(const Position& pos, float* input) {
 bool load(const std::string& path) {
     std::cout << "info string Loading policy from: " << path << std::endl;
     try {
-        // Use every physical core for intra-op parallelism (matrix multiplies
-        // inside the transformer). 0 = let ORT pick, which on macOS resolves
-        // to physical core count. Inter-op stays at 1 because each call to
-        // get_policy()/get_root_info() runs one inference at a time anyway -
-        // dispatching multiple concurrent sessions would just thrash the cache.
-        // Combined with ORT_ENABLE_ALL graph optimization this is usually
-        // 3-5x faster than the defaults on Apple Silicon.
-        session_options.SetIntraOpNumThreads(0);
+        // IntraOpNumThreads=1: critical for multi-threaded MCTS. Each MCTS
+        // worker calls session.Run() concurrently from its own thread. If we
+        // let each Run() grab all cores (IntraOp=0), N workers contend over
+        // the same N cores and net throughput collapses to ~1-worker
+        // performance. With IntraOp=1, N workers can actually run in parallel
+        // on N cores. Costs ~3-5x on threads=1 workloads but is the right
+        // default for the Lichess-bot / production use case (Threads>=4).
+        //
+        // Inter-op stays at 1: we never run multiple ops of one model in
+        // parallel; concurrency comes from concurrent Run() calls, not from
+        // splitting a single inference.
+        //
+        // ORT_ENABLE_ALL graph optimization unchanged - cheap, helps both
+        // single- and multi-threaded paths.
+        session_options.SetIntraOpNumThreads(1);
         session_options.SetInterOpNumThreads(1);
         session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 

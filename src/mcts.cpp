@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <iomanip>
 #include <iostream>
 #include <thread>
 #include <vector>
@@ -15,9 +16,40 @@ namespace eclipse::mcts {
 
 namespace {
 
-// Logging cadence shared across workers. Cheap atomic CAS dance to make sure
-// only one thread emits an info line per 1024-iteration boundary; others skip.
-std::atomic<std::int64_t> g_last_info_at{0};
+// Logging cadence shared across workers. Time-based (1s) rather than node-based
+// because at low NPS (a few hundred per second on a single CPU thread without
+// SIMD) a 1024-node boundary takes 3-5s, which is useless for live monitoring.
+// CAS dance so only one thread emits per second; others skip.
+std::atomic<std::int64_t> g_last_info_ms{0};
+constexpr std::int64_t kInfoIntervalMs = 1000;
+
+// Snapshot of the top-K root children for an info line. K=3 keeps the line
+// short enough to fit in a UCI client's typical info panel.
+template <std::size_t K>
+struct RootSnapshot {
+    struct Entry { Move m; std::int32_t n; float q; float p; };
+    Entry slots[K]{};
+    std::size_t filled = 0;
+};
+
+template <std::size_t K>
+RootSnapshot<K> snapshot_root_topk(const Node& root) {
+    RootSnapshot<K> snap;
+    for (const auto& child : root.children) {
+        const auto n = child->N.load(std::memory_order_relaxed);
+        // Insertion sort into the top-K by N.
+        std::size_t pos = snap.filled;
+        while (pos > 0 && snap.slots[pos - 1].n < n) {
+            if (pos < K) snap.slots[pos] = snap.slots[pos - 1];
+            --pos;
+        }
+        if (pos < K) {
+            snap.slots[pos] = {child->move, n, child->Q(), child->P};
+            if (snap.filled < K) ++snap.filled;
+        }
+    }
+    return snap;
+}
 
 }  // namespace
 
@@ -33,7 +65,7 @@ Move MCTS::search() {
     }
 
     const int threads = std::clamp(search_info.threads, 1, 128);
-    g_last_info_at.store(0, std::memory_order_relaxed);
+    g_last_info_ms.store(0, std::memory_order_relaxed);
 
     // For threads=1 we stay on the calling thread to keep the codepath as
     // close to the previous behaviour as possible (useful for the test suite
@@ -47,6 +79,43 @@ Move MCTS::search() {
             workers.emplace_back([this] { worker_loop(); });
         }
         for (auto& w : workers) w.join();
+    }
+
+    // Proactive mate-in-1 sweep. We can't trust MCTS visit counts here: under
+    // tight visit budgets (test_search runs 4 iterations) or with weak priors,
+    // the mating move may have been visited zero times. Instead we just play
+    // every legal root move and check for immediate checkmate. Cost is
+    // bounded - one movegen per legal move, ~microseconds each, far cheaper
+    // than a single MCTS iteration's ONNX call.
+    {
+        MoveList moves;
+        Position scratch = root_pos;
+        generate_legal_moves(scratch, moves);
+        for (const Move m : moves) {
+            StateInfo st;
+            Position after = root_pos;
+            after.do_move(m, st);
+            MoveList opp_replies;
+            generate_legal_moves(after, opp_replies);
+            if (opp_replies.size == 0 && after.in_check()) {
+                // Opp has no legal reply and is in check -> checkmate by `m`.
+                search_info.best_score = static_cast<Score>(kMateScore - 1);
+                // Find the matching child for logging if it was expanded.
+                Node* mating = nullptr;
+                for (const auto& c : root->children) {
+                    if (c->move == m) { mating = c.get(); break; }
+                }
+                if (mating) {
+                    log_search_summary(*mating,
+                        mating->N.load(std::memory_order_relaxed));
+                } else {
+                    std::cout << "info string mate-in-1 found by sweep: "
+                              << m.to_uci() << " (MCTS did not visit)"
+                              << std::endl;
+                }
+                return m;
+            }
+        }
     }
 
     // Best move = most-visited root child. Visit count is the standard MCTS
@@ -65,9 +134,27 @@ Move MCTS::search() {
     }
     if (best_child) {
         search_info.best_score = static_cast<Score>(best_child->Q() * 400.0f);
+        log_search_summary(*best_child, best_child->N.load(std::memory_order_relaxed));
         return best_child->move;
     }
     return MoveNone;
+}
+
+void MCTS::log_search_summary(const Node& chosen, std::int32_t chosen_visits) const {
+    // End-of-search diagnostic: top-5 root children sorted by visit count.
+    // Lets the operator see whether the chosen move dominated by a wide
+    // margin (engine confident) or barely beat alternatives (engine guessing).
+    const auto snap = snapshot_root_topk<5>(*root);
+    std::cout << "info string final root (chose " << chosen.move.to_uci()
+              << " N=" << chosen_visits << "):";
+    for (std::size_t i = 0; i < snap.filled; ++i) {
+        const auto& e = snap.slots[i];
+        std::cout << "  " << e.m.to_uci()
+                  << " N=" << e.n
+                  << " Q=" << std::fixed << std::setprecision(3) << e.q
+                  << " P=" << std::fixed << std::setprecision(3) << e.p;
+    }
+    std::cout << std::endl;
 }
 
 void MCTS::worker_loop() {
@@ -86,28 +173,36 @@ void MCTS::worker_loop() {
             break;
         }
 
-        // Emit an info line every ~1024 iterations. CAS so only one thread
-        // does the printing per boundary, even with N workers racing.
-        if ((seen & 0x3FF) == 0) {
-            auto prev = g_last_info_at.load(std::memory_order_relaxed);
-            if (seen > prev &&
-                g_last_info_at.compare_exchange_strong(
-                    prev, seen, std::memory_order_relaxed)) {
-                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - search_info.start_time).count();
-                if (elapsed > 0) {
-                    Node* bc = nullptr;
-                    std::int32_t bn = -1;
-                    for (const auto& child : root->children) {
-                        const auto cn = child->N.load(std::memory_order_relaxed);
-                        if (cn > bn) { bn = cn; bc = child.get(); }
+        // Time-based info emission: at most one line per kInfoIntervalMs across
+        // all workers. Sample only every 128 iterations to keep clock reads
+        // cheap, then CAS-race to be the printer if enough time has passed.
+        if ((seen & 0x7F) == 0) {
+            const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - search_info.start_time).count();
+            auto prev_ms = g_last_info_ms.load(std::memory_order_relaxed);
+            if (elapsed_ms - prev_ms >= kInfoIntervalMs &&
+                g_last_info_ms.compare_exchange_strong(
+                    prev_ms, elapsed_ms, std::memory_order_relaxed)) {
+                const auto snap = snapshot_root_topk<3>(*root);
+                if (snap.filled > 0 && elapsed_ms > 0) {
+                    // Main info line: nodes/nps/time/pv of best (most-visited).
+                    std::cout << "info nodes " << seen
+                              << " nps "  << (seen * 1000 / elapsed_ms)
+                              << " time " << elapsed_ms
+                              << " score cp " << static_cast<int>(snap.slots[0].q * 400.0f)
+                              << " pv "   << snap.slots[0].m.to_uci()
+                              << std::endl;
+                    // Diagnostic line: top-3 root children with N / Q / prior.
+                    // Cheap; only fires once per second.
+                    std::cout << "info string root:";
+                    for (std::size_t i = 0; i < snap.filled; ++i) {
+                        const auto& e = snap.slots[i];
+                        std::cout << "  " << e.m.to_uci()
+                                  << " N=" << e.n
+                                  << " Q=" << std::fixed << std::setprecision(3) << e.q
+                                  << " P=" << std::fixed << std::setprecision(3) << e.p;
                     }
-                    if (bc) {
-                        std::cout << "info nodes " << seen
-                                  << " nps " << (seen * 1000 / elapsed)
-                                  << " pv "   << bc->move.to_uci()
-                                  << std::endl;
-                    }
+                    std::cout << std::endl;
                 }
             }
         }

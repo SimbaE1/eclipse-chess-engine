@@ -12,9 +12,14 @@
 namespace eclipse {
 
 struct SearchLimits {
-    int     depth     = 64;   // max iterative-deepening depth
-    int64_t time_ms   = 0;    // soft time bound; 0 = unlimited
-    int64_t nodes     = 0;    // node bound; 0 = unlimited (not enforced yet)
+    // 0 means unlimited for all three numeric bounds. depth is reinterpreted
+    // as a visit ceiling under MCTS (see mcts.cpp worker_loop). Leaving the
+    // default non-zero used to silently cap every search at 64 visits,
+    // starving the policy net of any real search budget regardless of the
+    // movetime/time-control the GUI sent.
+    int     depth     = 0;
+    int64_t time_ms   = 0;
+    int64_t nodes     = 0;
     bool    infinite  = false;
 };
 

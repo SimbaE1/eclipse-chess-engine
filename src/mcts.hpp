@@ -97,6 +97,7 @@ private:
     void   iterate();
     void   expand_under_lock(Node* node, const Position& pos);
     float  evaluate_node(const Position& pos);
+    void   log_search_summary(const Node& chosen, std::int32_t chosen_visits) const;
 
     Position&   root_pos;
     SearchInfo& search_info;
