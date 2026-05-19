@@ -73,6 +73,7 @@ void cmd_uci() {
               << "id author " << kEngineAuthor << '\n'
               << "option name EvalFile type string default <empty>\n"
               << "option name PolicyFile type string default <empty>\n"
+              << "option name Threads type spin default 1 min 1 max 128\n"
               << "uciok" << std::endl;
 }
 
@@ -101,6 +102,9 @@ void cmd_setoption(const std::vector<std::string>& tok) {
     } else if (name == "PolicyFile") {
         if (value.empty() || value == "<empty>") return;
         policy::load(value);
+    } else if (name == "Threads") {
+        const int n = std::atoi(value.c_str());
+        g_search_info.threads = std::clamp(n, 1, 128);
     }
     // Unknown options are silently ignored per UCI convention.
 }
