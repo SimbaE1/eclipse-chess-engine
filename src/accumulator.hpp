@@ -16,7 +16,7 @@ namespace eclipse::nnue {
 // Per-perspective hidden width of the feature transformer. Must stay in sync
 // with the constant referenced from nnue.cpp + the .nnue file header; the
 // loader cross-checks it at load time.
-constexpr int kFtOutSize = 512;
+constexpr int kFtOutSize = 1024;
 
 // One accumulator per perspective. The two perspectives share weights but are
 // indexed differently (king-relative + own/opp color), so we keep them as

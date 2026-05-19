@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 """
-HalfKP-256x2-32-32 training loop for Eclipse.
+HalfKAv2-1024x2-128-32 training loop for Eclipse.
 
 The model here is the float32 mirror of the inference path in src/nnue.cpp.
 After training, save state_dict (.pt) and convert with:
@@ -53,16 +53,23 @@ except ImportError:
     sys.exit(1)
 
 # Mirror src/nnue.hpp - any drift here = silently wrong inference.
-FT_IN_FEATURES = 40960
-FT_OUT         = 512                 # keep in sync with kFtOutSize in src/nnue.hpp
-L1_IN          = 2 * FT_OUT
-L1_OUT         = 32
+#
+# HalfKAv2 feature set (Stockfish-style):
+#   For each (own_king_sq, piece_sq) there are 11 piece-type slots:
+#     0..4 : own pieces (P, N, B, R, Q) -- own king is NOT encoded since it
+#            always sits at the indexing king square (the feature would be
+#            constant, redundant).
+#     5..10: opponent pieces (P, N, B, R, Q, K) -- opp king IS a feature.
+#   Total per perspective: 64 * 64 * 11 = 45056.
+FT_IN_FEATURES = 45056
+FT_OUT         = 1024                # keep in sync with kFtOutSize in src/nnue.hpp
+L1_IN          = 2 * FT_OUT          # 2048 (concat of both perspectives)
+L1_OUT         = 128
 L2_OUT         = 32
 L3_OUT         = 1
 
-# Piece-on-square encoding constants (mirror feature_index in src/nnue.cpp).
-PIECE_TYPES_INDEXED = 5     # P, N, B, R, Q (no king)
-PIECE_COLORS        = 2     # same / opposite as perspective
+# Piece-type slots within a (king_sq, piece_sq) cell. See FT_IN_FEATURES.
+N_PIECE_SLOTS  = 11
 
 
 # ---------------------------------------------------------------------------
@@ -97,20 +104,34 @@ def parse_fen_board(fen_board: str):
 
 
 def feature_index(king_sq: int, piece_sq: int, pt: int, piece_is_ours: bool) -> int:
-    """Must match feature_index() in src/nnue.cpp."""
-    p_idx = pt - 1
-    own = 0 if piece_is_ours else 1
-    return (king_sq * 64 * PIECE_TYPES_INDEXED * PIECE_COLORS
-            + piece_sq * PIECE_TYPES_INDEXED * PIECE_COLORS
-            + p_idx * PIECE_COLORS
-            + own)
+    """HalfKAv2 feature index. Must match feature_index() in src/nnue.cpp.
+
+    Slot layout within each (king_sq, piece_sq) cell:
+        ours:    0..4   (P=0, N=1, B=2, R=3, Q=4; own king is invalid)
+        theirs:  5..10  (P=5, N=6, B=7, R=8, Q=9, K=10)
+
+    Returns a value in [0, FT_IN_FEATURES). Raises ValueError if asked to
+    encode the own king (caller must skip it -- own king is implicit at the
+    indexing king square).
+    """
+    if piece_is_ours and pt == 6:
+        raise ValueError("own king is not a HalfKAv2 feature; skip it in the caller")
+    if piece_is_ours:
+        slot = pt - 1                  # P=0 .. Q=4
+    else:
+        slot = 5 + (pt - 1)             # P=5 .. K=10
+    return king_sq * (64 * N_PIECE_SLOTS) + piece_sq * N_PIECE_SLOTS + slot
 
 
 def fen_to_features(fen: str):
-    """Returns (us_indices, them_indices), each a list of HalfKP feature
+    """Returns (us_indices, them_indices), each a list of HalfKAv2 feature
     indices for the corresponding perspective.
 
     The C++ uses 0=White / 1=Black perspectives. "us" here is the side to move.
+
+    HalfKAv2 vs HalfKP: kings ARE features (specifically, the opponent's king
+    from each perspective; the own king is skipped because it's pinned at the
+    indexing king square).
     """
     parts = fen.split()
     board, stm = parts[0], parts[1]
@@ -134,10 +155,11 @@ def fen_to_features(fen: str):
         if persp_color == 1:  # Black perspective: mirror
             ksq = _FLIP_RANK(ksq)
         for sq, color, pt in pieces:
-            if pt == 6:
-                continue  # king is implicit
-            psq = sq if persp_color == 0 else _FLIP_RANK(sq)
             is_ours = (color == persp_color)
+            # Skip own king: HalfKAv2 doesn't encode it (would be a constant).
+            if is_ours and pt == 6:
+                continue
+            psq = sq if persp_color == 0 else _FLIP_RANK(sq)
             indices[persp].append(feature_index(ksq, psq, pt, is_ours))
 
     # Order [us, them] from side-to-move's perspective.

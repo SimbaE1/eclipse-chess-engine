@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 """
-HalfKP-256x2-32-32 weight packer for Eclipse's .nnue binary format.
+HalfKAv2-1024x2-128-32 weight packer for Eclipse's .nnue binary format.
 
 This script is the bridge between PyTorch training and the C++ inference path.
 It has two modes:
@@ -12,13 +12,13 @@ It has two modes:
                 values will hover near 0cp.
 
   from-torch  - convert a trained PyTorch state_dict (.pt) into Eclipse's
-                quantized binary format. Use this once you've trained a HalfKP
-                model with a layout matching the C++ side:
-                    ft.weight        shape [256, 40960]   (PyTorch convention)
-                    ft.bias          shape [256]
-                    l1.weight        shape [32, 512]
-                    l1.bias          shape [32]
-                    l2.weight        shape [32, 32]
+                quantized binary format. Use this once you've trained a
+                HalfKAv2 model with a layout matching the C++ side:
+                    ft.weight        shape [1024, 45056]  (PyTorch convention)
+                    ft.bias          shape [1024]
+                    l1.weight        shape [128, 2048]
+                    l1.bias          shape [128]
+                    l2.weight        shape [32, 128]
                     l2.bias          shape [32]
                     l3.weight        shape [1, 32]
                     l3.bias          shape [1]
@@ -37,13 +37,15 @@ from pathlib import Path
 import numpy as np
 
 # These must mirror the constants in src/nnue.hpp. If you bump the C++ side,
-# bump here too or the loader will reject the file.
-MAGIC               = 0xECCC0002
+# bump here too or the loader will reject the file. Magic was bumped when the
+# feature set switched from HalfKP (40960 features, 5 piece types per cell)
+# to HalfKAv2 (45056 features, 11 piece-type slots including opp king).
+MAGIC               = 0xECCC0003
 VERSION             = 1
-FT_IN_FEATURES      = 40960          # HalfKP: 64 * 64 * 5 * 2
-FT_OUT              = 512            # keep in sync with kFtOutSize in src/nnue.hpp
-L1_IN               = 2 * FT_OUT     # 1024 (concat of both perspectives)
-L1_OUT              = 32
+FT_IN_FEATURES      = 45056          # HalfKAv2: 64 * 64 * 11
+FT_OUT              = 1024           # keep in sync with kFtOutSize in src/nnue.hpp
+L1_IN               = 2 * FT_OUT     # 2048 (concat of both perspectives)
+L1_OUT              = 128
 L2_OUT              = 32
 L3_OUT              = 1
 
@@ -71,7 +73,7 @@ def _saturating_int(arr: np.ndarray, lo: int, hi: int, dtype: np.dtype, name: st
 
 
 def quantize_ft(weight_fp: np.ndarray, bias_fp: np.ndarray):
-    """Feature transformer: weight [256, 40960] / bias [256] (PyTorch shape).
+    """Feature transformer: weight [FT_OUT, FT_IN_FEATURES] / bias [FT_OUT].
 
     The accumulator stores values that, after clipped-ReLU at FT_QUANT, become
     "fixed-point with denominator FT_QUANT". So we encode `real_value * FT_QUANT`

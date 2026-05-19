@@ -16,16 +16,16 @@ namespace eclipse::nnue {
 
 namespace {
 
-// File format - bumped from the float32 tiny NNUE.
+// File format.
 //
 // Layout (little-endian, packed):
-//   uint32  magic            (kMagic)
+//   uint32  magic            (kMagic; bumped to 0xECCC0003 for HalfKAv2)
 //   uint32  version          (kVersion)
-//   uint32  ft_in_features   (must equal kFtNumFeatures)
-//   uint32  ft_out           (must equal kFtOutSize, per perspective)
-//   uint32  l1_out           (must equal kL1OutSize)
-//   uint32  l2_out           (must equal kL2OutSize)
-//   uint32  l3_out           (must equal kL3OutSize)
+//   uint32  ft_in_features   (must equal kFtNumFeatures = 45056)
+//   uint32  ft_out           (must equal kFtOutSize = 1024, per perspective)
+//   uint32  l1_out           (must equal kL1OutSize = 128)
+//   uint32  l2_out           (must equal kL2OutSize = 32)
+//   uint32  l3_out           (must equal kL3OutSize = 1)
 //   float   output_cp_per_unit   - centipawns per real-unit of L3 output;
 //                                  see kOutputCpDivisor explanation below
 //   int16   ft_b[ft_out]
@@ -37,8 +37,13 @@ namespace {
 //   int32   l3_b[l3_out]
 //   int8    l3_w[l3_out * l2_out]
 //
-// Total size for the spec dims: ~20.97 MB (FT weights dominate at 40960*256*2).
-constexpr std::uint32_t kMagic   = 0xECCC0002;
+// Total size for the spec dims: ~92.5 MB (FT weights dominate at
+// 45056*1024*2 = 88.0 MB).
+// Magic bumped when the feature set switched from HalfKP (40960 features,
+// 5 piece types * 2 colors) to HalfKAv2 (45056 features, 11 piece-type
+// slots including opp king). Old eclipse.nnue files now fail to load with
+// a clear "bad magic" message instead of silently producing garbage evals.
+constexpr std::uint32_t kMagic   = 0xECCC0003;
 constexpr std::uint32_t kVersion = 1;
 
 // L3 produces `out ~= y_real * kWeightScale * kFtQuant` because we don't shift
@@ -101,15 +106,19 @@ void reset_state() noexcept {
 
 int feature_index(Square king_sq, Square piece_sq,
                   PieceType pt, bool piece_is_ours) noexcept {
-    // HalfKP order: king * (64*5*2) + piece_sq * (5*2) + (pt-1)*2 + own/opp
-    // Strides match the "innermost = color, middle = piece type, outer = piece
-    // square, outermost = king square" layout, which keeps every per-king block
-    // contiguous and ~5 KB - good cache behaviour during refresh.
-    const int p_idx = static_cast<int>(pt) - 1;  // Pawn=1 -> 0, ..., Queen=5 -> 4
-    return static_cast<int>(king_sq) * (kFtPieceSquares * kFtPieceTypes * kFtPieceColors)
-         + static_cast<int>(piece_sq) * (kFtPieceTypes * kFtPieceColors)
-         + p_idx * kFtPieceColors
-         + (piece_is_ours ? 0 : 1);
+    // HalfKAv2 slot layout within each (king_sq, piece_sq) cell:
+    //   0..4  : own  (P,N,B,R,Q)        -- own king must NOT be passed here
+    //   5..10 : opp  (P,N,B,R,Q,K)
+    //
+    // Stride order is "innermost = type slot, middle = piece square, outer =
+    // king square". That keeps every per-king block (64 squares * 11 slots = 704
+    // FT columns = ~1.4 KB at FT_OUT=1024) contiguous for refresh, and the
+    // hot per-piece path only touches one cache line worth of weight indices.
+    const int p_idx = static_cast<int>(pt) - 1;  // Pawn=1 -> 0, ..., King=6 -> 5
+    const int slot  = piece_is_ours ? p_idx : (5 + p_idx);
+    return static_cast<int>(king_sq) * (kFtPieceSquares * kFtPieceTypeSlots)
+         + static_cast<int>(piece_sq) * kFtPieceTypeSlots
+         + slot;
 }
 
 // ---- Loader ---------------------------------------------------------------
@@ -209,7 +218,7 @@ bool load(const std::string& path) {
 
     g_loaded = true;
     std::cout << "info string NNUE loaded: " << path
-              << " (HalfKP-" << kFtOutSize << "x2-" << kL1OutSize << '-' << kL2OutSize
+              << " (HalfKAv2-" << kFtOutSize << "x2-" << kL1OutSize << '-' << kL2OutSize
               << ", output_cp/unit=" << g_output_cp_per_unit << ")" << std::endl;
     return true;
 }
@@ -231,20 +240,23 @@ void apply_piece(Accumulator& acc, const Position& pos,
                  Color c, PieceType pt, Square sq) noexcept {
     static_assert(Sign == 1 || Sign == -1, "Sign must be +1 or -1");
     if (!g_loaded) return;
-    if (pt == King) return;  // King is implicit (defines perspective), no FT column.
 
     for (std::size_t persp = 0; persp < 2; ++persp) {
         const Color persp_color = (persp == 0) ? White : Black;
+        const bool  is_ours     = (c == persp_color);
+        // HalfKAv2 skip: own king is implicit at the indexing king square,
+        // so we don't have a column for it. The opp king IS a feature.
+        if (is_ours && pt == King) continue;
+
         Square king_sq  = pos.king_square(persp_color);
         Square piece_sq = sq;
-        // HalfKP mirror convention: Black perspective sees everything flipped
-        // so the network always reasons in own-side-of-board coordinates.
+        // Mirror convention: Black perspective sees everything flipped so the
+        // network always reasons in own-side-of-board coordinates.
         if (persp_color == Black) {
             king_sq  = flip_rank(king_sq);
             piece_sq = flip_rank(piece_sq);
         }
-        const bool is_ours = (c == persp_color);
-        const int  idx     = feature_index(king_sq, piece_sq, pt, is_ours);
+        const int  idx = feature_index(king_sq, piece_sq, pt, is_ours);
         const std::int16_t* col =
             &g_ft_w[static_cast<std::size_t>(idx) * kFtOutSize];
         for (std::size_t i = 0; i < kFtOutSize; ++i) {
@@ -274,13 +286,15 @@ void refresh(const Position& pos, Accumulator& acc) noexcept {
         return;
     }
 
-    // Fill both perspectives. Each one runs over the entire occupancy (minus
-    // kings) and accumulates the king-relative feature column for every piece.
+    // Fill both perspectives. Each one runs over the entire occupancy and
+    // accumulates the king-relative feature column for every piece EXCEPT
+    // the perspective side's own king (which is implicit). Opp king is a
+    // normal feature.
     for (std::size_t persp = 0; persp < 2; ++persp) {
         const Color persp_color = (persp == 0) ? White : Black;
         Square king_sq = pos.king_square(persp_color);
-        // HalfKP convention: mirror everything to the Black-side frame when the
-        // perspective is Black, so the network always sees pawns advancing up.
+        // Mirror everything to the Black-side frame when the perspective is
+        // Black, so the network always sees pawns advancing up.
         if (persp_color == Black) king_sq = flip_rank(king_sq);
 
         // Start from the FT bias.
@@ -292,12 +306,12 @@ void refresh(const Position& pos, Accumulator& acc) noexcept {
             const Square    s        = pop_lsb(occ);
             const Piece     p        = pos.piece_on(s);
             const PieceType pt       = type_of(p);
-            if (pt == King) continue;  // King is implicit (defines perspective)
+            const Color     pc       = color_of(p);
+            const bool      is_ours  = (pc == persp_color);
+            if (is_ours && pt == King) continue;  // own king is implicit
 
-            const Color  piece_color = color_of(p);
-            Square       piece_sq    = s;
+            Square piece_sq = s;
             if (persp_color == Black) piece_sq = flip_rank(piece_sq);
-            const bool   is_ours     = (piece_color == persp_color);
 
             const int idx = feature_index(king_sq, piece_sq, pt, is_ours);
             const std::int16_t* col =

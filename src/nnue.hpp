@@ -1,17 +1,23 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// HalfKP-256x2-32-32 NNUE evaluation.
+// HalfKAv2-1024x2-128-32 NNUE evaluation.
 //
-// Architecture (Stockfish-classic shape):
-//   Input features: HalfKP - king-relative, perspective-doubled.
-//     Per-perspective: 64 king-sq * 64 piece-sq * 5 piece-types (P,N,B,R,Q) * 2 colors = 40960
-//     King is implicit (defines the perspective), not a feature itself.
-//   Feature transformer: 40960 -> 256, int16 weights + bias.
-//   Concatenation: [accumulator_us, accumulator_them] -> 512
-//   Activation: clipped ReLU [0, kFtQuant=127] -> uint8[512]
-//   L1: 512 -> 32, int8 weights, int32 bias.
-//   L2:  32 -> 32, int8 weights, int32 bias.
-//   L3:  32 -> 1,  int8 weights, int32 bias -> centipawns.
+// Architecture (Stockfish-modern shape):
+//   Input features: HalfKAv2 - king-relative, perspective-doubled.
+//     Per-perspective: 64 king-sq * 64 piece-sq * 11 piece-type slots = 45056
+//       Slots 0..4 : own (P,N,B,R,Q). Own king is NOT a feature -- it always
+//                    sits at the indexing king square so the feature would be
+//                    constant. Skipping it saves ~9% of the FT table size and
+//                    matches Stockfish's HalfKAv2.
+//       Slots 5..10: opp (P,N,B,R,Q,K). Opp king IS a feature, which gives
+//                    the network direct information about the opposing king's
+//                    distance / mating geometry that plain HalfKP lacked.
+//   Feature transformer: 45056 -> 1024, int16 weights + bias.
+//   Concatenation: [accumulator_us, accumulator_them] -> 2048
+//   Activation: clipped ReLU [0, kFtQuant=127] -> uint8[2048]
+//   L1: 2048 -> 128, int8 weights, int32 bias.
+//   L2:  128 -> 32,  int8 weights, int32 bias.
+//   L3:   32 -> 1,   int8 weights, int32 bias -> centipawns.
 //
 // Phase 1: scalar forward pass, non-incremental (recompute accumulator per eval).
 // Phase 2: incremental updates wired through StateInfo / do_move / undo_move.
@@ -36,18 +42,19 @@ namespace eclipse::nnue {
 // ---- Architecture constants ------------------------------------------------
 // kFtOutSize is defined in accumulator.hpp.
 
-constexpr int kL1InSize         = 2 * kFtOutSize; // = 1024
-constexpr int kL1OutSize        = 32;
+constexpr int kL1InSize         = 2 * kFtOutSize; // = 2048
+constexpr int kL1OutSize        = 128;
 constexpr int kL2OutSize        = 32;
 constexpr int kL3OutSize        = 1;
 
 constexpr int kFtKingSquares    = 64;
 constexpr int kFtPieceSquares   = 64;
-// 5 = {P, N, B, R, Q}, no king as a feature.
-constexpr int kFtPieceTypes     = 5;
-constexpr int kFtPieceColors    = 2;
+// HalfKAv2 piece-type slots per (king_sq, piece_sq) cell:
+//   0..4 : own  (P, N, B, R, Q)          -- 5 slots; own king is implicit
+//   5..10: theirs (P, N, B, R, Q, K)     -- 6 slots; opp king IS a feature
+constexpr int kFtPieceTypeSlots = 11;
 constexpr int kFtNumFeatures    =
-    kFtKingSquares * kFtPieceSquares * kFtPieceTypes * kFtPieceColors;  // = 40960
+    kFtKingSquares * kFtPieceSquares * kFtPieceTypeSlots;  // = 45056
 
 // ---- Quantization constants ------------------------------------------------
 //
@@ -77,19 +84,21 @@ constexpr std::int32_t kOutputScale     = 16;
 // Accumulator is defined in accumulator.hpp (so position.hpp can hold one
 // without circular include).
 
-// HalfKP feature index for a single piece-on-square, relative to the king
+// HalfKAv2 feature index for a single piece-on-square, relative to the king
 // square of the given perspective. Returns a value in [0, kFtNumFeatures).
 //
 // `perspective`     - which side is "us" (the king whose square indexes features)
 // `king_sq`         - king square for the perspective side (already mirrored
 //                     for Black inside the caller)
 // `piece_sq`        - square of the piece being indexed (mirrored for Black)
-// `pt`              - piece type (must be in {Pawn..Queen})
+// `pt`              - piece type. Can be {Pawn..King} EXCEPT the own king,
+//                     which the caller must skip (own king is implicit at
+//                     the indexing king square).
 // `piece_is_ours`   - true if the piece belongs to the perspective side
 //
-// The mirroring convention matches Stockfish HalfKP: for Black perspective,
-// every square is reflected vertically (sq ^ 56) so the network always sees
-// the position from its own side of the board.
+// The mirroring convention matches Stockfish: for Black perspective every
+// square is reflected vertically (sq ^ 56) so the network always sees the
+// position from its own side of the board.
 int feature_index(Square king_sq, Square piece_sq,
                   PieceType pt, bool piece_is_ours) noexcept;
 
