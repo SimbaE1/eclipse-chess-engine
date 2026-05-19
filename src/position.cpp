@@ -285,16 +285,23 @@ bool Position::is_square_attacked(Square s, Color by) const noexcept {
     // A pawn of color `by` attacks `s` iff a pawn of color `by` sits on a
     // square from which it could capture toward `s`. By symmetry, those
     // squares are exactly pawn_attacks(~by, s).
-    if (pawn_attacks  (~by, s) & by_piece_[make_piece(by, Pawn)])               return true;
-    if (knight_attacks(s)      & by_piece_[make_piece(by, Knight)])             return true;
-    if (king_attacks  (s)      & by_piece_[make_piece(by, King)])               return true;
-    const Bitboard bishops_queens =
-        by_piece_[make_piece(by, Bishop)] | by_piece_[make_piece(by, Queen)];
-    if (bishop_attacks(s, occ) & bishops_queens)                                return true;
-    const Bitboard rooks_queens =
-        by_piece_[make_piece(by, Rook)]   | by_piece_[make_piece(by, Queen)];
-    if (rook_attacks  (s, occ) & rooks_queens)                                  return true;
+    if (pawn_attacks  (~by, s) & pieces(by, Pawn))               return true;
+    if (knight_attacks(s)      & pieces(by, Knight))             return true;
+    if (king_attacks  (s)      & pieces(by, King))               return true;
+    const Bitboard bishops_queens = pieces(by, Bishop) | pieces(by, Queen);
+    if (bishop_attacks(s, occ) & bishops_queens)                 return true;
+    const Bitboard rooks_queens   = pieces(by, Rook)   | pieces(by, Queen);
+    if (rook_attacks  (s, occ) & rooks_queens)                   return true;
     return false;
+}
+
+Bitboard Position::attackers_to(Square s, Bitboard occ) const noexcept {
+    return (pawn_attacks(Black, s) & pieces(White, Pawn))
+         | (pawn_attacks(White, s) & pieces(Black, Pawn))
+         | (knight_attacks(s)      & (pieces(White, Knight) | pieces(Black, Knight)))
+         | (rook_attacks(s, occ)   & (pieces(White, Rook)   | pieces(Black, Rook)   | pieces(White, Queen) | pieces(Black, Queen)))
+         | (bishop_attacks(s, occ) & (pieces(White, Bishop) | pieces(Black, Bishop) | pieces(White, Queen) | pieces(Black, Queen)))
+         | (king_attacks(s)        & (pieces(White, King)   | pieces(Black, King)));
 }
 
 void Position::do_move(Move m, StateInfo& st) {

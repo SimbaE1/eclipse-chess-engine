@@ -11,6 +11,7 @@
 #include "eval.hpp"
 #include "movegen.hpp"
 #include "policy.hpp"
+#include "see.hpp"
 
 namespace eclipse::mcts {
 
@@ -193,11 +194,13 @@ void MCTS::worker_loop() {
         const auto seen = search_info.nodes_searched.fetch_add(
             1, std::memory_order_relaxed) + 1;
 
-        // Visit-count budget (UCI `go depth N` is reinterpreted as a visit
-        // ceiling under MCTS; alpha-beta depth doesn't translate). Hit on
-        // any worker stops everyone.
         if (search_info.limits.depth > 0 &&
             seen >= search_info.limits.depth) {
+            search_info.stop.store(true, std::memory_order_relaxed);
+            break;
+        }
+        if (search_info.limits.nodes > 0 &&
+            seen >= search_info.limits.nodes) {
             search_info.stop.store(true, std::memory_order_relaxed);
             break;
         }
@@ -351,9 +354,27 @@ void MCTS::expand_under_lock(Node* node, const Position& pos) {
         }
     }
 
+    float sum_p = 0.0f;
+    std::vector<float> filtered_priors;
+    filtered_priors.reserve(moves.size);
+
     for (const Move m : moves) {
-        const float p = priors.count(m) ? priors.at(m) : 0.0f;
-        node->children.push_back(std::make_unique<Node>(m, node, p));
+        float p = priors.count(m) ? priors.at(m) : 0.0f;
+        
+        // Tactical filtering: if move loses material according to SEE, reduce prior.
+        // We only do this for captures or if the side to move is not in check.
+        if (!pos.in_check() && !see_ge(pos, m, 0)) {
+            p *= 0.1f;
+        }
+        
+        filtered_priors.push_back(p);
+        sum_p += p;
+    }
+
+    // Re-normalize and create children.
+    for (int i = 0; i < moves.size; ++i) {
+        const float p = (sum_p > 0.0f) ? (filtered_priors[static_cast<std::size_t>(i)] / sum_p) : (1.0f / static_cast<float>(moves.size));
+        node->children.push_back(std::make_unique<Node>(moves[static_cast<std::size_t>(i)], node, p));
     }
 
     // Release ordering ensures other threads that acquire-load is_expanded

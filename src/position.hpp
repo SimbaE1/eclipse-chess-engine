@@ -73,6 +73,10 @@ public:
     // True iff the given square is attacked by any piece of color `by`.
     bool is_square_attacked(Square s, Color by) const noexcept;
 
+    // Returns a bitboard of all pieces (both colors) that attack square `s` given
+    // the occupancy `occ`.
+    Bitboard attackers_to(Square s, Bitboard occ) const noexcept;
+
     // True iff the side to move's king is in check.
     bool in_check() const noexcept {
         return is_square_attacked(king_square(stm_), ~stm_);

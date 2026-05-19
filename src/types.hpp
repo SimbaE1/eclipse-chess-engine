@@ -125,4 +125,22 @@ constexpr CastlingRights& operator&=(CastlingRights& a, CastlingRights b) noexce
     return a;
 }
 
+// Centipawn values for piece types, used for SEE and move ordering.
+constexpr int kPieceValue[PieceTypeNB] = {
+    0,     // NoPieceType
+    100,   // Pawn
+    320,   // Knight
+    330,   // Bishop
+    500,   // Rook
+    900,   // Queen
+    20000, // King
+    0,
+};
+
+using Score = int;
+constexpr Score kInfinite       = 30000;
+constexpr Score kMateScore      = 29000;
+constexpr Score kMateInMaxPly   = kMateScore - 1000;
+constexpr Score kDraw           = 0;
+
 }  // namespace eclipse

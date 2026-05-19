@@ -305,16 +305,27 @@ std::map<Move, float> get_policy_nnue_impl(const Position& pos) {
     // accumulator update and refresh-on-read handles it lazily.
     (void) nnue::evaluate(temp);
 
-    std::vector<float> evals(moves.size);
-    for (std::size_t i = 0; i < moves.size; ++i) {
+    std::vector<nnue::Accumulator> accs(static_cast<std::size_t>(moves.size));
+    std::vector<Color> stms(static_cast<std::size_t>(moves.size));
+    for (int i = 0; i < moves.size; ++i) {
         StateInfo st;
         temp.do_move(moves[i], st);
-        // nnue::evaluate returns the score from side-to-move's perspective.
+        accs[static_cast<std::size_t>(i)] = temp.accumulator();
+        // After do_move, side_to_move is the opponent.
+        stms[static_cast<std::size_t>(i)] = temp.side_to_move();
+        temp.undo_move(moves[i], st);
+    }
+
+    std::vector<Score> scores(static_cast<std::size_t>(moves.size));
+    nnue::evaluate_batch(accs.data(), stms.data(), scores.data(), moves.size);
+
+    std::vector<float> evals(static_cast<std::size_t>(moves.size));
+    for (int i = 0; i < moves.size; ++i) {
+        // nnue::evaluate_batch returns scores from side-to-move's perspective.
         // After do_move, side-to-move is the opponent, so we negate to get
         // the score from *our* (the caller's) perspective. Higher = better.
-        const float v = -static_cast<float>(nnue::evaluate(temp));
-        evals[i] = std::clamp(v, -kMaxAbsPriorCp, kMaxAbsPriorCp);
-        temp.undo_move(moves[i], st);
+        const float v = -static_cast<float>(scores[static_cast<std::size_t>(i)]);
+        evals[static_cast<std::size_t>(i)] = std::clamp(v, -kMaxAbsPriorCp, kMaxAbsPriorCp);
     }
 
     // Numerically-stable softmax: subtract max before exp.
@@ -328,8 +339,8 @@ std::map<Move, float> get_policy_nnue_impl(const Position& pos) {
     }
 
     if (sum > 0.0f) {
-        for (std::size_t i = 0; i < moves.size; ++i) {
-            distribution[moves[i]] = evals[i] / sum;
+        for (int i = 0; i < moves.size; ++i) {
+            distribution[moves[i]] = evals[static_cast<std::size_t>(i)] / sum;
         }
     } else {
         const float uniform = 1.0f / static_cast<float>(moves.size);

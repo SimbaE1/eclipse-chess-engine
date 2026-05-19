@@ -9,25 +9,13 @@
 #include "tt.hpp"
 #include "types.hpp"
 
+#include "see.hpp"
+
 namespace eclipse::ab {
 
 namespace {
 
 using Clock = std::chrono::steady_clock;
-
-// MVV-LVA piece values for ordering only — not the eval. Indexed by PieceType.
-// King is included for completeness (we never capture it, but checks during
-// qsearch can be ordered relative to others).
-constexpr std::array<int, 8> kPieceValue = {
-    0,    // NoPieceType
-    100,  // Pawn
-    320,  // Knight
-    330,  // Bishop
-    500,  // Rook
-    900,  // Queen
-    20000,// King
-    0,
-};
 
 struct SearchCtx {
     Clock::time_point start;
@@ -94,6 +82,9 @@ void generate_captures(Position& pos, MoveList& out) {
     }
 }
 
+Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
+              Move& out_best, SearchCtx& ctx, Move excluded = MoveNone);
+
 Score qsearch(Position& pos, Score alpha, Score beta, int ply, SearchCtx& ctx) {
     ++ctx.nodes;
     if (ctx.time_up()) { ctx.aborted = true; return 0; }
@@ -117,19 +108,25 @@ Score qsearch(Position& pos, Score alpha, Score beta, int ply, SearchCtx& ctx) {
 
     // Sort by MVV-LVA (descending order_score).
     std::array<int, 256> scores{};
-    for (int i = 0; i < caps.size; ++i) scores[i] = order_score(pos, caps[i], ply, ctx);
+    for (int i = 0; i < caps.size; ++i) {
+        scores[static_cast<std::size_t>(i)] = order_score(pos, caps[i], ply, ctx);
+    }
     for (int i = 1; i < caps.size; ++i) {
-        for (int j = i; j > 0 && scores[j] > scores[j - 1]; --j) {
-            std::swap(scores[j], scores[j - 1]);
-            std::swap(caps[j],   caps[j - 1]);
+        for (int j = i; j > 0 && scores[static_cast<std::size_t>(j)] > scores[static_cast<std::size_t>(j - 1)]; --j) {
+            std::swap(scores[static_cast<std::size_t>(j)], scores[static_cast<std::size_t>(j - 1)]);
+            std::swap(caps[static_cast<std::size_t>(j)],   caps[static_cast<std::size_t>(j - 1)]);
         }
     }
 
     for (int i = 0; i < caps.size; ++i) {
+        const Move m = caps[static_cast<std::size_t>(i)];
+        // SEE pruning: skip losing captures unless we are in check.
+        if (!pos.in_check() && !see_ge(pos, m, 0)) continue;
+
         StateInfo st;
-        pos.do_move(caps[i], st);
+        pos.do_move(m, st);
         const Score s = -qsearch(pos, -beta, -alpha, ply + 1, ctx);
-        pos.undo_move(caps[i], st);
+        pos.undo_move(m, st);
         if (ctx.aborted) return 0;
         if (s >= beta) return beta;
         if (s > alpha) alpha = s;
@@ -138,7 +135,7 @@ Score qsearch(Position& pos, Score alpha, Score beta, int ply, SearchCtx& ctx) {
 }
 
 Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
-              Move& out_best, SearchCtx& ctx) {
+              Move& out_best, SearchCtx& ctx, Move excluded) {
     ++ctx.nodes;
     out_best = MoveNone;
 
@@ -153,7 +150,8 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
     if (!pos.in_check() && depth >= 3 && static_eval >= beta) {
         StateInfo st;
         pos.do_null_move(st);
-        const Score s = -negamax(pos, depth - 1 - 3, -beta, -beta + 1, ply + 1, out_best, ctx);
+        Move dummy;
+        const Score s = -negamax(pos, depth - 1 - 3, -beta, -beta + 1, ply + 1, dummy, ctx);
         pos.undo_null_move(st);
         if (s >= beta) return beta;
     }
@@ -161,7 +159,7 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
     const Score alpha_orig = alpha;
     TTEntry tt_entry;
     Move    tt_move = MoveNone;
-    if (g_tt.probe(pos.key(), tt_entry)) {
+    if (excluded == MoveNone && g_tt.probe(pos.key(), tt_entry)) {
         tt_move = tt_entry.move;
         if (tt_entry.depth >= depth) {
             const Score s = tt_entry.score_from_tt(tt_entry.score, ply);
@@ -169,6 +167,21 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
             if (tt_entry.flag == TT_LOWERBOUND) alpha = std::max(alpha, s);
             if (tt_entry.flag == TT_UPPERBOUND) beta  = std::min(beta, s);
             if (alpha >= beta) return s;
+        }
+    }
+
+    // Singular extension: if we have a TT move that is a lower bound (cut-move)
+    // with enough depth, check if it's singularly better than all others.
+    int extension = 0;
+    if (excluded == MoveNone && depth >= 8 && tt_move != MoveNone && tt_entry.depth >= depth - 3 && tt_entry.flag == TT_LOWERBOUND) {
+        const Score tt_score = tt_entry.score_from_tt(tt_entry.score, ply);
+        const Score margin   = depth; // margin = 1cp per depth
+        
+        Move dummy;
+        const Score s = negamax(pos, depth / 2, tt_score - margin - 1, tt_score - margin, ply + 1, dummy, ctx, tt_move);
+        
+        if (s < tt_score - margin) {
+            extension = 1;
         }
     }
 
@@ -184,34 +197,40 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
     // Order moves. TT move comes first.
     std::array<int, 256> scores{};
     for (int i = 0; i < moves.size; ++i) {
-        if (moves[i] == tt_move) scores[i] = 3'000'000;
-        else                     scores[i] = order_score(pos, moves[i], ply, ctx);
+        const std::size_t idx = static_cast<std::size_t>(i);
+        if (moves[idx] == tt_move) scores[idx] = 3'000'000;
+        else                       scores[idx] = order_score(pos, moves[idx], ply, ctx);
     }
     for (int i = 1; i < moves.size; ++i) {
-        for (int j = i; j > 0 && scores[j] > scores[j - 1]; --j) {
-            std::swap(scores[j], scores[j - 1]);
-            std::swap(moves[j],  moves[j - 1]);
+        for (int j = i; j > 0 && scores[static_cast<std::size_t>(j)] > scores[static_cast<std::size_t>(j - 1)]; --j) {
+            std::swap(scores[static_cast<std::size_t>(j)], scores[static_cast<std::size_t>(j - 1)]);
+            std::swap(moves[static_cast<std::size_t>(j)],  moves[static_cast<std::size_t>(j - 1)]);
         }
     }
 
     Score best = -kInfinite;
     Move  best_move = MoveNone;
     for (int i = 0; i < moves.size; ++i) {
+        const std::size_t idx = static_cast<std::size_t>(i);
+        const Move m = moves[idx];
+        if (m == excluded) continue;
+
         StateInfo st;
-        pos.do_move(moves[i], st);
+        pos.do_move(m, st);
         
         Move  dummy;
         Score s;
         if (i == 0) {
             // PV node: search with full window.
-            s = -negamax(pos, depth - 1, -beta, -alpha, ply + 1, dummy, ctx);
+            s = -negamax(pos, depth - 1 + extension, -beta, -alpha, ply + 1, dummy, ctx);
         } else {
             // LMR: reduce depth for late-ordered quiet moves.
             int reduction = 0;
             if (depth >= 3 && i >= 4 && !pos.in_check() &&
-                pos.piece_on(moves[i].to()) == NoPiece &&
-                moves[i].type() != Move::EnPassant &&
-                moves[i] != ctx.killers[ply][0] && moves[i] != ctx.killers[ply][1]) {
+                pos.piece_on(m.to()) == NoPiece &&
+                m.type() != Move::EnPassant &&
+                m != ctx.killers[static_cast<std::size_t>(ply)][0] && 
+                m != ctx.killers[static_cast<std::size_t>(ply)][1]) {
                 reduction = 1;
             }
 
@@ -227,21 +246,22 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
             }
         }
 
-        pos.undo_move(moves[i], st);
+        pos.undo_move(m, st);
         if (ctx.aborted) return 0;
-        if (s > best) { best = s; best_move = moves[i]; }
+        if (s > best) { best = s; best_move = m; }
         if (s > alpha) alpha = s;
         if (alpha >= beta) {
             // Beta cutoff. Update heuristics for quiet moves.
-            if (pos.piece_on(moves[i].to()) == NoPiece && moves[i].type() != Move::EnPassant) {
+            if (pos.piece_on(m.to()) == NoPiece && m.type() != Move::EnPassant) {
                 if (ply < 64) {
-                    if (moves[i] != ctx.killers[ply][0]) {
-                        ctx.killers[ply][1] = ctx.killers[ply][0];
-                        ctx.killers[ply][0] = moves[i];
+                    const std::size_t pidx = static_cast<std::size_t>(ply);
+                    if (m != ctx.killers[pidx][0]) {
+                        ctx.killers[pidx][1] = ctx.killers[pidx][0];
+                        ctx.killers[pidx][0] = m;
                     }
                 }
                 const Color us = pos.side_to_move();
-                ctx.history[us][moves[i].from()][moves[i].to()] += depth * depth;
+                ctx.history[us][m.from()][m.to()] += static_cast<std::uint32_t>(depth * depth);
             }
             break;  // beta cutoff
         }
@@ -269,23 +289,21 @@ Result find_best_move(Position& pos, int max_depth, std::int64_t time_budget_ms)
     for (int d = 1; d <= max_depth; ++d) {
         Move best_at_d;
         Score s;
-        
-        if (d >= 4) {
-            Score alpha = last_score - 50;
-            Score beta  = last_score + 50;
-            while (true) {
-                s = negamax(pos, d, alpha, beta, 0, best_at_d, ctx);
-                if (ctx.aborted) break;
-                if (s <= alpha) {
-                    alpha = std::max(-kInfinite, alpha - 100);
-                } else if (s >= beta) {
-                    beta = std::min(kInfinite, beta + 100);
-                } else {
-                    break;
-                }
-            }
+
+        // Aspiration window or full window?
+        if (d <= 3) {
+            s = negamax(pos, d, -kInfinite, kInfinite, 0, best_at_d, ctx, MoveNone);
         } else {
-            s = negamax(pos, d, -kInfinite, kInfinite, 0, best_at_d, ctx);
+            // Very narrow aspiration: if we fail high/low, we widen and re-search.
+            Score alpha = last_score - 30;
+            Score beta  = last_score + 30;
+            while (true) {
+                s = negamax(pos, d, alpha, beta, 0, best_at_d, ctx, MoveNone);
+                if (ctx.aborted) break;
+                if (s <= alpha) { alpha = std::max(-kInfinite, alpha - 100); }
+                else if (s >= beta) { beta = std::min(kInfinite, beta + 100); }
+                else break;
+            }
         }
 
         if (ctx.aborted) break;

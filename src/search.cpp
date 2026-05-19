@@ -35,6 +35,8 @@ void log_ab_outcome(const ab::Result& ab, Move mcts_move, Score mcts_cp, bool ov
 }  // namespace
 
 bool SearchInfo::time_up() const noexcept {
+    if (limits.nodes > 0 && nodes_searched.load(std::memory_order_relaxed) >= limits.nodes) return true;
+    if (limits.depth > 0 && nodes_searched.load(std::memory_order_relaxed) >= limits.depth) return true;
     if (limits.infinite || limits.time_ms <= 0) return false;
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start_time).count();

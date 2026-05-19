@@ -64,9 +64,9 @@ except ImportError:
 FT_IN_FEATURES = 45056
 FT_OUT         = 1024                # keep in sync with kFtOutSize in src/nnue.hpp
 L1_IN          = 2 * FT_OUT          # 2048 (concat of both perspectives)
-L1_OUT         = 128
-L2_OUT         = 32
-L3_OUT         = 1
+L1_OUT         = 256                 # Increased for more capacity
+L2_OUT         = 64                  # Increased for more capacity
+L3_OUT         = 3                   # WDL Head: [Win, Draw, Loss]
 
 # Piece-type slots within a (king_sq, piece_sq) cell. See FT_IN_FEATURES.
 N_PIECE_SLOTS  = 11
@@ -313,7 +313,7 @@ class HalfKAv2Net(nn.Module):
         x = self.act(self.l1(x))
         x = self.act(self.l2(x))
         x = self.l3(x)
-        return x.squeeze(-1)   # [B]
+        return x  # [B, 3]
 
     def export_state_dict_for_quantization(self):
         """Repack the embedding into a plain weight matrix so convert_halfkav2_nnue.py
@@ -371,10 +371,12 @@ def train(args):
                         drop_last=True)
 
     net = HalfKAv2Net().to(device)
-    opt = torch.optim.Adam(net.parameters(), lr=args.lr)
+    # Weight decay (L2 regularization) helps prevent overfitting in the larger network.
+    opt = torch.optim.Adam(net.parameters(), lr=args.lr, weight_decay=1e-4)
+    # Scheduler: Cosine Annealing to help the model converge more precisely.
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
     # Sigmoid scaling: matches the tiny NNUE trainer's convention.
-    # score (cp) -> winchance via sigmoid(score / scale), loss against WDL target.
     cp_scale = args.cp_scale
 
     step = 0
@@ -383,9 +385,24 @@ def train(args):
         nbatch = 0
         for us, them, scores in loader:
             us, them, scores = us.to(device), them.to(device), scores.to(device)
-            target = torch.sigmoid(scores / cp_scale)
-            pred   = torch.sigmoid(net(us, them))
-            loss   = F.mse_loss(pred, target)
+            
+            # WDL target derivation: Convert CP to soft Win/Draw/Loss probabilities.
+            # This is a simplified sigmoid mapping.
+            win_prob  = torch.sigmoid(scores / cp_scale)
+            loss_prob = torch.sigmoid(-scores / cp_scale)
+            draw_prob = 1.0 - win_prob - loss_prob
+            draw_prob = torch.clamp(draw_prob, 0.0, 1.0)
+            
+            # Normalize to ensure sum=1
+            s = win_prob + draw_prob + loss_prob
+            target = torch.stack([win_prob/s, draw_prob/s, loss_prob/s], dim=1)
+
+            # Prediction
+            pred_logits = net(us, them)
+            pred_probs  = F.softmax(pred_logits, dim=1)
+            
+            # Loss: KL Divergence or MSE on probabilities
+            loss = F.mse_loss(pred_probs, target)
 
             opt.zero_grad()
             loss.backward()
@@ -400,7 +417,9 @@ def train(args):
             step += 1
             if step % 200 == 0:
                 print(f"  epoch {epoch} step {step} loss {loss.item():.5f}")
-        print(f"epoch {epoch} avg loss {epoch_loss / max(nbatch, 1):.5f}")
+        
+        scheduler.step()
+        print(f"epoch {epoch} avg loss {epoch_loss / max(nbatch, 1):.5f} (lr: {scheduler.get_last_lr()[0]:.6f})")
 
     out_pt = Path(args.out)
     out_pt.parent.mkdir(parents=True, exist_ok=True)

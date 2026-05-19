@@ -43,9 +43,9 @@ namespace eclipse::nnue {
 // kFtOutSize is defined in accumulator.hpp.
 
 constexpr int kL1InSize         = 2 * kFtOutSize; // = 2048
-constexpr int kL1OutSize        = 128;
-constexpr int kL2OutSize        = 32;
-constexpr int kL3OutSize        = 1;
+constexpr int kL1OutSize        = 256;
+constexpr int kL2OutSize        = 64;
+constexpr int kL3OutSize        = 3;
 
 constexpr int kFtKingSquares    = 64;
 constexpr int kFtPieceSquares   = 64;
@@ -131,10 +131,10 @@ void remove_piece(Accumulator& acc, const Position& pos,
 
 // Forward pass: returns the score in centipawns from the side-to-move's
 // perspective, matching eclipse::evaluate's contract.
-//
-// Reads the up-to-date accumulator from `pos.accumulator()`. If it is not
-// marked computed (e.g. NNUE was loaded after the position was last set),
-// performs an on-the-spot refresh and caches the result.
 Score evaluate(const Position& pos) noexcept;
+
+// Batched forward pass: computes scores for multiple positions at once.
+// Takes accumulators and side-to-move for each position in the batch.
+void evaluate_batch(const Accumulator* accs, const Color* stms, Score* scores, int batch_size) noexcept;
 
 }  // namespace eclipse::nnue

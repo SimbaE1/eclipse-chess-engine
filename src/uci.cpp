@@ -71,8 +71,17 @@ Move parse_move(const std::string& s, Position& pos) {
 
 void cmd_uci() {
     std::cout << "id name " << kEngineName << ' ' << kEngineVersion << '\n'
-              << "id author " << kEngineAuthor << '\n'
-              << "option name EvalFile type string default <empty>\n"
+              << "id author " << kEngineAuthor << '\n';
+
+#if defined(__AVX2__)
+    std::cout << "info string SIMD: AVX2\n";
+#elif defined(__ARM_NEON)
+    std::cout << "info string SIMD: NEON\n";
+#else
+    std::cout << "info string SIMD: None (Scalar)\n";
+#endif
+
+    std::cout << "option name EvalFile type string default <empty>\n"
               << "option name PolicyFile type string default <empty>\n"
               << "option name Threads type spin default 1 min 1 max 128\n"
               << "option name Hash type spin default 16 min 1 max 16384\n"
@@ -259,6 +268,14 @@ void loop() {
         else if (cmd == "setoption")  cmd_setoption(tok);
         else if (cmd == "position")   cmd_position(tok);
         else if (cmd == "go")         cmd_go(tok);
+        else if (cmd == "bench") {
+            g_pos = Position::startpos();
+            g_search_info.limits = SearchLimits{};
+            g_search_info.limits.nodes = 10000;
+            g_search_info.limits.depth = 0;
+            g_search_info.stop.store(false, std::memory_order_relaxed);
+            search(g_pos, g_search_info);
+        }
         else if (cmd == "stop")       g_search_info.stop.store(true, std::memory_order_relaxed);
         else if (cmd == "quit")       break;
         // Unknown commands are silently ignored per the UCI spec.

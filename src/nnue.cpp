@@ -65,9 +65,11 @@ bool                                          g_loaded = false;
 float                                         g_output_cp_per_unit = 410.0f;
 
 // Feature-transformer weights stored row-major as [feature, hidden] so the
-// per-feature "column" we add to the accumulator is contiguous - same pattern
-// the tiny NNUE used, and the layout SIMD wants.
-std::vector<std::int16_t>                     g_ft_w;
+// per-feature "column" we add to the accumulator is contiguous.
+// We use a custom alignment-aware allocation here so SIMD loads from weights
+// are always 64-byte aligned.
+std::int16_t*                                 g_ft_w = nullptr;
+std::size_t                                   g_ft_w_size = 0;
 std::array<std::int16_t, kFtOutSize>          g_ft_b{};
 
 // All int8 layers are stored row-major as [out, in] so each output neuron's
@@ -99,8 +101,14 @@ bool read_array(std::ifstream& f, T* dst, std::size_t n) {
 void reset_state() noexcept {
     g_loaded = false;
     g_output_cp_per_unit = 410.0f;
-    g_ft_w.clear();
-    g_ft_w.shrink_to_fit();
+    if (g_ft_w) {
+#if defined(_MSC_VER)
+        _aligned_free(g_ft_w);
+#else
+        free(g_ft_w);
+#endif
+        g_ft_w = nullptr;
+    }
     g_ft_b.fill(0);
     g_l1_w.clear();
     g_l1_b.fill(0);
@@ -187,9 +195,19 @@ bool load(const std::string& path) {
         std::fprintf(stderr, "info string NNUE load failed: short read on ft_b\n");
         return false;
     }
-    g_ft_w.assign(static_cast<std::size_t>(kFtNumFeatures) * kFtOutSize, 0);
-    if (!read_array(f, g_ft_w.data(), g_ft_w.size())) {
-        std::fprintf(stderr, "info string NNUE load failed: short read on ft_w\n");
+    
+    g_ft_w_size = static_cast<std::size_t>(kFtNumFeatures) * kFtOutSize;
+#if defined(_MSC_VER)
+    g_ft_w = static_cast<std::int16_t*>(_aligned_malloc(g_ft_w_size * sizeof(std::int16_t), 64));
+#else
+    if (posix_memalign(reinterpret_cast<void**>(&g_ft_w), 64, g_ft_w_size * sizeof(std::int16_t)) != 0) {
+        g_ft_w = nullptr;
+    }
+#endif
+
+    if (!g_ft_w || !read_array(f, g_ft_w, g_ft_w_size)) {
+        std::fprintf(stderr, "info string NNUE load failed: FT weights allocation or read failed\n");
+        reset_state();
         return false;
     }
 
@@ -267,12 +285,36 @@ void apply_piece(Accumulator& acc, const Position& pos,
             piece_sq = flip_rank(piece_sq);
         }
         const int  idx = feature_index(king_sq, piece_sq, pt, is_ours);
-        const std::int16_t* col =
-            &g_ft_w[static_cast<std::size_t>(idx) * kFtOutSize];
+        const std::int16_t* col = &g_ft_w[static_cast<std::size_t>(idx) * kFtOutSize];
+
+#if defined(__AVX2__)
+        for (std::size_t i = 0; i < kFtOutSize; i += 16) {
+            __m256i acc_vec = _mm256_load_si256(reinterpret_cast<const __m256i*>(&acc.v[persp][i]));
+            __m256i col_vec = _mm256_load_si256(reinterpret_cast<const __m256i*>(&col[i]));
+            if constexpr (Sign == 1) {
+                acc_vec = _mm256_add_epi16(acc_vec, col_vec);
+            } else {
+                acc_vec = _mm256_sub_epi16(acc_vec, col_vec);
+            }
+            _mm256_store_si256(reinterpret_cast<__m256i*>(&acc.v[persp][i]), acc_vec);
+        }
+#elif defined(__ARM_NEON)
+        for (std::size_t i = 0; i < kFtOutSize; i += 8) {
+            int16x8_t acc_vec = vld1q_s16(&acc.v[persp][i]);
+            int16x8_t col_vec = vld1q_s16(&col[i]);
+            if constexpr (Sign == 1) {
+                acc_vec = vaddq_s16(acc_vec, col_vec);
+            } else {
+                acc_vec = vsubq_s16(acc_vec, col_vec);
+            }
+            vst1q_s16(&acc.v[persp][i], acc_vec);
+        }
+#else
         for (std::size_t i = 0; i < kFtOutSize; ++i) {
             acc.v[persp][i] = static_cast<std::int16_t>(
                 acc.v[persp][i] + Sign * col[i]);
         }
+#endif
     }
 }
 
@@ -324,11 +366,27 @@ void refresh(const Position& pos, Accumulator& acc) noexcept {
             if (persp_color == Black) piece_sq = flip_rank(piece_sq);
 
             const int idx = feature_index(king_sq, piece_sq, pt, is_ours);
-            const std::int16_t* col =
-                &g_ft_w[static_cast<std::size_t>(idx) * kFtOutSize];
+            const std::int16_t* col = &g_ft_w[static_cast<std::size_t>(idx) * kFtOutSize];
+
+#if defined(__AVX2__)
+            for (std::size_t i = 0; i < kFtOutSize; i += 16) {
+                __m256i acc_vec = _mm256_load_si256(reinterpret_cast<const __m256i*>(&acc.v[persp][i]));
+                __m256i col_vec = _mm256_load_si256(reinterpret_cast<const __m256i*>(&col[i]));
+                acc_vec = _mm256_add_epi16(acc_vec, col_vec);
+                _mm256_store_si256(reinterpret_cast<__m256i*>(&acc.v[persp][i]), acc_vec);
+            }
+#elif defined(__ARM_NEON)
+            for (std::size_t i = 0; i < kFtOutSize; i += 8) {
+                int16x8_t acc_vec = vld1q_s16(&acc.v[persp][i]);
+                int16x8_t col_vec = vld1q_s16(&col[i]);
+                acc_vec = vaddq_s16(acc_vec, col_vec);
+                vst1q_s16(&acc.v[persp][i], acc_vec);
+            }
+#else
             for (std::size_t i = 0; i < kFtOutSize; ++i) {
                 acc.v[persp][i] = static_cast<std::int16_t>(acc.v[persp][i] + col[i]);
             }
+#endif
         }
     }
 
@@ -421,6 +479,64 @@ void affine_clipped_relu(const std::uint8_t* in,
 #endif
 }
 
+#if defined(__AVX2__)
+template <int kIn, int kOut>
+void affine_clipped_relu_batch(const std::uint8_t* in,
+                               const std::int8_t*  w,
+                               const std::int32_t* b,
+                               std::uint8_t*       out,
+                               int                 batch_size) noexcept {
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    for (int o = 0; o < kOut; ++o) {
+        const std::int8_t* wo = w + o * kIn;
+        
+        // Process 4 inputs in the batch at a time to maximize weight vector reuse.
+        int b_idx = 0;
+        for (; b_idx <= batch_size - 4; b_idx += 4) {
+            __m256i acc0 = _mm256_setzero_si256();
+            __m256i acc1 = _mm256_setzero_si256();
+            __m256i acc2 = _mm256_setzero_si256();
+            __m256i acc3 = _mm256_setzero_si256();
+
+            for (int i = 0; i < kIn; i += 32) {
+                const __m256i wv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(wo + i));
+                acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(in + (b_idx + 0) * kIn + i)), wv), ones16));
+                acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(in + (b_idx + 1) * kIn + i)), wv), ones16));
+                acc2 = _mm256_add_epi32(acc2, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(in + (b_idx + 2) * kIn + i)), wv), ones16));
+                acc3 = _mm256_add_epi32(acc3, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(in + (b_idx + 3) * kIn + i)), wv), ones16));
+            }
+
+            auto hsum = [](const __m256i& acc) -> std::int32_t {
+                __m128i lo = _mm256_castsi256_si128(acc);
+                __m128i hi = _mm256_extracti128_si256(acc, 1);
+                __m128i s4 = _mm_add_epi32(lo, hi);
+                __m128i s2 = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, 0x4E));
+                __m128i s1 = _mm_add_epi32(s2, _mm_shuffle_epi32(s2, 0xB1));
+                return _mm_cvtsi128_si32(s1);
+            };
+
+            auto finalize = [&](int batch_offset, const __m256i& acc) {
+                std::int32_t sum = b[o] + hsum(acc);
+                sum >>= kWeightShift;
+                if (sum < 0)         sum = 0;
+                if (sum > kFtQuant)  sum = kFtQuant;
+                out[batch_offset * kOut + o] = static_cast<std::uint8_t>(sum);
+            };
+
+            finalize(b_idx + 0, acc0);
+            finalize(b_idx + 1, acc1);
+            finalize(b_idx + 2, acc2);
+            finalize(b_idx + 3, acc3);
+        }
+
+        // Remainder
+        for (; b_idx < batch_size; ++b_idx) {
+            affine_clipped_relu<kIn, 1>(in + b_idx * kIn, wo, b + o, out + b_idx * kOut + o);
+        }
+    }
+}
+#endif
+
 }  // namespace
 
 Score evaluate(const Position& pos) noexcept {
@@ -448,26 +564,115 @@ Score evaluate(const Position& pos) noexcept {
     }
 
     alignas(64) std::uint8_t l1_out[kL1OutSize];
+    affine_clipped_relu<kL1InSize, kL1OutSize>(ft_out, g_l1_w.data(), g_l1_b.data(), l1_out);
+
     alignas(64) std::uint8_t l2_out[kL2OutSize];
+    affine_clipped_relu<kL1OutSize, kL2OutSize>(l1_out, g_l2_w.data(), g_l2_b.data(), l2_out);
 
-    affine_clipped_relu<kL1InSize, kL1OutSize>(
-        ft_out, g_l1_w.data(), g_l1_b.data(), l1_out);
-    affine_clipped_relu<kL1OutSize, kL2OutSize>(
-        l1_out, g_l2_w.data(), g_l2_b.data(), l2_out);
-
-    // L3: int8 dot product, NO shift, NO clamp - we want full int32 precision
-    // for the centipawn conversion.
-    std::int32_t y = g_l3_b[0];
-    const std::int8_t* w3 = g_l3_w.data();
-    for (int i = 0; i < kL2OutSize; ++i) {
-        y += static_cast<std::int32_t>(w3[i]) * static_cast<std::int32_t>(l2_out[i]);
+    // Final layer: kL2OutSize -> kL3OutSize (3), no ReLU.
+    std::array<float, 3> logits;
+    for (int j = 0; j < kL3OutSize; ++j) {
+        std::int32_t y = g_l3_b[static_cast<std::size_t>(j)];
+        const std::int8_t* w3 = &g_l3_w[static_cast<std::size_t>(j * kL2OutSize)];
+        for (int i = 0; i < kL2OutSize; ++i) {
+            y += static_cast<std::int32_t>(w3[static_cast<std::size_t>(i)]) * static_cast<std::int32_t>(l2_out[static_cast<std::size_t>(i)]);
+        }
+        logits[static_cast<std::size_t>(j)] = static_cast<float>(y);
     }
 
-    // y ~= kWeightScale * kFtQuant * y_real (because no post-shift was applied)
-    // cp = y_real * output_cp_per_unit = y * output_cp_per_unit / kOutputCpDivisor
-    const float cp = static_cast<float>(y) * g_output_cp_per_unit
-                   / static_cast<float>(kOutputCpDivisor);
+    // Softmax over logits to get [P(Win), P(Draw), P(Loss)]
+    float max_l = logits[0];
+    if (logits[1] > max_l) max_l = logits[1];
+    if (logits[2] > max_l) max_l = logits[2];
+
+    float sum_p = 0.0f;
+    std::array<float, 3> probs;
+    for (int j = 0; j < 3; ++j) {
+        probs[static_cast<std::size_t>(j)] = std::exp((logits[static_cast<std::size_t>(j)] - max_l) / 512.0f);
+        sum_p += probs[static_cast<std::size_t>(j)];
+    }
+
+    // cp = (P(Win) - P(Loss)) * g_output_cp_per_unit
+    const float cp = (probs[0] - probs[2]) / sum_p * g_output_cp_per_unit;
+
     return static_cast<Score>(cp);
+}
+
+void evaluate_batch(const Accumulator* accs, const Color* stms, Score* scores, int batch_size) noexcept {
+    if (batch_size <= 0) return;
+    if (!is_loaded()) {
+        for (int i = 0; i < batch_size; ++i) scores[i] = 0;
+        return;
+    }
+
+    // Thread-local scratch buffers to avoid allocations per call.
+    // Max batch size is usually moves.size (max ~218 in chess, but usually < 50).
+    // We'll support up to 256.
+    constexpr int kMaxBatch = 256;
+    alignas(64) static thread_local std::uint8_t ft_scratch[kMaxBatch * kL1InSize];
+    alignas(64) static thread_local std::uint8_t l1_scratch[kMaxBatch * kL1OutSize];
+    alignas(64) static thread_local std::uint8_t l2_scratch[kMaxBatch * kL2OutSize];
+
+    const int n = std::min(batch_size, kMaxBatch);
+
+    // 1. Feature Transformer (Accumulator -> FT_out)
+    for (int b = 0; b < n; ++b) {
+        const Accumulator& acc = accs[b];
+        const Color       stm  = stms[b];
+        const std::size_t us   = (stm == White) ? 0u : 1u;
+        const std::size_t them = us ^ 1u;
+        
+        std::uint8_t* ft_out = &ft_scratch[b * kL1InSize];
+        for (std::size_t i = 0; i < kFtOutSize; ++i) {
+            ft_out[i]              = static_cast<std::uint8_t>(std::clamp<std::int32_t>(acc.v[us][i], 0, kFtQuant));
+            ft_out[i + kFtOutSize] = static_cast<std::uint8_t>(std::clamp<std::int32_t>(acc.v[them][i], 0, kFtQuant));
+        }
+    }
+
+    // 2. Batched L1 Layer
+#if defined(__AVX2__)
+    affine_clipped_relu_batch<kL1InSize, kL1OutSize>(ft_scratch, g_l1_w.data(), g_l1_b.data(), l1_scratch, n);
+#else
+    for (int b = 0; b < n; ++b) {
+        affine_clipped_relu<kL1InSize, kL1OutSize>(&ft_scratch[b * kL1InSize], g_l1_w.data(), g_l1_b.data(), &l1_scratch[b * kL1OutSize]);
+    }
+#endif
+
+    // 3. Batched L2 Layer
+#if defined(__AVX2__)
+    affine_clipped_relu_batch<kL1OutSize, kL2OutSize>(l1_scratch, g_l2_w.data(), g_l2_b.data(), l2_scratch, n);
+#else
+    for (int b = 0; b < n; ++b) {
+        affine_clipped_relu<kL1OutSize, kL2OutSize>(&l1_scratch[b * kL1OutSize], g_l2_w.data(), g_l2_b.data(), &l2_scratch[b * kL2OutSize]);
+    }
+#endif
+
+    // 4. Final L3 and Score Calculation
+    for (int b = 0; b < n; ++b) {
+        const std::uint8_t* l2_out = &l2_scratch[b * kL2OutSize];
+        std::array<float, 3> logits;
+        for (int j = 0; j < kL3OutSize; ++j) {
+            std::int32_t y = g_l3_b[static_cast<std::size_t>(j)];
+            const std::int8_t* w3 = &g_l3_w[static_cast<std::size_t>(j * kL2OutSize)];
+            for (int i = 0; i < kL2OutSize; ++i) {
+                y += static_cast<std::int32_t>(w3[static_cast<std::size_t>(i)]) * static_cast<std::int32_t>(l2_out[static_cast<std::size_t>(i)]);
+            }
+            logits[static_cast<std::size_t>(j)] = static_cast<float>(y);
+        }
+
+        float max_l = logits[0];
+        if (logits[1] > max_l) max_l = logits[1];
+        if (logits[2] > max_l) max_l = logits[2];
+
+        float sum_p = 0.0f;
+        std::array<float, 3> probs;
+        for (int j = 0; j < 3; ++j) {
+            probs[static_cast<std::size_t>(j)] = std::exp((logits[static_cast<std::size_t>(j)] - max_l) / 512.0f);
+            sum_p += probs[static_cast<std::size_t>(j)];
+        }
+
+        scores[b] = static_cast<Score>((probs[0] - probs[2]) / sum_p * g_output_cp_per_unit);
+    }
 }
 
 }  // namespace eclipse::nnue
