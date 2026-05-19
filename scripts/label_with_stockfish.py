@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 """
-Stockfish-driven label generator for HalfKP training.
+Stockfish-driven label generator for HalfKAv2 training.
 
 Reads FENs (one per line) from --fens or stdin, runs Stockfish at the given
 depth, and writes `<fen>;<score_cp>` lines to --out for consumption by
-scripts/train_halfkp.py.
+scripts/train_halfkav2.py.
 
 Mate scores are converted to a saturating cp value (kMateCp) so they don't
 break the sigmoid loss. Positions that Stockfish refuses (illegal/checkmated)

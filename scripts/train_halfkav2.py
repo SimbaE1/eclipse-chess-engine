@@ -6,7 +6,7 @@ HalfKAv2-1024x2-128-32 training loop for Eclipse.
 The model here is the float32 mirror of the inference path in src/nnue.cpp.
 After training, save state_dict (.pt) and convert with:
 
-    python scripts/convert_halfkp_nnue.py from-torch \
+    python scripts/convert_halfkav2_nnue.py from-torch \
         --state-dict path/to/weights.pt \
         --out data/eclipse.nnue
 
@@ -73,7 +73,7 @@ N_PIECE_SLOTS  = 11
 
 
 # ---------------------------------------------------------------------------
-# Position -> HalfKP feature indices
+# Position -> HalfKAv2 feature indices
 # ---------------------------------------------------------------------------
 
 # Standard chess piece-square layout matching src/types.hpp:
@@ -172,13 +172,13 @@ def fen_to_features(fen: str):
 # Dataset
 # ---------------------------------------------------------------------------
 
-# HalfKP has at most 30 active features per perspective (32 starting pieces
-# minus 2 kings). 32 is a round padding cap that fits in cache nicely and
-# leaves headroom for forms of the feature set that include the king.
+# HalfKAv2 has at most 31 active features per perspective (32 starting pieces
+# minus the perspective side's own king, which is implicit at the indexing
+# king square; the opponent's king IS a feature). 32 is the round padding cap.
 MAX_ACTIVE = 32
 
 
-class HalfKPDataset(Dataset):
+class HalfKAv2Dataset(Dataset):
     """Reads `<fen>;<score_cp>` lines into flat numpy arrays.
 
     Memory model: three contiguous arrays
@@ -246,7 +246,7 @@ class HalfKPDataset(Dataset):
 
         # If we skipped some, the tail of the arrays is unused. Truncate so
         # __len__ is accurate and we don't train on zero-rows that mean
-        # "completely empty board" (which would actually be a valid HalfKP
+        # "completely empty board" (which would actually be a valid HalfKAv2
         # encoding - all padding).
         if i < n:
             self.us_idx   = self.us_idx[:i]
@@ -286,7 +286,7 @@ class ClippedReLU(nn.Module):
         return torch.clamp(x, 0.0, 1.0)
 
 
-class HalfKPNet(nn.Module):
+class HalfKAv2Net(nn.Module):
     def __init__(self):
         super().__init__()
         # Padded feature index FT_IN_FEATURES sits at the end of the embedding
@@ -316,7 +316,7 @@ class HalfKPNet(nn.Module):
         return x.squeeze(-1)   # [B]
 
     def export_state_dict_for_quantization(self):
-        """Repack the embedding into a plain weight matrix so convert_halfkp_nnue.py
+        """Repack the embedding into a plain weight matrix so convert_halfkav2_nnue.py
         can read it as a regular Linear layer.
 
         Embedding stores weights as [num_embeddings, embedding_dim] and our
@@ -365,12 +365,12 @@ def train(args):
     device = pick_device(args.device)
     print(f"training on {device}")
 
-    ds = HalfKPDataset(args.data, max_lines=args.max_lines)
+    ds = HalfKAv2Dataset(args.data, max_lines=args.max_lines)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
                         num_workers=args.num_workers, collate_fn=collate,
                         drop_last=True)
 
-    net = HalfKPNet().to(device)
+    net = HalfKAv2Net().to(device)
     opt = torch.optim.Adam(net.parameters(), lr=args.lr)
 
     # Sigmoid scaling: matches the tiny NNUE trainer's convention.
@@ -406,7 +406,7 @@ def train(args):
     out_pt.parent.mkdir(parents=True, exist_ok=True)
     torch.save(net.export_state_dict_for_quantization(), out_pt)
     print(f"saved {out_pt}")
-    print("now run: python scripts/convert_halfkp_nnue.py from-torch "
+    print("now run: python scripts/convert_halfkav2_nnue.py from-torch "
           f"--state-dict {out_pt} --out data/eclipse.nnue "
           f"--output-cp-per-unit {cp_scale}")
 
@@ -416,7 +416,7 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data", type=Path, required=True,
                    help="text file with '<fen>;<score_cp>' lines")
-    p.add_argument("--out", type=Path, default=Path("data/halfkp.pt"),
+    p.add_argument("--out", type=Path, default=Path("data/halfkav2.pt"),
                    help="PyTorch state_dict output")
     p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--batch-size", type=int, default=4096)

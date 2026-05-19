@@ -11,7 +11,7 @@ games and embeds the score directly in the PGN as comments like:
 That eval is *much* better than anything we'd label locally at depth 8, and
 it's already in the file. This script harvests every %eval-annotated position
 from games matching our quality bar (Elo + time control) and outputs them in
-the same `<fen>;<score_cp>` format train_halfkp.py expects.
+the same `<fen>;<score_cp>` format train_halfkav2.py expects.
 
 Convention conversions:
   - Lichess %eval is in pawns, from WHITE's perspective.

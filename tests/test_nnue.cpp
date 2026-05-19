@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// NNUE smoke + sanity tests for the HalfKP-256x2-32-32 architecture.
+// NNUE smoke + sanity tests for the HalfKAv2-1024x2-128-32 architecture.
 //
 // The test has two modes, gated by env vars - never blocks CI on machines
 // without trained weights:
@@ -10,7 +10,7 @@
 //   ECLIPSE_NNUE_PATH=...      "infrastructure" mode: load + forward pass +
 //                              determinism. Works with any valid file
 //                              including the `init` scaffold from
-//                              scripts/convert_halfkp_nnue.py - no strength
+//                              scripts/convert_halfkav2_nnue.py - no strength
 //                              claim is checked.
 //
 //   ECLIPSE_NNUE_PATH=...

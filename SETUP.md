@@ -139,8 +139,8 @@ Full pipeline lives in `scripts/`:
 |---|---|---|
 | Extract Lichess positions | `sample_lichess.py` / `extract_lichess_evals.py` | Streaming, filters by Elo + TC |
 | Label with Stockfish | `label_with_stockfish.py` | Optional — only if not using Lichess's built-in evals |
-| Train HalfKP net | `train_halfkp.py` | PyTorch, supports `--device cuda/mps/cpu` |
-| Pack to .nnue | `convert_halfkp_nnue.py` | Quantizes float32 -> int8/int16 |
+| Train HalfKAv2 net | `train_halfkav2.py` | PyTorch, supports `--device cuda/mps/cpu` |
+| Pack to .nnue | `convert_halfkav2_nnue.py` | Quantizes float32 -> int8/int16 |
 
 Recommended workflow for the Mac Pro: extract data locally (network-bound),
 upload to Kaggle, train on a T4 in a notebook, download the `.pt`, pack locally.
@@ -149,8 +149,8 @@ See conversation history for details.
 ## Architecture overview
 
 - **Search**: MCTS with PUCT, single-threaded
-- **Value**: HalfKP-512x2-32-32 NNUE (40960 features -> 512 per perspective ->
-  32 -> 32 -> 1, int16/int8 quantized) in `src/nnue.cpp`
+- **Value**: HalfKAv2-1024x2-128-32 NNUE (45056 features -> 1024 per perspective ->
+  128 -> 32 -> 1, int16/int8 quantized) in `src/nnue.cpp`
 - **Policy**: Lc0 transformer (10 encoder layers, 8 heads) loaded via
   ONNX Runtime in `src/policy.cpp`
 - **Time mgmt**: MLH head from the policy net divides remaining time across
