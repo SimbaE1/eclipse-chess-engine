@@ -13,6 +13,21 @@
 
 namespace eclipse::ab {
 
+// LMR Table: [depth][move_index]
+float g_lmr_table[64][256];
+bool  g_lmr_init = false;
+
+void init_search_tables() {
+    if (g_lmr_init) return;
+    for (int d = 1; d < 64; ++d) {
+        for (int i = 1; i < 256; ++i) {
+            // Standard Stockfish-style LMR formula.
+            g_lmr_table[d][i] = 0.75f + std::log(static_cast<float>(d)) * std::log(static_cast<float>(i)) / 2.25f;
+        }
+    }
+    g_lmr_init = true;
+}
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -27,7 +42,7 @@ struct SearchCtx {
     std::array<std::array<Move, 2>, 64> killers{};
 
     // History heuristic: [color][from][to].
-    std::uint32_t history[2][64][64]{};
+    std::int32_t history[2][64][64]{};
 
     bool time_up() noexcept {
         // Cheap node-stride check before the clock read so we don't read the
@@ -64,7 +79,7 @@ int order_score(const Position& pos, Move m, int ply, const SearchCtx& ctx) {
             if (m == ctx.killers[ply][0]) return 1'000'000;
             if (m == ctx.killers[ply][1]) return 900'000;
         }
-        s = static_cast<int>(ctx.history[pos.side_to_move()][m.from()][m.to()]);
+        s = ctx.history[pos.side_to_move()][m.from()][m.to()];
     }
     return s;
 }
@@ -143,6 +158,13 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
     if (depth <= 0) return qsearch(pos, alpha, beta, ply, ctx);
 
     const Score static_eval = evaluate(pos);
+    
+    // Reverse Futility Pruning (RFP): also known as Static Null Move Pruning.
+    // If we are at a low depth and the evaluation is far above beta, we can
+    // skip the search and return beta.
+    if (!pos.in_check() && depth <= 6 && static_eval >= beta + 120 * depth) {
+        return static_eval;
+    }
 
     // Null-move pruning: if we are so far ahead that passing a turn still
     // stays above beta, we can prune this branch. Skip if in check or if
@@ -226,12 +248,21 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
         } else {
             // LMR: reduce depth for late-ordered quiet moves.
             int reduction = 0;
-            if (depth >= 3 && i >= 4 && !pos.in_check() &&
+            if (depth >= 3 && i >= 3 && !pos.in_check() &&
                 pos.piece_on(m.to()) == NoPiece &&
-                m.type() != Move::EnPassant &&
-                m != ctx.killers[static_cast<std::size_t>(ply)][0] && 
-                m != ctx.killers[static_cast<std::size_t>(ply)][1]) {
-                reduction = 1;
+                m.type() != Move::EnPassant) {
+                
+                const int d_idx = std::min(depth, 63);
+                const int i_idx = std::min(i, 255);
+                reduction = static_cast<int>(g_lmr_table[d_idx][i_idx]);
+                
+                // Reduce less if it's a killer or has good history.
+                if (m == ctx.killers[static_cast<std::size_t>(ply)][0] || 
+                    m == ctx.killers[static_cast<std::size_t>(ply)][1]) {
+                    reduction -= 1;
+                }
+                
+                reduction = std::clamp(reduction, 0, depth - 1);
             }
 
             // Non-PV node: search with null window first.
@@ -261,7 +292,19 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
                     }
                 }
                 const Color us = pos.side_to_move();
-                ctx.history[us][m.from()][m.to()] += static_cast<std::uint32_t>(depth * depth);
+                ctx.history[us][m.from()][m.to()] += static_cast<std::int32_t>(depth * depth);
+                
+                // History Aging: if a history score gets too large, divide all
+                // history scores by 2.
+                if (ctx.history[us][m.from()][m.to()] > 1'000'000) {
+                    for (int c = 0; c < 2; ++c) {
+                        for (int f = 0; f < 64; ++f) {
+                            for (int t = 0; t < 64; ++t) {
+                                ctx.history[c][f][t] /= 2;
+                            }
+                        }
+                    }
+                }
             }
             break;  // beta cutoff
         }
@@ -279,6 +322,7 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
 }  // namespace
 
 Result find_best_move(Position& pos, int max_depth, std::int64_t time_budget_ms) {
+    init_search_tables();
     Result r;
     SearchCtx ctx{Clock::now(), time_budget_ms, 0, false};
 

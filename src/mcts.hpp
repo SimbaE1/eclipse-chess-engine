@@ -70,14 +70,19 @@ struct Node {
     // negation makes the engine play moves that maximize the opponent's
     // expected outcome — for example, refusing to capture a hanging piece
     // because doing so makes the opponent's Q drop sharply.
-    float puct_score(std::int32_t parent_n, float cpuct) const noexcept {
+    float puct_score(std::int32_t parent_n, float cpuct, float parent_q) const noexcept {
         const auto n  = N.load(std::memory_order_relaxed);
         const auto vl = virtual_loss.load(std::memory_order_relaxed);
         const auto n_eff = n + vl;
 
         float q;
         if (n_eff == 0) {
-            q = 0.0f;
+            // First Play Urgency (FPU): discount the parent's Q.
+            // parent_q is the value of the parent position from the perspective 
+            // of the player who just moved to reach this node. 
+            // We subtract a small discount to favor exploration of unvisited nodes
+            // without being reckless.
+            q = parent_q - 0.25f;
         } else {
             const float w_eff = W() - static_cast<float>(vl);
             q = w_eff / static_cast<float>(n_eff);

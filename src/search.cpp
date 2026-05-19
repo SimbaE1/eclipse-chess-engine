@@ -52,6 +52,15 @@ Move search(Position& pos, SearchInfo& info) {
     const int          total_threads = info.threads;
     const std::int64_t total_time_ms = info.limits.time_ms;
 
+    // Forced Move Pruning: if there is only one legal move, just play it immediately.
+    // Skips search setup and thread launching overhead.
+    MoveList moves;
+    generate_legal_moves(pos, moves);
+    if (moves.size == 1 && !info.limits.nodes && !info.limits.depth) {
+        std::cout << "info string forced move pruning: only " << moves[0].to_uci() << " is legal" << std::endl;
+        return moves[0];
+    }
+
     // Parallel AB+MCTS when (a) we have enough threads to dedicate to AB AND
     // (b) there is a non-zero time budget. With time_ms==0 (go depth /
     // go infinite) we can't meaningfully time-share, so fall back to

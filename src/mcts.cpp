@@ -259,11 +259,12 @@ void MCTS::iterate() {
         // Snapshot parent N for the PUCT denominator. Workers update it
         // concurrently, so we read once and use that throughout the loop.
         const auto parent_n = node->N.load(std::memory_order_relaxed);
+        const float parent_q = node->Q();
 
         Node* best_child = nullptr;
         float best_score = -1e30f;
         for (const auto& child : node->children) {
-            const float s = child->puct_score(parent_n, kCpuct);
+            const float s = child->puct_score(parent_n, kCpuct, parent_q);
             if (s > best_score) {
                 best_score = s;
                 best_child = child.get();
