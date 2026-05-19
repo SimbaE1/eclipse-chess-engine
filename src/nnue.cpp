@@ -8,6 +8,16 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+
+// Phase 3 SIMD inference. The scalar path below is preserved as a fallback;
+// the SIMD path is enabled when the compiler advertises AVX2 (x86) or NEON
+// (ARM). With -march=native this lights up automatically on the build host.
+#if defined(__AVX2__)
+#  include <immintrin.h>
+#endif
+#if defined(__ARM_NEON)
+#  include <arm_neon.h>
+#endif
 #include <vector>
 
 #include "bitboard.hpp"
@@ -331,11 +341,72 @@ namespace {
 
 // L1/L2 dense int8 dot product with int32 bias, post-shift by kWeightShift,
 // clamp into [0, kFtQuant] for the next layer's uint8 input.
+//
+// Three implementations of the same arithmetic contract:
+//   sum = b[o] + dot(uint8 in[kIn], int8 w[o, kIn])
+//   out[o] = clamp(sum >> kWeightShift, 0, kFtQuant)
+//
+// Inputs are alignas(64) stack buffers from evaluate(). Weights live in a
+// std::vector and have only 1-byte guaranteed alignment, so the weight load
+// is unaligned; the throughput cost of loadu vs load is zero on Haswell+ when
+// the address actually is aligned, which it usually is once kIn ≥ 32.
 template <int kIn, int kOut>
 void affine_clipped_relu(const std::uint8_t* in,
                          const std::int8_t*  w,        // [kOut, kIn]
                          const std::int32_t* b,        // [kOut]
                          std::uint8_t*       out) noexcept {
+#if defined(__AVX2__)
+    static_assert(kIn % 32 == 0, "AVX2 affine_clipped_relu: kIn must be a multiple of 32");
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    for (int o = 0; o < kOut; ++o) {
+        const std::int8_t* wo = w + o * kIn;
+        __m256i acc = _mm256_setzero_si256();
+        for (int i = 0; i < kIn; i += 32) {
+            // 32 uint8 inputs (aligned), 32 int8 weights (unaligned-safe).
+            const __m256i x = _mm256_load_si256(reinterpret_cast<const __m256i*>(in + i));
+            const __m256i y = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(wo + i));
+            // maddubs_epi16: u8 × i8 → i16, summing adjacent pairs (saturating).
+            // For uint8≤127 × int8 in [-128,127], the pair sum fits in int16
+            // without saturation (worst case 127*127 + 127*(-128) ≈ -32).
+            const __m256i p = _mm256_maddubs_epi16(x, y);
+            // madd_epi16: i16 × i16 (here ×1) → i32, summing adjacent pairs.
+            // Result: 8 lanes of int32 partial sums, no saturation possible.
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p, ones16));
+        }
+        // Horizontal-sum the 8 int32 lanes into one.
+        __m128i lo  = _mm256_castsi256_si128(acc);
+        __m128i hi  = _mm256_extracti128_si256(acc, 1);
+        __m128i s4  = _mm_add_epi32(lo, hi);
+        __m128i s2  = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, 0x4E));  // swap halves
+        __m128i s1  = _mm_add_epi32(s2, _mm_shuffle_epi32(s2, 0xB1));  // swap pairs
+        std::int32_t sum = b[o] + _mm_cvtsi128_si32(s1);
+        sum >>= kWeightShift;
+        if (sum < 0)         sum = 0;
+        if (sum > kFtQuant)  sum = kFtQuant;
+        out[o] = static_cast<std::uint8_t>(sum);
+    }
+#elif defined(__ARM_NEON)
+    static_assert(kIn % 16 == 0, "NEON affine_clipped_relu: kIn must be a multiple of 16");
+    for (int o = 0; o < kOut; ++o) {
+        const std::int8_t* wo = w + o * kIn;
+        int32x4_t acc = vdupq_n_s32(0);
+        for (int i = 0; i < kIn; i += 16) {
+            // 16 uint8 → 16 int16 (in fits in int8 since values ≤ 127), then
+            // signed multiply-accumulate against int8 weights via widening.
+            const int8x16_t x = vreinterpretq_s8_u8(vld1q_u8(in + i));
+            const int8x16_t y = vld1q_s8(wo + i);
+            const int16x8_t lo = vmull_s8(vget_low_s8(x),  vget_low_s8(y));   // 8× i16
+            const int16x8_t hi = vmull_s8(vget_high_s8(x), vget_high_s8(y));  // 8× i16
+            acc = vpadalq_s16(acc, lo);
+            acc = vpadalq_s16(acc, hi);
+        }
+        std::int32_t sum = b[o] + vaddvq_s32(acc);
+        sum >>= kWeightShift;
+        if (sum < 0)         sum = 0;
+        if (sum > kFtQuant)  sum = kFtQuant;
+        out[o] = static_cast<std::uint8_t>(sum);
+    }
+#else
     for (int o = 0; o < kOut; ++o) {
         std::int32_t sum = b[o];
         const std::int8_t* wo = w + o * kIn;
@@ -347,6 +418,7 @@ void affine_clipped_relu(const std::uint8_t* in,
         if (sum > kFtQuant)  sum = kFtQuant;
         out[o] = static_cast<std::uint8_t>(sum);
     }
+#endif
 }
 
 }  // namespace
