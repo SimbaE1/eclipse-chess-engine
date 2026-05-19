@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-#include <vector>
-#include <memory>
+#include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <vector>
 
 #include "move.hpp"
 #include "position.hpp"
@@ -12,45 +15,94 @@
 
 namespace eclipse::mcts {
 
+// W is stored as a fixed-point int64 (multiply real value by kWScale) so we
+// can fetch_add it atomically without relying on the still-uneven compiler
+// support for std::atomic<float>::fetch_add. 2^20 keeps us comfortably away
+// from int64 overflow even after 2^40 visits of values in [-1, 1].
+inline constexpr int     kWShift = 20;
+inline constexpr int64_t kWScale = 1LL << kWShift;
+
 struct Node {
-    Move move = MoveNone;
+    Move  move   = MoveNone;
     Node* parent = nullptr;
     std::vector<std::unique_ptr<Node>> children;
-    
-    float Q = 0.0f;          // Average value (from perspective of side to move in parent)
-    float W = 0.0f;          // Total accumulated value
-    float N = 0.0f;          // Visit count
-    float P = 0.0f;          // Policy prior
-    
-    bool is_expanded = false;
-    bool is_terminal = false;
 
-    Node(Move m, Node* p, float prior) : move(m), parent(p), P(prior) {}
+    // -- Lockless state ------------------------------------------------------
+    // N, W, virtual_loss are mutated by backpropagate() and read by select()
+    // from many worker threads. Relaxed ordering is enough: PUCT scores are
+    // approximate anyway, and we never read N and W as a transactional pair.
+    std::atomic<std::int32_t> N{0};
+    std::atomic<std::int64_t> W_fx{0};      // W * kWScale
+    std::atomic<std::int32_t> virtual_loss{0};
 
-    // PUCT formula: Q + c * P * sqrt(N_parent) / (1 + N)
-    float puct_score(float total_n, float cpuct) const {
-        return Q + cpuct * P * std::sqrt(total_n) / (1.0f + N);
+    float P = 0.0f;                          // policy prior - written once, then read-only
+
+    // is_expanded gates safe reads of `children`. The expanding thread sets it
+    // with release ordering at the end of expansion; readers acquire-load it
+    // before iterating children. expand_mutex serializes the expansion itself
+    // so children is never observed half-built.
+    std::atomic<bool> is_expanded{false};
+    bool              is_terminal = false;  // set under expand_mutex, then frozen
+    std::mutex        expand_mutex;
+
+    Node(Move m, Node* p, float prior) noexcept : move(m), parent(p), P(prior) {}
+
+    // -- Derived getters -----------------------------------------------------
+    float W() const noexcept {
+        return static_cast<float>(W_fx.load(std::memory_order_relaxed)) /
+               static_cast<float>(kWScale);
+    }
+
+    float Q() const noexcept {
+        const auto n = N.load(std::memory_order_relaxed);
+        return n > 0 ? W() / static_cast<float>(n) : 0.0f;
+    }
+
+    // PUCT with virtual loss applied. Treats each outstanding virtual_loss
+    // as a visit that returned -1.0 from this child's perspective, which is
+    // what dissuades other workers from selecting the same path while it's
+    // in flight.
+    float puct_score(std::int32_t parent_n, float cpuct) const noexcept {
+        const auto n  = N.load(std::memory_order_relaxed);
+        const auto vl = virtual_loss.load(std::memory_order_relaxed);
+        const auto n_eff = n + vl;
+
+        float q;
+        if (n_eff == 0) {
+            q = 0.0f;
+        } else {
+            const float w_eff = W() - static_cast<float>(vl);
+            q = w_eff / static_cast<float>(n_eff);
+        }
+        return q + cpuct * P * std::sqrt(static_cast<float>(parent_n)) /
+                              (1.0f + static_cast<float>(n_eff));
+    }
+
+    void apply_virtual_loss() noexcept {
+        virtual_loss.fetch_add(1, std::memory_order_relaxed);
+    }
+    void remove_virtual_loss() noexcept {
+        virtual_loss.fetch_sub(1, std::memory_order_relaxed);
     }
 };
 
 class MCTS {
 public:
     MCTS(Position& pos, SearchInfo& info) : root_pos(pos), search_info(info) {}
-    
+
     Move search();
 
 private:
-    void iterate();
-    Node* select(Node* node, Position& pos);
-    void expand(Node* node, const Position& pos);
-    float evaluate_node(const Position& pos);
-    void backpropagate(Node* node, float value);
+    void   worker_loop();
+    void   iterate();
+    void   expand_under_lock(Node* node, const Position& pos);
+    float  evaluate_node(const Position& pos);
 
-    Position& root_pos;
+    Position&   root_pos;
     SearchInfo& search_info;
     std::unique_ptr<Node> root;
-    
-    const float kCpuct = 1.41f; // Tuning constant
+
+    static constexpr float kCpuct = 1.41f;
 };
 
 }  // namespace eclipse::mcts

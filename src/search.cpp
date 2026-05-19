@@ -17,7 +17,7 @@ bool SearchInfo::time_up() const noexcept {
 }
 
 Move search(Position& pos, SearchInfo& info) {
-    info.nodes_searched = 0;
+    info.nodes_searched.store(0, std::memory_order_relaxed);
     info.start_time     = std::chrono::steady_clock::now();
     info.best_move      = MoveNone;
     info.best_score     = -kInfinite;

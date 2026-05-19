@@ -22,8 +22,13 @@ struct SearchInfo {
     SearchLimits      limits;
     std::atomic<bool> stop{false};
 
-    // Filled during search.
-    std::int64_t                            nodes_searched = 0;
+    // Worker count for multi-threaded MCTS. Set by the UCI Threads option,
+    // hard-clamped to [1, 128]. 1 keeps the single-threaded code path.
+    int               threads = 1;
+
+    // Filled during search. Atomic because multiple MCTS workers fetch_add
+    // concurrently.
+    std::atomic<std::int64_t>               nodes_searched{0};
     std::chrono::steady_clock::time_point   start_time{};
 
     Move  best_move  = MoveNone;
