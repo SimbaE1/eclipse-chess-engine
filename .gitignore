@@ -23,3 +23,7 @@ data/
 data/*
 !data/.gitkeep
 !data/*.pgn
+# The 1858-entry Lc0 policy index <-> UCI move map is small (~17 KB) and
+# required for the policy net to produce non-uniform priors. Commit it
+# alongside the code rather than shipping it via Releases.
+!data/lc0_policy_map.txt

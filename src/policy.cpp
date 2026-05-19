@@ -3,10 +3,14 @@
 #include "movegen.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <vector>
 #include <iostream>
 #include <fstream>
 #include <onnxruntime_cxx_api.h>
+#ifdef __APPLE__
+#include <coreml_provider_factory.h>
+#endif
 
 namespace eclipse::policy {
 
@@ -162,21 +166,58 @@ bool load(const std::string& path) {
         session_options.SetInterOpNumThreads(1);
         session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 
+#ifdef __APPLE__
+        // CoreML EP: dispatches supported ops to the Apple Neural Engine
+        // (Apple Silicon) or the discrete/integrated GPU via Metal (Intel
+        // Macs with Radeon Vega / Iris). Ops the EP can't handle silently
+        // fall back to the CPU EP, so this is safe to always enable. Honor
+        // ECLIPSE_DISABLE_COREML=1 as an escape hatch for triage.
+        //
+        // First-run cost: ORT compiles supported subgraphs to MLProgram
+        // format, which can take a few seconds on a large transformer. The
+        // result is cached in /tmp by default; survives within a process but
+        // not across processes (would need ModelCacheDirectory for that).
+        bool coreml_disabled = false;
+        if (const char* env_disable = std::getenv("ECLIPSE_DISABLE_COREML")) {
+            coreml_disabled = env_disable[0] != '\0' && env_disable[0] != '0';
+        }
+        if (!coreml_disabled) {
+            try {
+                uint32_t coreml_flags = COREML_FLAG_USE_NONE;
+                Ort::ThrowOnError(OrtSessionOptionsAppendExecutionProvider_CoreML(
+                    session_options, coreml_flags));
+                std::cout << "info string CoreML EP enabled "
+                             "(falls back to CPU for unsupported ops)" << std::endl;
+            } catch (const std::exception& e) {
+                std::cerr << "info string CoreML EP unavailable, using CPU only: "
+                          << e.what() << std::endl;
+            }
+        }
+#endif
+
         session = std::make_unique<Ort::Session>(env, path.c_str(), session_options);
         std::cout << "info string Policy NN loaded: " << path << std::endl;
-        
-        // Try to load policy map
-        if (!init_policy_map("lc0_policy_map.txt")) {
-            // Try absolute path
-            if (!init_policy_map("/Users/ezra/TCEC/lc0_policy_map.txt")) {
-                // Try one level up
-                if (!init_policy_map("../lc0_policy_map.txt")) {
-                    // Try two levels up
-                    if (!init_policy_map("../../lc0_policy_map.txt")) {
-                        std::cerr << "info string Warning: Could not find lc0_policy_map.txt" << std::endl;
-                    }
-                }
-            }
+
+        // Resolve lc0_policy_map.txt relative to the .onnx we just opened.
+        // The canonical home is `data/lc0_policy_map.txt`; we also look in the
+        // same directory as `path` (handy if the user keeps weights in a
+        // non-standard location) and finally the CWD.
+        std::vector<std::string> candidates;
+        auto slash = path.find_last_of('/');
+        if (slash != std::string::npos) {
+            candidates.push_back(path.substr(0, slash + 1) + "lc0_policy_map.txt");
+        }
+        candidates.push_back("data/lc0_policy_map.txt");
+        candidates.push_back("lc0_policy_map.txt");
+
+        bool loaded_map = false;
+        for (const auto& c : candidates) {
+            if (init_policy_map(c)) { loaded_map = true; break; }
+        }
+        if (!loaded_map) {
+            std::cerr << "info string Warning: lc0_policy_map.txt not found; "
+                         "policy net will fall back to uniform priors "
+                         "(expect very weak play)." << std::endl;
         }
         
         return true;

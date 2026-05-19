@@ -73,6 +73,11 @@ scp m1-air:/Users/ezra/TCEC/eclipse/data/policy.onnx data/
 With the release in `data/`, you can skip step 3 (policy conversion) entirely —
 `policy.onnx` is the same artifact `lc0 leela2onnx` would produce.
 
+The 1858-entry policy index → UCI move map (`data/lc0_policy_map.txt`) is
+required for the policy net to produce meaningful priors. It's committed to
+the repo since it's tiny (~17 KB) and identical for every Lc0 net, so a
+fresh clone has everything it needs after the release-download step.
+
 ## 5. Verify
 
 ```bash
