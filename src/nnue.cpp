@@ -587,8 +587,9 @@ Score evaluate(const Position& pos) noexcept {
 
     float sum_p = 0.0f;
     std::array<float, 3> probs;
+    constexpr float kLogitScale = static_cast<float>(kWeightScale * kFtQuant);
     for (int j = 0; j < 3; ++j) {
-        probs[static_cast<std::size_t>(j)] = std::exp((logits[static_cast<std::size_t>(j)] - max_l) / 512.0f);
+        probs[static_cast<std::size_t>(j)] = std::exp((logits[static_cast<std::size_t>(j)] - max_l) / kLogitScale);
         sum_p += probs[static_cast<std::size_t>(j)];
     }
 
@@ -666,8 +667,9 @@ void evaluate_batch(const Accumulator* accs, const Color* stms, Score* scores, i
 
         float sum_p = 0.0f;
         std::array<float, 3> probs;
+        constexpr float kLogitScale = static_cast<float>(kWeightScale * kFtQuant);
         for (int j = 0; j < 3; ++j) {
-            probs[static_cast<std::size_t>(j)] = std::exp((logits[static_cast<std::size_t>(j)] - max_l) / 512.0f);
+            probs[static_cast<std::size_t>(j)] = std::exp((logits[static_cast<std::size_t>(j)] - max_l) / kLogitScale);
             sum_p += probs[static_cast<std::size_t>(j)];
         }
 
