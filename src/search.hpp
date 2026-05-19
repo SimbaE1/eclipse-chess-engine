@@ -31,6 +31,13 @@ struct SearchInfo {
     // hard-clamped to [1, 128]. 1 keeps the single-threaded code path.
     int               threads = 1;
 
+    // Minimum score advantage (centipawns) required for an Alpha-Beta result
+    // to override the MCTS move choice.
+    int               override_margin = 150;
+
+    // Number of threads to dedicate to the Alpha-Beta verifier.
+    int               ab_threads = 1;
+
     // Filled during search. Atomic because multiple MCTS workers fetch_add
     // concurrently.
     std::atomic<std::int64_t>               nodes_searched{0};

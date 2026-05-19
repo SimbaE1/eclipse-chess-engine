@@ -98,7 +98,11 @@ class MCTS {
 public:
     MCTS(Position& pos, SearchInfo& info) : root_pos(pos), search_info(info) {}
 
-    Move search();
+    Move search(); // deprecated/wrapper
+
+    void run();
+    void adjust_root_q(Move m, Score s);
+    Move get_best_move();
 
 private:
     void   worker_loop();

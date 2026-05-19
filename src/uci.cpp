@@ -14,6 +14,7 @@
 #include "perft.hpp"
 #include "position.hpp"
 #include "search.hpp"
+#include "tt.hpp"
 #include "zobrist.hpp"
 
 namespace eclipse::uci {
@@ -74,6 +75,9 @@ void cmd_uci() {
               << "option name EvalFile type string default <empty>\n"
               << "option name PolicyFile type string default <empty>\n"
               << "option name Threads type spin default 1 min 1 max 128\n"
+              << "option name Hash type spin default 16 min 1 max 16384\n"
+              << "option name OverrideMargin type spin default 150 min 0 max 1000\n"
+              << "option name AbThreads type spin default 1 min 0 max 128\n"
               << "uciok" << std::endl;
 }
 
@@ -115,6 +119,13 @@ void cmd_setoption(const std::vector<std::string>& tok) {
     } else if (name == "Threads") {
         const int n = std::atoi(value.c_str());
         g_search_info.threads = std::clamp(n, 1, 128);
+    } else if (name == "Hash") {
+        g_tt.resize(std::atoi(value.c_str()));
+    } else if (name == "OverrideMargin") {
+        g_search_info.override_margin = std::atoi(value.c_str());
+    } else if (name == "AbThreads") {
+        const int n = std::atoi(value.c_str());
+        g_search_info.ab_threads = std::clamp(n, 0, 128);
     }
     // Unknown options are silently ignored per UCI convention.
 }

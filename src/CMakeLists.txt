@@ -11,6 +11,7 @@ add_library(eclipse_core STATIC
     policy.cpp
     position.cpp
     search.cpp
+    tt.cpp
     uci.cpp
     zobrist.cpp
 )

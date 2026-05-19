@@ -81,6 +81,8 @@ public:
     // ---- mutators -------------------------------------------------------------
     void do_move  (Move m, StateInfo& st);
     void undo_move(Move m, const StateInfo& st);
+    void do_null_move  (StateInfo& st);
+    void undo_null_move(const StateInfo& st);
 
     // ---- debug ----------------------------------------------------------------
     std::string ascii_board() const;

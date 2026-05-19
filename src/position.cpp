@@ -475,6 +475,37 @@ void Position::undo_move(Move m, const StateInfo& st) {
     acc_ = st.accumulator;
 }
 
+void Position::do_null_move(StateInfo& st) {
+    st.prev_castling = castling_;
+    st.prev_ep       = ep_;
+    st.prev_halfmove = halfmove_clock_;
+    st.prev_key      = key_;
+    st.captured      = NoPiece;
+    st.accumulator   = acc_;
+
+    if (ep_ != SquareNone) {
+        key_ ^= zobrist::en_passant_file[file_of(ep_)];
+        ep_ = SquareNone;
+    }
+
+    stm_ = ~stm_;
+    key_ ^= zobrist::side_to_move;
+
+    if (stm_ == White) ++fullmove_number_;
+    ++halfmove_clock_;
+}
+
+void Position::undo_null_move(const StateInfo& st) {
+    stm_ = ~stm_;
+    if (stm_ == Black) --fullmove_number_;
+
+    castling_         = st.prev_castling;
+    ep_               = st.prev_ep;
+    halfmove_clock_   = st.prev_halfmove;
+    key_              = st.prev_key;
+    acc_              = st.accumulator;
+}
+
 std::string Position::ascii_board() const {
     std::ostringstream oss;
     for (int r = 7; r >= 0; --r) {

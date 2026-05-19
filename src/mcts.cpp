@@ -54,6 +54,11 @@ RootSnapshot<K> snapshot_root_topk(const Node& root) {
 }  // namespace
 
 Move MCTS::search() {
+    run();
+    return get_best_move();
+}
+
+void MCTS::run() {
     root = std::make_unique<Node>(MoveNone, nullptr, 1.0f);
 
     // Root expansion is single-threaded so workers see a populated child list
@@ -113,25 +118,45 @@ Move MCTS::search() {
                               << m.to_uci() << " (MCTS did not visit)"
                               << std::endl;
                 }
-                return m;
+                search_info.best_move = m;
+                return;
             }
         }
     }
+}
 
-    // Best move = most-visited root child. Visit count is the standard MCTS
-    // signal because it incorporates both Q (a child gets more visits when
-    // its Q is good) and prior (PUCT exploration tilts visits toward priors
-    // early). Tie-broken by Q to avoid picking a fluky-high-prior move that
-    // happened to share visits with a better one.
-    //
-    // child->Q() is from the child's STM (= our opponent's) perspective, so a
-    // LOWER child Q is BETTER for us. Tie-break and final-score display both
-    // negate to report from our perspective.
+void MCTS::adjust_root_q(Move m, Score s) {
+    if (!root) return;
+    for (auto& child : root->children) {
+        if (child->move == m) {
+            // Convert centipawns back to Q-value [-1, 1].
+            // Score s is from our perspective. Child Q is from opponent's.
+            // So we want child Q to be -s / 400.
+            const float target_q = -static_cast<float>(s) / 400.0f;
+            const auto n = child->N.load(std::memory_order_relaxed);
+            if (n > 0) {
+                // Adjust W such that W/N = target_q
+                const int64_t target_w_fx = static_cast<int64_t>(target_q * n * kWScale);
+                child->W_fx.store(target_w_fx, std::memory_order_relaxed);
+                
+                std::cout << "info string MCTS adjusted " << m.to_uci() 
+                          << " Q to " << std::fixed << std::setprecision(3) << target_q
+                          << " based on AB score " << s << "cp" << std::endl;
+            }
+            break;
+        }
+    }
+}
+
+Move MCTS::get_best_move() {
+    if (search_info.best_move != MoveNone) return search_info.best_move;
+
     Node* best_child = nullptr;
     for (const auto& child : root->children) {
         if (!best_child) { best_child = child.get(); continue; }
         const auto cn = child->N.load(std::memory_order_relaxed);
         const auto bn = best_child->N.load(std::memory_order_relaxed);
+        // Best move = most-visited root child. Tie-broken by Q.
         if (cn > bn || (cn == bn && child->Q() < best_child->Q())) {
             best_child = child.get();
         }
