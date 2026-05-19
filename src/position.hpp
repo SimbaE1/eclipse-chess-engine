@@ -5,6 +5,7 @@
 #include <string>
 #include <string_view>
 
+#include "accumulator.hpp"
 #include "bitboard.hpp"
 #include "move.hpp"
 #include "types.hpp"
@@ -16,11 +17,14 @@ namespace eclipse {
 // matched do/undo pair. This mirrors Stockfish's approach and avoids embedding
 // a history stack inside Position itself.
 struct StateInfo {
-    CastlingRights prev_castling      = NoCastling;
-    Square         prev_ep            = SquareNone;
-    int            prev_halfmove      = 0;
-    std::uint64_t  prev_key           = 0;
-    Piece          captured           = NoPiece;
+    CastlingRights    prev_castling   = NoCastling;
+    Square            prev_ep         = SquareNone;
+    int               prev_halfmove   = 0;
+    std::uint64_t     prev_key        = 0;
+    Piece             captured        = NoPiece;
+    // Pre-do_move accumulator snapshot, used by undo_move to restore the
+    // Position's cached accumulator without a full refresh.
+    nnue::Accumulator accumulator{};
 };
 
 class Position {
@@ -58,6 +62,13 @@ public:
         return lsb(by_piece_[make_piece(c, King)]);
     }
 
+    // Up-to-date NNUE accumulator for this position. Maintained incrementally
+    // by do_move / undo_move; falls back to a refresh on first access if the
+    // network was loaded after the position was last set. Marked `mutable` /
+    // returned by non-const reference so evaluate() (which takes
+    // `const Position&`) can perform the lazy refresh.
+    nnue::Accumulator& accumulator() const noexcept { return acc_; }
+
     // ---- queries --------------------------------------------------------------
     // True iff the given square is attacked by any piece of color `by`.
     bool is_square_attacked(Square s, Color by) const noexcept;
@@ -85,6 +96,12 @@ private:
     int             halfmove_clock_   = 0;
     int             fullmove_number_  = 1;
     std::uint64_t   key_              = 0;
+
+    // Incrementally-maintained NNUE accumulator. Refreshed in set_from_fen,
+    // updated in do_move, restored from StateInfo in undo_move. `mutable` so
+    // evaluate() can lazy-refresh through the const accessor when the network
+    // was loaded after the position was last set.
+    mutable nnue::Accumulator acc_{};
 
     // Hash-updating piece moves used by do_move().
     void put_piece   (Piece p, Square s);
