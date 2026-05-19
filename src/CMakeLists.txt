@@ -1,4 +1,5 @@
 add_library(eclipse_core STATIC
+    ab.cpp
     attacks.cpp
     bitboard.cpp
     eval.cpp
