@@ -50,8 +50,21 @@ if(ECLIPSE_SANITIZERS)
         $<$<CONFIG:Debug>:-fsanitize=address,undefined>)
 endif()
 
-# ONNX Runtime
-set(ONNXRUNTIME_ROOT "/opt/homebrew/Cellar/onnxruntime/1.26.0")
+# ONNX Runtime - locate via Homebrew so this works on both Intel
+# (/usr/local) and Apple Silicon (/opt/homebrew) Macs without hardcoding.
+# Honor a caller-provided ONNXRUNTIME_ROOT first for cross-builds.
+if(NOT ONNXRUNTIME_ROOT)
+    execute_process(
+        COMMAND brew --prefix onnxruntime
+        OUTPUT_VARIABLE ONNXRUNTIME_ROOT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE _eclipse_onnx_result)
+    if(NOT _eclipse_onnx_result EQUAL 0 OR NOT IS_DIRECTORY "${ONNXRUNTIME_ROOT}")
+        message(FATAL_ERROR
+            "Could not locate onnxruntime. Install with `brew install onnxruntime` "
+            "or pass -DONNXRUNTIME_ROOT=/path/to/onnxruntime.")
+    endif()
+endif()
 include_directories(${ONNXRUNTIME_ROOT}/include/onnxruntime)
 link_directories(${ONNXRUNTIME_ROOT}/lib)
 

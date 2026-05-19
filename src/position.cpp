@@ -2,11 +2,13 @@
 #include "position.hpp"
 
 #include <array>
+#include <cassert>
 #include <cctype>
 #include <cstdlib>
 #include <sstream>
 
 #include "attacks.hpp"
+#include "nnue.hpp"
 #include "zobrist.hpp"
 
 namespace eclipse {
@@ -224,6 +226,12 @@ bool Position::set_from_fen(std::string_view fen) {
     }
 
     key_ = compute_key();
+
+    // Refresh the NNUE accumulator to match the freshly-loaded position. If
+    // the network is not loaded yet, refresh() leaves acc_.computed=false and
+    // evaluate() will lazy-refresh on first call.
+    nnue::refresh(*this, acc_);
+
     return true;
 }
 
@@ -308,6 +316,11 @@ void Position::do_move(Move m, StateInfo& st) {
     st.captured      = (mt == Move::EnPassant)
                          ? make_piece(them, Pawn)
                          : board_[to];
+    // Snapshot the pre-move accumulator so undo_move can restore it without
+    // a full refresh. Unconditional copy keeps the do/undo symmetry simple
+    // even when the network has not been loaded (acc_.computed=false carries
+    // through the snapshot too).
+    st.accumulator = acc_;
 
     // The castling-rights hash key uses the full 4-bit mask, so we XOR out
     // the old value here and XOR in the new one at the bottom of this fn.
@@ -357,6 +370,42 @@ void Position::do_move(Move m, StateInfo& st) {
         }
     }
 
+    // ---- NNUE accumulator: incremental update ----
+    // HalfKP feature indices are king-relative, so any move that shifts a
+    // king (explicit king moves and castling) invalidates every feature and
+    // forces a full refresh. Everything else touches 2-3 columns at most.
+    //
+    // The helpers read king_square() off `*this`, which is fine because the
+    // king has NOT moved in any branch other than the full-refresh ones.
+    // We skip work entirely when acc_.computed is false - either the network
+    // is not loaded or evaluate() will lazy-refresh on first call.
+    if (acc_.computed) {
+        const bool king_moved = (moving_pt == King) || (mt == Move::Castling);
+        if (king_moved) {
+            nnue::refresh(*this, acc_);
+        } else if (mt == Move::EnPassant) {
+            const Square cap_sq = make_square(file_of(to), rank_of(from));
+            nnue::remove_piece(acc_, *this, them, Pawn,      cap_sq);
+            nnue::remove_piece(acc_, *this, us,   Pawn,      from);
+            nnue::add_piece   (acc_, *this, us,   Pawn,      to);
+        } else if (mt == Move::Promotion) {
+            if (st.captured != NoPiece) {
+                nnue::remove_piece(acc_, *this, color_of(st.captured),
+                                   type_of(st.captured), to);
+            }
+            nnue::remove_piece(acc_, *this, us, Pawn,                  from);
+            nnue::add_piece   (acc_, *this, us, m.promotion_piece(),   to);
+        } else {
+            // Normal quiet or capture move.
+            if (st.captured != NoPiece) {
+                nnue::remove_piece(acc_, *this, color_of(st.captured),
+                                   type_of(st.captured), to);
+            }
+            nnue::remove_piece(acc_, *this, us, moving_pt, from);
+            nnue::add_piece   (acc_, *this, us, moving_pt, to);
+        }
+    }
+
     // Castling-rights revocation: any move out of or into one of the keyed
     // squares revokes the affected rights.
     castling_ &= ~(kCastlingRevoke[from] | kCastlingRevoke[to]);
@@ -364,6 +413,23 @@ void Position::do_move(Move m, StateInfo& st) {
 
     stm_ = them;
     key_ ^= zobrist::side_to_move;
+
+#ifndef NDEBUG
+    // Debug-only invariant: the incrementally-updated accumulator must match
+    // a from-scratch refresh of the post-move position bit-for-bit. Catches
+    // missed king-move refreshes, perspective desyncs, and feature-index
+    // miscalculations immediately at the source of the error.
+    if (acc_.computed && nnue::is_loaded()) {
+        nnue::Accumulator scratch;
+        nnue::refresh(*this, scratch);
+        assert(scratch.computed);
+        for (int p = 0; p < 2; ++p) {
+            for (int i = 0; i < nnue::kFtOutSize; ++i) {
+                assert(acc_.v[p][i] == scratch.v[p][i]);
+            }
+        }
+    }
+#endif
 }
 
 void Position::undo_move(Move m, const StateInfo& st) {
@@ -402,6 +468,11 @@ void Position::undo_move(Move m, const StateInfo& st) {
     halfmove_clock_   = st.prev_halfmove;
     key_              = st.prev_key;
     if (us == Black) --fullmove_number_;
+
+    // Restore the pre-do_move accumulator snapshot. Unconditional copy: if
+    // the network was not loaded the snapshot is just an uncomputed zero
+    // accumulator, which is the correct state to roll back to.
+    acc_ = st.accumulator;
 }
 
 std::string Position::ascii_board() const {

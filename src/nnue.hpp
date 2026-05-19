@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <string>
 
+#include "accumulator.hpp"
 #include "eval.hpp"
 #include "position.hpp"
 #include "types.hpp"
@@ -33,9 +34,9 @@
 namespace eclipse::nnue {
 
 // ---- Architecture constants ------------------------------------------------
+// kFtOutSize is defined in accumulator.hpp.
 
-constexpr int kFtOutSize        = 512;          // per perspective
-constexpr int kL1InSize         = 2 * kFtOutSize; // = 512
+constexpr int kL1InSize         = 2 * kFtOutSize; // = 1024
 constexpr int kL1OutSize        = 32;
 constexpr int kL2OutSize        = 32;
 constexpr int kL3OutSize        = 1;
@@ -73,17 +74,8 @@ constexpr int          kWeightShift     = 6;     // log2(kWeightScale)
 constexpr std::int32_t kOutputScale     = 16;
 
 // ---- Public types ----------------------------------------------------------
-
-// One accumulator per perspective. The two perspectives share weights but are
-// indexed differently (king-relative + own/opp color), so we keep them as
-// separate int16[256] arrays.
-//
-// alignas(64) so SIMD loads (32B for AVX2, 16B for NEON) stay aligned even when
-// the struct is embedded inside StateInfo in Phase 2.
-struct alignas(64) Accumulator {
-    std::array<std::int16_t, kFtOutSize> v[2]{};   // [perspective]
-    bool computed = false;                          // false = needs full refresh
-};
+// Accumulator is defined in accumulator.hpp (so position.hpp can hold one
+// without circular include).
 
 // HalfKP feature index for a single piece-on-square, relative to the king
 // square of the given perspective. Returns a value in [0, kFtNumFeatures).
@@ -116,11 +108,24 @@ bool is_loaded() noexcept;
 // loses track of the incremental state.
 void refresh(const Position& pos, Accumulator& acc) noexcept;
 
+// Add the FT column for one piece (color, pt, sq) to `acc` on both perspectives.
+// Caller must guarantee that the king squares in `pos` are the post-move ones
+// when (color/pt/sq) describes a post-move piece; equivalently, the kings did
+// NOT move on this update (king moves require a full refresh).
+void add_piece(Accumulator& acc, const Position& pos,
+               Color c, PieceType pt, Square sq) noexcept;
+
+// Symmetric subtract: remove the FT column for (color, pt, sq) from `acc`.
+// Same king-invariance constraint as add_piece.
+void remove_piece(Accumulator& acc, const Position& pos,
+                  Color c, PieceType pt, Square sq) noexcept;
+
 // Forward pass: returns the score in centipawns from the side-to-move's
 // perspective, matching eclipse::evaluate's contract.
 //
-// Phase 1: ignores any external accumulator and recomputes from scratch.
-// Phase 2: will take the up-to-date accumulator from the current StateInfo.
+// Reads the up-to-date accumulator from `pos.accumulator()`. If it is not
+// marked computed (e.g. NNUE was loaded after the position was last set),
+// performs an on-the-spot refresh and caches the result.
 Score evaluate(const Position& pos) noexcept;
 
 }  // namespace eclipse::nnue

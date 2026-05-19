@@ -214,6 +214,58 @@ bool load(const std::string& path) {
     return true;
 }
 
+// ---- Incremental piece updates --------------------------------------------
+
+namespace {
+
+// Add or subtract one piece's FT column on both perspective accumulators.
+// `Sign` is +1 for add, -1 for remove. Both perspectives must be touched in
+// lockstep - they share weights but are indexed differently, so updating only
+// one would silently desync the other.
+//
+// King squares are read from `pos`, so the caller must ensure the kings have
+// not moved relative to the accumulator state being updated (king moves
+// invalidate every feature index and require a full refresh instead).
+template <int Sign>
+void apply_piece(Accumulator& acc, const Position& pos,
+                 Color c, PieceType pt, Square sq) noexcept {
+    static_assert(Sign == 1 || Sign == -1, "Sign must be +1 or -1");
+    if (!g_loaded) return;
+    if (pt == King) return;  // King is implicit (defines perspective), no FT column.
+
+    for (std::size_t persp = 0; persp < 2; ++persp) {
+        const Color persp_color = (persp == 0) ? White : Black;
+        Square king_sq  = pos.king_square(persp_color);
+        Square piece_sq = sq;
+        // HalfKP mirror convention: Black perspective sees everything flipped
+        // so the network always reasons in own-side-of-board coordinates.
+        if (persp_color == Black) {
+            king_sq  = flip_rank(king_sq);
+            piece_sq = flip_rank(piece_sq);
+        }
+        const bool is_ours = (c == persp_color);
+        const int  idx     = feature_index(king_sq, piece_sq, pt, is_ours);
+        const std::int16_t* col =
+            &g_ft_w[static_cast<std::size_t>(idx) * kFtOutSize];
+        for (std::size_t i = 0; i < kFtOutSize; ++i) {
+            acc.v[persp][i] = static_cast<std::int16_t>(
+                acc.v[persp][i] + Sign * col[i]);
+        }
+    }
+}
+
+}  // namespace
+
+void add_piece(Accumulator& acc, const Position& pos,
+               Color c, PieceType pt, Square sq) noexcept {
+    apply_piece<+1>(acc, pos, c, pt, sq);
+}
+
+void remove_piece(Accumulator& acc, const Position& pos,
+                  Color c, PieceType pt, Square sq) noexcept {
+    apply_piece<-1>(acc, pos, c, pt, sq);
+}
+
 // ---- Refresh --------------------------------------------------------------
 
 void refresh(const Position& pos, Accumulator& acc) noexcept {
@@ -286,12 +338,13 @@ void affine_clipped_relu(const std::uint8_t* in,
 }  // namespace
 
 Score evaluate(const Position& pos) noexcept {
-    // Phase 1: full refresh on every call. Phase 2 will replace this with a
-    // pull from the up-to-date StateInfo accumulator.
-    Accumulator acc;
-    refresh(pos, acc);
+    // Phase 2: read the incrementally-maintained accumulator off the Position.
+    // do_move keeps it in sync; we only refresh on the cold path (network
+    // loaded after set_from_fen, or someone forgot to mark it computed).
+    Accumulator& acc = pos.accumulator();
+    if (!acc.computed) refresh(pos, acc);
     if (!acc.computed) {
-        // Should only happen if !is_loaded() - caller checks, but defend.
+        // refresh() left it false -> the network is not loaded. Fall back.
         return material_evaluate(pos);
     }
 
