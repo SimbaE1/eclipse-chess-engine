@@ -10,12 +10,25 @@ After training, save state_dict (.pt) and convert with:
         --state-dict path/to/weights.pt \
         --out data/eclipse.nnue
 
-Training data format (line-oriented, one position per line):
+Training data format (line-oriented, one position per line). Two formats
+are autodetected per line (mixed files are fine):
 
-    <fen>;<score_cp>
+    <fen>;<W>;<D>;<L>       # observed game outcome (preferred for WDL head)
+    <fen>;<score_cp>        # cp-derived legacy format (single-cp head only)
 
-where score_cp is the centipawn evaluation from the side-to-move's perspective,
-e.g. produced by `stockfish go depth 8`. Lines starting with '#' are ignored.
+WDL labels come from real game results (use extract_lichess_wdl.py — labels
+each position with the game's eventual W/D/L from STM's perspective). cp
+labels are Stockfish-evaluated centipawns from STM's perspective.
+
+The WDL→cp derivation that used to live in the cp path was broken in a
+subtle way: `sigmoid(x) + sigmoid(-x) = 1` algebraically, so
+`draw_prob = 1 - sigmoid(x) - sigmoid(-x)` was always 0. The trainer was
+silently producing a W/L binary classifier with the D channel zeroed out.
+The WDL-labels path uses cross-entropy on the true distribution and is
+the right thing for the WDL head; the cp path remains for the legacy
+single-cp head and emits a deprecation warning.
+
+Lines starting with '#' are ignored.
 
 Example label generation (bash):
 
@@ -179,21 +192,22 @@ MAX_ACTIVE = 32
 
 
 class HalfKAv2Dataset(Dataset):
-    """Reads `<fen>;<score_cp>` lines into flat numpy arrays.
+    """Reads `<fen>;<W>;<D>;<L>` or legacy `<fen>;<score_cp>` lines into flat
+    numpy arrays. Format is autodetected per line by counting separators.
 
     Memory model: three contiguous arrays
-        us_idx   : int32 [N, MAX_ACTIVE]   (padded with FT_IN_FEATURES sentinel)
-        them_idx : int32 [N, MAX_ACTIVE]
-        scores   : float32 [N]
+        us_idx   : int32   [N, MAX_ACTIVE]   (padded with FT_IN_FEATURES sentinel)
+        them_idx : int32   [N, MAX_ACTIVE]
+        targets  : float32 [N, 3]            (W, D, L) or (sigmoid(cp), 0, sigmoid(-cp))
 
-    For 10M positions this is 10M * (32+32) * 4 + 10M * 4 = ~2.6 GB - flat,
-    cache-friendly, and pickling-cheap if DataLoader workers are ever used.
+    targets is always shape [N, 3]; the cp path back-fills draw=0 to keep the
+    array shape uniform (and the trainer warns when cp-labeled rows are seen,
+    since the resulting WDL targets are degenerate).
 
-    Versus the original per-row tuple/list storage, which spent ~80 bytes of
-    Python object overhead per row, that's a 5-10x memory saving at scale.
+    For 10M positions: 10M * (32+32) * 4 + 10M * 3 * 4 = ~2.7 GB.
     """
 
-    def __init__(self, path: Path, max_lines: int | None = None):
+    def __init__(self, path: Path, max_lines: int | None = None, cp_scale: float = 410.0):
         # Two-pass: count usable lines, then allocate flat arrays of the right
         # size and fill them. Avoids Python list growth + per-row object
         # overhead during construction.
@@ -211,10 +225,12 @@ class HalfKAv2Dataset(Dataset):
 
         self.us_idx   = np.full((n, MAX_ACTIVE), FT_IN_FEATURES, dtype=np.int32)
         self.them_idx = np.full((n, MAX_ACTIVE), FT_IN_FEATURES, dtype=np.int32)
-        self.scores   = np.zeros(n, dtype=np.float32)
+        self.targets  = np.zeros((n, 3), dtype=np.float32)  # always (W, D, L)
 
         i = 0
         skipped = 0
+        n_wdl_rows = 0
+        n_cp_rows  = 0
         with path.open() as f:
             for ln, line in enumerate(f, start=1):
                 line = line.strip()
@@ -222,14 +238,41 @@ class HalfKAv2Dataset(Dataset):
                     continue
                 if i >= n:
                     break
-                try:
-                    fen, score_str = line.split(";")
-                    score = float(score_str.strip())
-                except ValueError:
+
+                parts = line.split(";")
+                # 4 fields => WDL (fen, W, D, L); 2 fields => legacy cp.
+                if len(parts) == 4:
+                    try:
+                        fen = parts[0].strip()
+                        w   = float(parts[1].strip())
+                        d   = float(parts[2].strip())
+                        l   = float(parts[3].strip())
+                    except ValueError:
+                        skipped += 1
+                        continue
+                    target = (w, d, l)
+                    n_wdl_rows += 1
+                elif len(parts) == 2:
+                    try:
+                        fen   = parts[0].strip()
+                        score = float(parts[1].strip())
+                    except ValueError:
+                        skipped += 1
+                        continue
+                    # cp -> WDL via sigmoid mapping. We back-fill draw=0 to
+                    # keep the array shape uniform; the trainer will warn
+                    # about cp rows since this collapses to a W/L target.
+                    # Kept only for compatibility with old cp datasets.
+                    import math
+                    pw = 1.0 / (1.0 + math.exp(-score / cp_scale))
+                    target = (pw, 0.0, 1.0 - pw)
+                    n_cp_rows += 1
+                else:
                     skipped += 1
                     continue
+
                 try:
-                    us, them = fen_to_features(fen.strip())
+                    us, them = fen_to_features(fen)
                 except (KeyError, IndexError, ValueError) as e:
                     if skipped < 5:
                         print(f"  skip line {ln}: feature error: {e}", file=sys.stderr)
@@ -239,7 +282,9 @@ class HalfKAv2Dataset(Dataset):
                 k_them = min(len(them), MAX_ACTIVE)
                 self.us_idx[i,   :k_us]   = us[:k_us]
                 self.them_idx[i, :k_them] = them[:k_them]
-                self.scores[i] = score
+                self.targets[i, 0] = target[0]
+                self.targets[i, 1] = target[1]
+                self.targets[i, 2] = target[2]
                 i += 1
                 if i % 500_000 == 0:
                     print(f"  loaded {i}/{n} positions", file=sys.stderr)
@@ -251,16 +296,27 @@ class HalfKAv2Dataset(Dataset):
         if i < n:
             self.us_idx   = self.us_idx[:i]
             self.them_idx = self.them_idx[:i]
-            self.scores   = self.scores[:i]
+            self.targets  = self.targets[:i]
 
-        print(f"loaded {i} positions ({skipped} skipped)")
+        print(f"loaded {i} positions ({skipped} skipped, "
+              f"wdl_rows={n_wdl_rows}, cp_rows={n_cp_rows})")
+        if n_cp_rows > 0 and n_wdl_rows == 0:
+            print("WARNING: all rows are legacy cp format. The derived WDL "
+                  "targets put 0 mass on draw — the resulting net will be "
+                  "a W/L binary classifier, not a real WDL net. Re-extract "
+                  "with scripts/extract_lichess_wdl.py for proper WDL.",
+                  file=sys.stderr)
+        elif n_cp_rows > 0:
+            mix = 100.0 * n_cp_rows / max(1, n_cp_rows + n_wdl_rows)
+            print(f"WARNING: {mix:.1f}% of rows are legacy cp format with "
+                  f"degenerate draw=0 targets.", file=sys.stderr)
 
     def __len__(self):
-        return len(self.scores)
+        return len(self.targets)
 
     def __getitem__(self, idx):
         # Return numpy slices - cheap, no allocation. collate() stacks them.
-        return self.us_idx[idx], self.them_idx[idx], self.scores[idx]
+        return self.us_idx[idx], self.them_idx[idx], self.targets[idx]
 
 
 def collate(batch):
@@ -269,10 +325,10 @@ def collate(batch):
     time keeps storage at int32 in the dataset."""
     us   = np.stack([b[0] for b in batch])
     them = np.stack([b[1] for b in batch])
-    scr  = np.array([b[2] for b in batch], dtype=np.float32)
+    tgt  = np.stack([b[2] for b in batch])  # [B, 3]
     return (torch.from_numpy(us).long(),
             torch.from_numpy(them).long(),
-            torch.from_numpy(scr))
+            torch.from_numpy(tgt))
 
 
 # ---------------------------------------------------------------------------
@@ -365,7 +421,7 @@ def train(args):
     device = pick_device(args.device)
     print(f"training on {device}")
 
-    ds = HalfKAv2Dataset(args.data, max_lines=args.max_lines)
+    ds = HalfKAv2Dataset(args.data, max_lines=args.max_lines, cp_scale=args.cp_scale)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
                         num_workers=args.num_workers, collate_fn=collate,
                         drop_last=True)
@@ -376,33 +432,22 @@ def train(args):
     # Scheduler: Cosine Annealing to help the model converge more precisely.
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
-    # Sigmoid scaling: matches the tiny NNUE trainer's convention.
-    cp_scale = args.cp_scale
-
     step = 0
     for epoch in range(args.epochs):
         epoch_loss = 0.0
         nbatch = 0
-        for us, them, scores in loader:
-            us, them, scores = us.to(device), them.to(device), scores.to(device)
-            
-            # WDL target derivation: Convert CP to soft Win/Draw/Loss probabilities.
-            # This is a simplified sigmoid mapping.
-            win_prob  = torch.sigmoid(scores / cp_scale)
-            loss_prob = torch.sigmoid(-scores / cp_scale)
-            draw_prob = 1.0 - win_prob - loss_prob
-            draw_prob = torch.clamp(draw_prob, 0.0, 1.0)
-            
-            # Normalize to ensure sum=1
-            s = win_prob + draw_prob + loss_prob
-            target = torch.stack([win_prob/s, draw_prob/s, loss_prob/s], dim=1)
+        for us, them, target in loader:
+            # target is [B, 3] (W, D, L) — directly from dataset, no derivation.
+            us, them, target = us.to(device), them.to(device), target.to(device)
 
-            # Prediction
-            pred_logits = net(us, them)
-            pred_probs  = F.softmax(pred_logits, dim=1)
-            
-            # Loss: KL Divergence or MSE on probabilities
-            loss = F.mse_loss(pred_probs, target)
+            pred_logits = net(us, them)  # [B, 3]
+
+            # Soft-label cross entropy: -sum(target * log_softmax(logits)).
+            # The right loss for a probability-distribution target. MSE on
+            # softmax outputs (the previous bug) under-trains the tails and
+            # ignores the unit-simplex geometry.
+            log_probs = F.log_softmax(pred_logits, dim=1)
+            loss = -(target * log_probs).sum(dim=1).mean()
 
             opt.zero_grad()
             loss.backward()
@@ -427,14 +472,15 @@ def train(args):
     print(f"saved {out_pt}")
     print("now run: python scripts/convert_halfkav2_nnue.py from-torch "
           f"--state-dict {out_pt} --out data/eclipse.nnue "
-          f"--output-cp-per-unit {cp_scale}")
+          f"--output-cp-per-unit {args.cp_scale}")
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data", type=Path, required=True,
-                   help="text file with '<fen>;<score_cp>' lines")
+                   help="text file with '<fen>;<W>;<D>;<L>' (preferred) or "
+                        "'<fen>;<score_cp>' (legacy) lines")
     p.add_argument("--out", type=Path, default=Path("data/halfkav2.pt"),
                    help="PyTorch state_dict output")
     p.add_argument("--epochs", type=int, default=5)
