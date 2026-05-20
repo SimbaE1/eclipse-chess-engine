@@ -593,8 +593,17 @@ Score evaluate(const Position& pos) noexcept {
         sum_p += probs[static_cast<std::size_t>(j)];
     }
 
-    // cp = (P(Win) - P(Loss)) * g_output_cp_per_unit
-    const float cp = (probs[0] - probs[2]) / sum_p * g_output_cp_per_unit;
+    // Inverse-sigmoid (logit) of P(W) + 0.5·P(D). Half of P(D) is treated as
+    // expected score, matching the standard Elo-style win-expectancy convention.
+    // The transform is unbounded — a clearly winning position with P_W=0.99
+    // produces cp ≈ 4.6·scale; the previous linear formula `(P_W − P_L)·scale`
+    // was hard-capped at ±scale, which compressed every eval near the ceiling
+    // and starved MCTS priors of signal in winning positions (e.g. K+Q showed
+    // the same +355 cp as K+R because both saturated).
+    const float pw = probs[0] / sum_p;
+    const float pd = probs[1] / sum_p;
+    const float win_expectancy = std::clamp(pw + 0.5f * pd, 1e-6f, 1.0f - 1e-6f);
+    const float cp = std::log(win_expectancy / (1.0f - win_expectancy)) * g_output_cp_per_unit;
 
     return static_cast<Score>(cp);
 }
@@ -673,7 +682,11 @@ void evaluate_batch(const Accumulator* accs, const Color* stms, Score* scores, i
             sum_p += probs[static_cast<std::size_t>(j)];
         }
 
-        scores[b] = static_cast<Score>((probs[0] - probs[2]) / sum_p * g_output_cp_per_unit);
+        // Inverse-sigmoid (logit) — see evaluate() for the rationale.
+        const float pw = probs[0] / sum_p;
+        const float pd = probs[1] / sum_p;
+        const float we = std::clamp(pw + 0.5f * pd, 1e-6f, 1.0f - 1e-6f);
+        scores[b] = static_cast<Score>(std::log(we / (1.0f - we)) * g_output_cp_per_unit);
     }
 }
 

@@ -14,6 +14,14 @@ constexpr Color operator~(Color c) noexcept {
     return Color(c ^ 1);
 }
 
+struct SearchLimits {
+    int           depth    = 0;
+    std::uint64_t nodes    = 0;
+    std::int64_t  time_ms  = 0;
+    bool          infinite = false;
+    bool          ponder   = false;
+};
+
 // Piece-type indexing leaves slot 0 free as NoPieceType so a Piece can encode
 // the empty square as 0 and pack into 4 bits (color << 3 | piecetype).
 enum PieceType : std::uint8_t {

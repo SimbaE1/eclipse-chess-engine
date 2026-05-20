@@ -5,6 +5,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "attacks.hpp"
@@ -27,6 +28,14 @@ constexpr const char* kEngineAuthor  = "SimbaE11";
 
 Position    g_pos;
 SearchInfo  g_search_info;
+std::thread g_search_thread;
+
+void join_search_thread() {
+    if (g_search_thread.joinable()) {
+        g_search_info.stop.store(true, std::memory_order_relaxed);
+        g_search_thread.join();
+    }
+}
 
 std::vector<std::string> tokenize(const std::string& s) {
     std::vector<std::string> out;
@@ -85,7 +94,7 @@ void cmd_uci() {
               << "option name PolicyFile type string default <empty>\n"
               << "option name Threads type spin default 1 min 1 max 128\n"
               << "option name Hash type spin default 16 min 1 max 16384\n"
-              << "option name OverrideMargin type spin default 150 min 0 max 1000\n"
+              << "option name OverrideMargin type spin default 50 min 0 max 1000\n"
               << "option name AbThreads type spin default 1 min 0 max 128\n"
               << "uciok" << std::endl;
 }
@@ -204,6 +213,7 @@ void cmd_go(const std::vector<std::string>& tok) {
         else if (t == "winc")     { winc  = take(); }
         else if (t == "binc")     { binc  = take(); }
         else if (t == "movestogo"){ movestogo = std::max(1, take()); }
+        else if (t == "ponder")    limits.ponder = true;
         else if (t == "perft") {
             const int depth = take();
             const auto split = perft_divided(g_pos, depth);
@@ -238,15 +248,11 @@ void cmd_go(const std::vector<std::string>& tok) {
 
     g_search_info.limits = limits;
     g_search_info.stop.store(false, std::memory_order_relaxed);
-    const Move best = search(g_pos, g_search_info);
-
-    if (best == MoveNone) {
-        // No legal moves: report a null move. Most GUIs treat this as the
-        // game-over signal; the engine doesn't crash.
-        std::cout << "bestmove 0000" << std::endl;
-    } else {
-        std::cout << "bestmove " << best.to_uci() << std::endl;
-    }
+    
+    join_search_thread();
+    g_search_thread = std::thread([]() {
+        search(g_pos, g_search_info);
+    });
 }
 
 }  // namespace
@@ -264,20 +270,33 @@ void loop() {
 
         if      (cmd == "uci")        cmd_uci();
         else if (cmd == "isready")    cmd_isready();
-        else if (cmd == "ucinewgame") g_pos = Position::startpos();
-        else if (cmd == "setoption")  cmd_setoption(tok);
-        else if (cmd == "position")   cmd_position(tok);
+        else if (cmd == "ucinewgame") { join_search_thread(); g_pos = Position::startpos(); }
+        else if (cmd == "setoption")  { join_search_thread(); cmd_setoption(tok); }
+        else if (cmd == "position")   { join_search_thread(); cmd_position(tok); }
         else if (cmd == "go")         cmd_go(tok);
         else if (cmd == "bench") {
             g_pos = Position::startpos();
             g_search_info.limits = SearchLimits{};
-            g_search_info.limits.nodes = 10000;
+            g_search_info.limits.nodes = 100000;
             g_search_info.limits.depth = 0;
             g_search_info.stop.store(false, std::memory_order_relaxed);
+            
+            const auto start = std::chrono::steady_clock::now();
             search(g_pos, g_search_info);
+            const auto end = std::chrono::steady_clock::now();
+            
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+            const auto nps = (ms > 0) ? (g_search_info.nodes_searched.load() * 1000 / ms) : 0;
+            
+            std::cout << "Benchmark: " << g_search_info.nodes_searched.load() << " nodes in " << ms << "ms (" << nps << " nps)" << std::endl;
         }
         else if (cmd == "stop")       g_search_info.stop.store(true, std::memory_order_relaxed);
-        else if (cmd == "quit")       break;
+        else if (cmd == "ponderhit") {
+            g_search_info.limits.ponder = false;
+            // Update start time to now so time management is relative to the ponderhit
+            g_search_info.start_time = std::chrono::steady_clock::now();
+        }
+        else if (cmd == "quit")       { join_search_thread(); break; }
         // Unknown commands are silently ignored per the UCI spec.
     }
 }

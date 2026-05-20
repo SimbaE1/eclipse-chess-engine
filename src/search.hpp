@@ -11,17 +11,12 @@
 
 namespace eclipse {
 
-struct SearchLimits {
-    // 0 means unlimited for all three numeric bounds. depth is reinterpreted
-    // as a visit ceiling under MCTS (see mcts.cpp worker_loop). Leaving the
-    // default non-zero used to silently cap every search at 64 visits,
-    // starving the policy net of any real search budget regardless of the
-    // movetime/time-control the GUI sent.
-    int     depth     = 0;
-    int64_t time_ms   = 0;
-    int64_t nodes     = 0;
-    bool    infinite  = false;
-};
+// SearchLimits lives in types.hpp now (added with a ponder field for the
+// uci_ponder path). 0 means unlimited for the three numeric bounds; depth
+// is reinterpreted as a visit ceiling under MCTS (see mcts.cpp worker_loop).
+// Leaving the default non-zero used to silently cap every search at 64
+// visits, starving the policy net of any real search budget regardless of
+// the movetime/time-control the GUI sent.
 
 struct SearchInfo {
     SearchLimits      limits;
@@ -31,9 +26,14 @@ struct SearchInfo {
     // hard-clamped to [1, 128]. 1 keeps the single-threaded code path.
     int               threads = 1;
 
-    // Minimum score advantage (centipawns) required for an Alpha-Beta result
-    // to override the MCTS move choice.
-    int               override_margin = 150;
+    // AB-vs-MCTS override threshold in cp. AB only overrides the played move
+    // when its evaluation is at least this many cp above MCTS's. 150 (one
+    // piece) was the historical default, but in real tactical positions
+    // MCTS's misses are usually 30-100 cp, so the override never fired. 50
+    // cp = half a pawn — fires for real tactical wins, ignores fluctuations
+    // of ~a tempo. Tunable via UCI `OverrideMargin`. Mate scores always
+    // override regardless of this value (see search.cpp).
+    int               override_margin = 50;
 
     // Number of threads to dedicate to the Alpha-Beta verifier.
     int               ab_threads = 1;

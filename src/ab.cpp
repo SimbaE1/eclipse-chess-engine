@@ -167,15 +167,23 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
     }
 
     // Null-move pruning: if we are so far ahead that passing a turn still
-    // stays above beta, we can prune this branch. Skip if in check or if
-    // depth is low to avoid zugzwang risks or shallow misses.
+    // stays above beta, we can prune this branch. Skip if in check, if depth
+    // is low, or if the side-to-move has only pawns + king (zugzwang risk
+    // in K+P endings — a tempo can be the difference between win and draw,
+    // and giving the opponent a free move actively misrepresents the
+    // position there).
     if (!pos.in_check() && depth >= 3 && static_eval >= beta) {
-        StateInfo st;
-        pos.do_null_move(st);
-        Move dummy;
-        const Score s = -negamax(pos, depth - 1 - 3, -beta, -beta + 1, ply + 1, dummy, ctx);
-        pos.undo_null_move(st);
-        if (s >= beta) return beta;
+        const Color us       = pos.side_to_move();
+        const Bitboard non_p = pos.pieces(us, Knight) | pos.pieces(us, Bishop)
+                             | pos.pieces(us, Rook)   | pos.pieces(us, Queen);
+        if (non_p) {
+            StateInfo st;
+            pos.do_null_move(st);
+            Move dummy;
+            const Score s = -negamax(pos, depth - 1 - 3, -beta, -beta + 1, ply + 1, dummy, ctx);
+            pos.undo_null_move(st);
+            if (s >= beta) return beta;
+        }
     }
 
     const Score alpha_orig = alpha;
@@ -293,17 +301,16 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
                 }
                 const Color us = pos.side_to_move();
                 ctx.history[us][m.from()][m.to()] += static_cast<std::int32_t>(depth * depth);
-                
-                // History Aging: if a history score gets too large, divide all
-                // history scores by 2.
+
+                // History aging via right-shift over the flat backing array.
+                // The previous form ran 8192 divides through three nested
+                // loops each time the table grew past 1M — a measurable
+                // hiccup on cutoff-heavy positions. >>= 1 is the same
+                // arithmetic for non-negative values and amortizes the
+                // cost to a single memset-speed pass.
                 if (ctx.history[us][m.from()][m.to()] > 1'000'000) {
-                    for (int c = 0; c < 2; ++c) {
-                        for (int f = 0; f < 64; ++f) {
-                            for (int t = 0; t < 64; ++t) {
-                                ctx.history[c][f][t] /= 2;
-                            }
-                        }
-                    }
+                    std::int32_t* base = &ctx.history[0][0][0];
+                    for (int i = 0; i < 2 * 64 * 64; ++i) base[i] >>= 1;
                 }
             }
             break;  // beta cutoff
@@ -335,18 +342,25 @@ Result find_best_move(Position& pos, int max_depth, std::int64_t time_budget_ms)
         Score s;
 
         // Aspiration window or full window?
-        if (d <= 3) {
+        if (d <= 4) {
             s = negamax(pos, d, -kInfinite, kInfinite, 0, best_at_d, ctx, MoveNone);
         } else {
-            // Very narrow aspiration: if we fail high/low, we widen and re-search.
-            Score alpha = last_score - 30;
-            Score beta  = last_score + 30;
+            // Start with ±50 cp (half a pawn). Iteration-to-iteration eval
+            // swings of 30 cp are normal — the previous ±30 window caused
+            // frequent re-searches that capped reached depth. On fail-low/
+            // high, widen exponentially (50→200→800→full) so we recover from
+            // a real eval shift in 2-3 re-searches rather than 8+ linear
+            // ones.
+            Score delta = 50;
+            Score alpha = std::max(-kInfinite, last_score - delta);
+            Score beta  = std::min( kInfinite, last_score + delta);
             while (true) {
                 s = negamax(pos, d, alpha, beta, 0, best_at_d, ctx, MoveNone);
                 if (ctx.aborted) break;
-                if (s <= alpha) { alpha = std::max(-kInfinite, alpha - 100); }
-                else if (s >= beta) { beta = std::min(kInfinite, beta + 100); }
+                if      (s <= alpha) { delta *= 4; alpha = std::max(-kInfinite, last_score - delta); }
+                else if (s >= beta)  { delta *= 4; beta  = std::min( kInfinite, last_score + delta); }
                 else break;
+                if (delta >= 800) { alpha = -kInfinite; beta = kInfinite; }
             }
         }
 
