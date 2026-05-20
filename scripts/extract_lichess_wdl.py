@@ -40,6 +40,23 @@ Usage:
     zstd -dc lichess_db_2025-01.pgn.zst | \\
         python3 scripts/extract_lichess_wdl.py --target 10_000_000 \\
         > data/wdl_training.txt
+
+Recommended faster pipeline using pgn-extract as an Elo pre-filter (kills
+99%+ of input games in fast C code before Python ever sees them — adds
+another ~3-4x on top of the multiprocessing path):
+
+    # one-time: write the Elo threshold to a tag filter file
+    printf 'WhiteElo >= "2500"\\nBlackElo >= "2500"\\n' > /tmp/elo_filter.pgn
+
+    zstd -dc lichess_db_2025-01.pgn.zst | \\
+        pgn-extract -s --quiet -t /tmp/elo_filter.pgn 2>/dev/null | \\
+        python3 scripts/extract_lichess_wdl.py --target 10_000_000 \\
+        > data/wdl_training.txt
+
+pgn-extract's `-s --quiet` silences per-game and per-file status. The
+`2>/dev/null` discards the remaining stderr noise. Python still applies
+the TimeControl + Result filters (pgn-extract can't easily numeric-compare
+on the "600+5" TC string format).
 """
 
 from __future__ import annotations
