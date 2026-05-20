@@ -554,14 +554,51 @@ Score evaluate(const Position& pos) noexcept {
     const std::size_t us   = (stm == White) ? 0u : 1u;
     const std::size_t them = us ^ 1u;
 
-    // FT concat + clipped ReLU: [acc_us, acc_them] -> uint8[512]
+    // FT concat + clipped ReLU: [acc_us, acc_them] -> uint8[2048].
+    //
+    // Per int16 lane: clamp into [0, kFtQuant=127] and pack into uint8. On
+    // AVX2 packus_epi16 handles both the upper saturation (>127 -> 127) and
+    // the lower (signed negatives -> 0) for free in one instruction per 16
+    // lanes, vs the scalar form which needs branchy clamp+cast per lane.
+    // Called once per evaluate() so it's not the dominant cost, but at 36
+    // NNUE evals per MCTS expansion it adds up.
     alignas(64) std::uint8_t ft_out[kL1InSize];
+#if defined(__AVX2__)
+    {
+        const __m256i clamp_hi = _mm256_set1_epi16(static_cast<std::int16_t>(kFtQuant));
+        // Process 32 int16 lanes (= 32 uint8 outputs) per iteration.
+        // packus_epi16 takes two __m256i of int16, returns __m256i of
+        // uint8 with cross-lane interleaving, so unpack_perm with the
+        // permute below restores [0..15, 16..31] order.
+        // packus_epi16(a, b) produces lanes [a_lo, b_lo, a_hi, b_hi] in
+        // 64-bit chunks. We want [a_lo, a_hi, b_lo, b_hi] so the 32
+        // contiguous int16 input values map to 32 contiguous uint8 outputs
+        // in their original order.
+        const __m256i perm = _mm256_setr_epi32(0, 1, 4, 5, 2, 3, 6, 7);
+        for (int half = 0; half < 2; ++half) {
+            const std::size_t persp = (half == 0) ? us : them;
+            const std::int16_t* acc_ptr = acc.v[persp].data();
+            std::uint8_t*       out_ptr = ft_out + half * kFtOutSize;
+            for (int i = 0; i < kFtOutSize; i += 32) {
+                __m256i a = _mm256_load_si256(reinterpret_cast<const __m256i*>(acc_ptr + i));
+                __m256i b = _mm256_load_si256(reinterpret_cast<const __m256i*>(acc_ptr + i + 16));
+                a = _mm256_min_epi16(a, clamp_hi);
+                b = _mm256_min_epi16(b, clamp_hi);
+                // packus also saturates negatives to 0, so no explicit max needed.
+                __m256i packed = _mm256_packus_epi16(a, b);
+                packed = _mm256_permutevar8x32_epi32(packed, perm);
+                _mm256_store_si256(reinterpret_cast<__m256i*>(out_ptr + i), packed);
+            }
+        }
+    }
+#else
     for (std::size_t i = 0; i < kFtOutSize; ++i) {
         const std::int16_t a = acc.v[us][i];
         const std::int16_t b = acc.v[them][i];
         ft_out[i]              = static_cast<std::uint8_t>(std::clamp<std::int32_t>(a, 0, kFtQuant));
         ft_out[i + kFtOutSize] = static_cast<std::uint8_t>(std::clamp<std::int32_t>(b, 0, kFtQuant));
     }
+#endif
 
     alignas(64) std::uint8_t l1_out[kL1OutSize];
     affine_clipped_relu<kL1InSize, kL1OutSize>(ft_out, g_l1_w.data(), g_l1_b.data(), l1_out);
@@ -625,19 +662,47 @@ void evaluate_batch(const Accumulator* accs, const Color* stms, Score* scores, i
 
     const int n = std::min(batch_size, kMaxBatch);
 
-    // 1. Feature Transformer (Accumulator -> FT_out)
+    // 1. Feature Transformer (Accumulator -> FT_out). Same packus_epi16
+    //    SIMD as evaluate(), applied per batch element.
+#if defined(__AVX2__)
+    {
+        const __m256i clamp_hi = _mm256_set1_epi16(static_cast<std::int16_t>(kFtQuant));
+        const __m256i perm     = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+        for (int b = 0; b < n; ++b) {
+            const Accumulator& acc = accs[b];
+            const Color       stm  = stms[b];
+            const std::size_t us   = (stm == White) ? 0u : 1u;
+            const std::size_t them = us ^ 1u;
+            std::uint8_t* ft_out = &ft_scratch[b * kL1InSize];
+            for (int half = 0; half < 2; ++half) {
+                const std::size_t persp = (half == 0) ? us : them;
+                const std::int16_t* acc_ptr = acc.v[persp].data();
+                std::uint8_t*       out_ptr = ft_out + half * kFtOutSize;
+                for (int i = 0; i < kFtOutSize; i += 32) {
+                    __m256i a = _mm256_load_si256(reinterpret_cast<const __m256i*>(acc_ptr + i));
+                    __m256i e = _mm256_load_si256(reinterpret_cast<const __m256i*>(acc_ptr + i + 16));
+                    a = _mm256_min_epi16(a, clamp_hi);
+                    e = _mm256_min_epi16(e, clamp_hi);
+                    __m256i packed = _mm256_packus_epi16(a, e);
+                    packed = _mm256_permutevar8x32_epi32(packed, perm);
+                    _mm256_store_si256(reinterpret_cast<__m256i*>(out_ptr + i), packed);
+                }
+            }
+        }
+    }
+#else
     for (int b = 0; b < n; ++b) {
         const Accumulator& acc = accs[b];
         const Color       stm  = stms[b];
         const std::size_t us   = (stm == White) ? 0u : 1u;
         const std::size_t them = us ^ 1u;
-        
         std::uint8_t* ft_out = &ft_scratch[b * kL1InSize];
         for (std::size_t i = 0; i < kFtOutSize; ++i) {
             ft_out[i]              = static_cast<std::uint8_t>(std::clamp<std::int32_t>(acc.v[us][i], 0, kFtQuant));
             ft_out[i + kFtOutSize] = static_cast<std::uint8_t>(std::clamp<std::int32_t>(acc.v[them][i], 0, kFtQuant));
         }
     }
+#endif
 
     // 2. Batched L1 Layer
 #if defined(__AVX2__)

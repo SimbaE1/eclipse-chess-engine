@@ -421,33 +421,61 @@ def train(args):
     device = pick_device(args.device)
     print(f"training on {device}")
 
-    ds = HalfKAv2Dataset(args.data, max_lines=args.max_lines, cp_scale=args.cp_scale)
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
-                        num_workers=args.num_workers, collate_fn=collate,
-                        drop_last=True)
+    full_ds = HalfKAv2Dataset(args.data, max_lines=args.max_lines, cp_scale=args.cp_scale)
+
+    # Validation hold-out: take a deterministic ~5% slice for val loss. Using
+    # a fixed index range (not random) so val examples never leak into train
+    # across restarts. 5% is enough to spot overfitting trends and small
+    # enough not to starve training (we have millions).
+    n_total = len(full_ds)
+    n_val   = max(1024, int(n_total * args.val_frac))
+    n_val   = min(n_val, n_total // 10)  # cap at 10% for tiny datasets
+    n_train = n_total - n_val
+    print(f"split: {n_train} train / {n_val} val")
+    train_ds = torch.utils.data.Subset(full_ds, range(n_train))
+    val_ds   = torch.utils.data.Subset(full_ds, range(n_train, n_total))
+
+    loader     = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                            num_workers=args.num_workers, collate_fn=collate,
+                            drop_last=True, pin_memory=(device.type == "cuda"))
+    val_loader = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False,
+                            num_workers=max(1, args.num_workers // 2),
+                            collate_fn=collate, drop_last=False,
+                            pin_memory=(device.type == "cuda"))
 
     net = HalfKAv2Net().to(device)
     # Weight decay (L2 regularization) helps prevent overfitting in the larger network.
     opt = torch.optim.Adam(net.parameters(), lr=args.lr, weight_decay=1e-4)
-    # Scheduler: Cosine Annealing to help the model converge more precisely.
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+    # Cosine annealing schedule with a linear warmup. Warmup helps when
+    # using larger batch sizes (16k+) on a fresh init — Adam's first
+    # moment estimates are very noisy in the first ~500 steps, and a
+    # full LR there can push the embedding into a degenerate region.
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+    warmup_steps = args.warmup_steps
+
+    def soft_label_ce(logits, target):
+        # The right loss for a probability-distribution target. MSE on
+        # softmax outputs (the previous bug) under-trains the tails.
+        log_probs = F.log_softmax(logits, dim=1)
+        return -(target * log_probs).sum(dim=1).mean()
 
     step = 0
     for epoch in range(args.epochs):
+        net.train()
         epoch_loss = 0.0
         nbatch = 0
         for us, them, target in loader:
-            # target is [B, 3] (W, D, L) — directly from dataset, no derivation.
             us, them, target = us.to(device), them.to(device), target.to(device)
 
-            pred_logits = net(us, them)  # [B, 3]
+            # Linear warmup for the first warmup_steps. After warmup the
+            # cosine schedule takes over (post-epoch step).
+            if step < warmup_steps:
+                lr_scale = (step + 1) / max(1, warmup_steps)
+                for g in opt.param_groups:
+                    g["lr"] = args.lr * lr_scale
 
-            # Soft-label cross entropy: -sum(target * log_softmax(logits)).
-            # The right loss for a probability-distribution target. MSE on
-            # softmax outputs (the previous bug) under-trains the tails and
-            # ignores the unit-simplex geometry.
-            log_probs = F.log_softmax(pred_logits, dim=1)
-            loss = -(target * log_probs).sum(dim=1).mean()
+            pred_logits = net(us, them)
+            loss = soft_label_ce(pred_logits, target)
 
             opt.zero_grad()
             loss.backward()
@@ -462,9 +490,26 @@ def train(args):
             step += 1
             if step % 200 == 0:
                 print(f"  epoch {epoch} step {step} loss {loss.item():.5f}")
-        
-        scheduler.step()
-        print(f"epoch {epoch} avg loss {epoch_loss / max(nbatch, 1):.5f} (lr: {scheduler.get_last_lr()[0]:.6f})")
+
+        # Validation pass: report val loss + simple win-accuracy (argmax==target_argmax).
+        net.eval()
+        val_loss_sum = 0.0
+        val_acc_sum  = 0
+        val_count    = 0
+        with torch.no_grad():
+            for us, them, target in val_loader:
+                us, them, target = us.to(device), them.to(device), target.to(device)
+                logits = net(us, them)
+                val_loss_sum += soft_label_ce(logits, target).item() * target.shape[0]
+                val_acc_sum  += (logits.argmax(dim=1) == target.argmax(dim=1)).sum().item()
+                val_count    += target.shape[0]
+        val_loss = val_loss_sum / max(1, val_count)
+        val_acc  = val_acc_sum  / max(1, val_count)
+
+        cosine.step()
+        print(f"epoch {epoch} train_loss {epoch_loss / max(nbatch, 1):.5f} "
+              f"val_loss {val_loss:.5f} val_argmax_acc {val_acc:.3f} "
+              f"(lr next: {cosine.get_last_lr()[0]:.6f})")
 
     out_pt = Path(args.out)
     out_pt.parent.mkdir(parents=True, exist_ok=True)
@@ -486,7 +531,12 @@ def main():
     p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--batch-size", type=int, default=4096)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--num-workers", type=int, default=2)
+    p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--val-frac", type=float, default=0.05,
+                   help="fraction of dataset held out for validation loss")
+    p.add_argument("--warmup-steps", type=int, default=500,
+                   help="linear LR warmup for the first N steps (mitigates "
+                        "Adam's noisy first-moment estimates on large batches)")
     p.add_argument("--max-lines", type=int, default=None,
                    help="cap on training rows (useful for quick sanity runs)")
     p.add_argument("--cp-scale", type=float, default=410.0,

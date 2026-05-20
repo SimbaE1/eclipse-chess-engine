@@ -171,12 +171,23 @@ def _reconstruct_pgn(headers: dict, moves: str) -> str:
     return "\n".join(parts)
 
 
-def _emit_wdl_lines(headers: dict, moves_text: str, min_ply: int) -> List[str]:
+def _emit_wdl_lines(headers: dict, moves_text: str, min_ply: int,
+                    mirror_augment: bool) -> List[str]:
     """Return a list of output lines for one accepted game.
 
     The game result is applied to every position past min_ply equally —
     standard outcome-propagation. Noisy per-position but averaged over
-    millions of positions the net learns the marginal expected outcome."""
+    millions of positions the net learns the marginal expected outcome.
+
+    When `mirror_augment` is True, each position is emitted twice: once as
+    observed and once with colors swapped via board.mirror() (white pieces
+    become black on the mirrored rank, STM flips, WDL flips W↔L). This
+    doubles the dataset for free and corrects the W-perspective bias that
+    natural Lichess data has (white scores ~55% at high levels). The
+    previous WDL net showed K+Q vs K at +1083 cp from white's POV but
+    only -387 cp from black's POV — a 3x asymmetry — because the net
+    never saw enough black-perspective Q-up positions. Mirror augmentation
+    fixes that by construction."""
     result = headers.get("Result", "*")
     wdl_white = _RESULT_WDL_WHITE.get(result)
     if wdl_white is None:
@@ -202,12 +213,19 @@ def _emit_wdl_lines(headers: dict, moves_text: str, min_ply: int) -> List[str]:
         else:
             w, d, l = wdl_white[2], wdl_white[1], wdl_white[0]
         out.append(f"{board.fen()};{w};{d};{l}\n")
+        if mirror_augment:
+            # board.mirror() flips colors AND vertically reflects piece
+            # positions, so the STM flips too. The new STM's WDL is the
+            # opposite outcome from the original STM's: a "win for original
+            # STM" is a "loss for mirrored STM".
+            mboard = board.mirror()
+            out.append(f"{mboard.fen()};{l};{d};{w}\n")
     return out
 
 
 # Worker-side filter-and-emit. Returns (n_scanned, n_accepted, lines).
 def _process_chunk(chunk: str, min_elo: int, min_tc_seconds: int,
-                   min_ply: int) -> Tuple[int, int, List[str]]:
+                   min_ply: int, mirror_augment: bool) -> Tuple[int, int, List[str]]:
     n_scanned = 0
     n_accepted = 0
     lines: List[str] = []
@@ -227,7 +245,7 @@ def _process_chunk(chunk: str, min_elo: int, min_tc_seconds: int,
             continue
 
         n_accepted += 1
-        lines.extend(_emit_wdl_lines(headers, moves_text, min_ply))
+        lines.extend(_emit_wdl_lines(headers, moves_text, min_ply, mirror_augment))
     return n_scanned, n_accepted, lines
 
 
@@ -235,19 +253,22 @@ def _process_chunk(chunk: str, min_elo: int, min_tc_seconds: int,
 _GLOBAL_ARGS: dict = {}
 
 
-def _worker_init(min_elo: int, min_tc_seconds: int, min_ply: int) -> None:
+def _worker_init(min_elo: int, min_tc_seconds: int, min_ply: int,
+                 mirror_augment: bool) -> None:
     """Pool initializer — stash filter knobs in module globals so they don't
     have to be pickled into every chunk message."""
     _GLOBAL_ARGS["min_elo"]         = min_elo
     _GLOBAL_ARGS["min_tc_seconds"]  = min_tc_seconds
     _GLOBAL_ARGS["min_ply"]         = min_ply
+    _GLOBAL_ARGS["mirror_augment"]  = mirror_augment
 
 
 def _worker_task(chunk: str) -> Tuple[int, int, List[str]]:
     return _process_chunk(chunk,
                           _GLOBAL_ARGS["min_elo"],
                           _GLOBAL_ARGS["min_tc_seconds"],
-                          _GLOBAL_ARGS["min_ply"])
+                          _GLOBAL_ARGS["min_ply"],
+                          _GLOBAL_ARGS["mirror_augment"])
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +322,15 @@ def main() -> None:
                    help="bytes per chunk handed to workers (default 1 MiB)")
     p.add_argument("--report-every", type=int, default=50_000,
                    help="log progress every N emitted positions")
+    p.add_argument("--no-mirror-augment", action="store_true",
+                   help="disable color-swap mirror augmentation. Off by "
+                        "default — augmentation doubles output volume but "
+                        "guarantees symmetric W/B perspective coverage, "
+                        "which was missing from the original WDL net "
+                        "training data and caused a 3x eval asymmetry "
+                        "(K+Q white-POV +1083cp vs black-POV -387cp).")
     args = p.parse_args()
+    mirror_augment = not args.no_mirror_augment
 
     emitted = 0
     games_scanned = 0
@@ -311,7 +340,8 @@ def main() -> None:
     if args.workers <= 0:
         for chunk in _iter_chunks(sys.stdin, args.chunk_bytes):
             s, a, lines = _process_chunk(chunk, args.min_elo,
-                                         args.min_tc_seconds, args.min_ply)
+                                         args.min_tc_seconds, args.min_ply,
+                                         mirror_augment)
             games_scanned  += s
             games_accepted += a
             for line in lines:
@@ -333,7 +363,8 @@ def main() -> None:
     # Multiprocessing path.
     pool = mp.Pool(processes=args.workers,
                    initializer=_worker_init,
-                   initargs=(args.min_elo, args.min_tc_seconds, args.min_ply))
+                   initargs=(args.min_elo, args.min_tc_seconds, args.min_ply,
+                             mirror_augment))
     try:
         # imap_unordered with a small chunksize keeps the work queue full
         # without big latency spikes when chunks are very uneven. The main
