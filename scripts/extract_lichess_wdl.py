@@ -51,21 +51,47 @@ another ~3-4x on top of the multiprocessing path):
     zstd -dc lichess_db_2025-01.pgn.zst | \\
         pgn-extract -s --quiet -t /tmp/elo_filter.pgn 2>/dev/null | \\
         python3 scripts/extract_lichess_wdl.py --target 10_000_000 \\
-        > data/wdl_training.txt
+            --output data/wdl_training.txt
 
 pgn-extract's `-s --quiet` silences per-game and per-file status. The
 `2>/dev/null` discards the remaining stderr noise. Python still applies
 the TimeControl + Result filters (pgn-extract can't easily numeric-compare
 on the "600+5" TC string format).
+
+Resumable runs
+--------------
+Pass `--output PATH` (instead of redirecting stdout to a file) and the
+script will persist a JSON checkpoint at `<PATH>.ckpt` after every fully
+processed chunk. Re-running the same command after a crash, kill, or
+disconnect detects the checkpoint, fast-forwards through the already-
+processed prefix of the input, and appends the rest to the existing
+output. Filter args (min-elo, min-tc, min-ply, mirror-augment) are
+recorded in the checkpoint and a mismatch aborts the run to keep the
+dataset distribution clean. Pass `--no-resume` to truncate and restart.
+
+To survive SSH/terminal disconnects in the first place, wrap the command
+in `nohup ... &`, or run it inside `screen` / `tmux`. The checkpoint is
+the safety net for unexpected deaths (SIGKILL, panic, power loss), not a
+substitute for keeping the process alive when the terminal goes away.
+
+    nohup bash -c 'zstd -dc lichess_db_2025-01.pgn.zst \\
+        | pgn-extract -s --quiet -t /tmp/elo_filter.pgn 2>/dev/null \\
+        | python3 scripts/extract_lichess_wdl.py --target 10_000_000 \\
+              --output data/wdl_training.txt' \\
+        > extract.log 2>&1 &
 """
 
 from __future__ import annotations
 
 import argparse
 import io
+import json
 import multiprocessing as mp
 import os
+import signal
 import sys
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
 try:
@@ -256,7 +282,11 @@ _GLOBAL_ARGS: dict = {}
 def _worker_init(min_elo: int, min_tc_seconds: int, min_ply: int,
                  mirror_augment: bool) -> None:
     """Pool initializer — stash filter knobs in module globals so they don't
-    have to be pickled into every chunk message."""
+    have to be pickled into every chunk message. Also mask SIGINT so Ctrl-C
+    is routed cleanly to the main process; otherwise every worker raises
+    KeyboardInterrupt and spews a traceback before main gets a chance to
+    flush output + persist the checkpoint."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     _GLOBAL_ARGS["min_elo"]         = min_elo
     _GLOBAL_ARGS["min_tc_seconds"]  = min_tc_seconds
     _GLOBAL_ARGS["min_ply"]         = min_ply
@@ -275,29 +305,93 @@ def _worker_task(chunk: str) -> Tuple[int, int, List[str]]:
 # Chunked reader (main process)
 # ---------------------------------------------------------------------------
 
-def _iter_chunks(handle, chunk_size: int = 1 << 20) -> Iterable[str]:
-    """Read `handle` in ~chunk_size pieces, snapped to the last blank-line
-    game boundary. Guarantees that every yielded chunk ends between games,
-    so workers never see a half-game.
+def _iter_chunks_bytes(handle_bin, chunk_size: int = 1 << 20
+                       ) -> Iterable[Tuple[str, int]]:
+    """Read `handle_bin` in ~chunk_size byte pieces, snapped to the last
+    blank-line game boundary. Yields (chunk_text, cumulative_bytes_consumed).
+
+    Reading bytes (not text) lets us count input position exactly — which is
+    the unit `_skip_input_bytes` consumes to resume from a checkpoint. PGN is
+    essentially ASCII so the per-chunk decode is cheap.
 
     Buffer carries over the trailing partial-game text to the next chunk."""
-    buf = ""
+    buf = b""
+    bytes_total = 0
     while True:
-        new_data = handle.read(chunk_size)
+        new_data = handle_bin.read(chunk_size)
         if not new_data:
             if buf.strip():
-                yield buf
+                bytes_total += len(buf)
+                yield buf.decode("utf-8", errors="replace"), bytes_total
             return
         buf += new_data
         # Snap to the last blank-line (game boundary) within the buffer.
         # PGN games are separated by a single blank line, so '\n\n' is the
         # cleanest splitter.
-        cut = buf.rfind("\n\n")
+        cut = buf.rfind(b"\n\n")
         if cut < 0:
             # No complete game in this buffer yet; keep accumulating.
             continue
-        yield buf[:cut + 2]
+        chunk = buf[:cut + 2]
+        bytes_total += len(chunk)
+        yield chunk.decode("utf-8", errors="replace"), bytes_total
         buf = buf[cut + 2:]
+
+
+def _skip_input_bytes(handle_bin, n: int) -> int:
+    """Read and discard up to `n` bytes from a binary handle. Returns the
+    number actually skipped (less than `n` only if the stream ended early)."""
+    BLOCK = 1 << 24  # 16 MiB
+    remaining = n
+    while remaining > 0:
+        block = handle_bin.read(min(remaining, BLOCK))
+        if not block:
+            break
+        remaining -= len(block)
+    return n - remaining
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint (resumable output)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _Checkpoint:
+    """On-disk state that makes extraction resumable across crashes /
+    disconnects. `input_bytes` is the cumulative byte count read from stdin
+    through the last fully-processed chunk; on resume we skip exactly that
+    many bytes and continue appending to the output.
+
+    Filter params are stored so we refuse to resume into a dataset that was
+    built with different filters — silently mixing min-elo=2500 positions
+    with min-elo=2200 positions would corrupt the training distribution."""
+    input_bytes:       int
+    games_scanned:     int
+    games_accepted:    int
+    positions_emitted: int
+    min_elo:           int
+    min_tc_seconds:    int
+    min_ply:           int
+    mirror_augment:    bool
+
+
+def _load_checkpoint(path: Path) -> Optional[_Checkpoint]:
+    if not path.exists():
+        return None
+    try:
+        return _Checkpoint(**json.loads(path.read_text()))
+    except (OSError, json.JSONDecodeError, TypeError) as e:
+        print(f"warning: checkpoint at {path} unreadable ({e!s}); ignoring.",
+              file=sys.stderr)
+        return None
+
+
+def _save_checkpoint(path: Path, cp: _Checkpoint) -> None:
+    """Atomic write — tmp file then rename, so a partial write never leaves
+    the checkpoint in a half-valid state that would make resume unsafe."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(asdict(cp)))
+    tmp.replace(path)
 
 
 # ---------------------------------------------------------------------------
@@ -308,7 +402,9 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--target", type=int, required=True,
-                   help="emit this many positions and exit (triggers SIGPIPE upstream)")
+                   help="emit this many positions total (across restarts) and "
+                        "exit. With --output, the checkpoint's emit count "
+                        "carries over so the target is the final dataset size.")
     p.add_argument("--min-elo", type=int, default=2500,
                    help="reject games where either player rated below this")
     p.add_argument("--min-tc-seconds", type=int, default=300,
@@ -329,74 +425,221 @@ def main() -> None:
                         "which was missing from the original WDL net "
                         "training data and caused a 3x eval asymmetry "
                         "(K+Q white-POV +1083cp vs black-POV -387cp).")
+    p.add_argument("--output", type=str, default=None,
+                   help="write positions to PATH instead of stdout. Enables "
+                        "resumable extraction: re-run the same command after "
+                        "a crash/disconnect and the script auto-detects the "
+                        "checkpoint at <PATH>.ckpt and skips past already-"
+                        "processed input. With no --output, the script "
+                        "writes to stdout and resume is not available.")
+    p.add_argument("--checkpoint", type=str, default=None,
+                   help="checkpoint file path (default: <output>.ckpt). "
+                        "Ignored when --output is not set.")
+    p.add_argument("--no-resume", action="store_true",
+                   help="ignore an existing checkpoint and start fresh "
+                        "(truncates the output file).")
     args = p.parse_args()
     mirror_augment = not args.no_mirror_augment
 
-    emitted = 0
-    games_scanned = 0
-    games_accepted = 0
+    # Resolve --output / --checkpoint into Path objects (or None for stdout).
+    output_path: Optional[Path] = Path(args.output) if args.output else None
+    ckpt_path:   Optional[Path] = None
+    if output_path is not None:
+        ckpt_path = (Path(args.checkpoint) if args.checkpoint
+                     else output_path.with_suffix(output_path.suffix + ".ckpt"))
+
+    # Try to load a checkpoint. Refuse to resume into a dataset that was
+    # built with different filter args — the resulting file would silently
+    # mix distributions.
+    cp: Optional[_Checkpoint] = None
+    if ckpt_path is not None and not args.no_resume:
+        cp = _load_checkpoint(ckpt_path)
+        if cp is not None:
+            mismatches: List[str] = []
+            for name, want in (("min_elo",        args.min_elo),
+                               ("min_tc_seconds", args.min_tc_seconds),
+                               ("min_ply",        args.min_ply),
+                               ("mirror_augment", mirror_augment)):
+                got = getattr(cp, name)
+                if got != want:
+                    mismatches.append(f"  {name}: checkpoint={got!r}  arg={want!r}")
+            if mismatches:
+                print("error: checkpoint params disagree with CLI args:",
+                      file=sys.stderr)
+                for m in mismatches:
+                    print(m, file=sys.stderr)
+                print("re-run with --no-resume to start fresh, or pass matching args.",
+                      file=sys.stderr)
+                sys.exit(1)
+
+    # Guard against accidentally clobbering an existing dataset. If the
+    # output file exists but no checkpoint is alongside it, the user is
+    # probably pointing at an old run they don't want truncated.
+    if (output_path is not None and cp is None and output_path.exists()
+            and not args.no_resume):
+        print(f"error: {output_path} exists but no checkpoint at {ckpt_path}.",
+              file=sys.stderr)
+        print("Either pass --no-resume to truncate, or move/delete the file.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    emitted        = cp.positions_emitted if cp else 0
+    games_scanned  = cp.games_scanned     if cp else 0
+    games_accepted = cp.games_accepted    if cp else 0
+    last_report    = emitted
+
+    # Binary stdin so we can track byte offsets exactly for resume.
+    in_handle = sys.stdin.buffer
+
+    # Open output: append on resume, truncate on a fresh run, stdout otherwise.
+    if output_path is not None:
+        mode = "a" if cp is not None else "w"
+        output_handle = open(output_path, mode, buffering=1 << 20)
+    else:
+        output_handle = sys.stdout
+
+    # On resume, fast-forward through the already-processed prefix.
+    if cp is not None:
+        print(f"resuming from {ckpt_path}: skipping {cp.input_bytes:,} input "
+              f"bytes ({cp.positions_emitted:,} positions already emitted)",
+              file=sys.stderr)
+        skipped = _skip_input_bytes(in_handle, cp.input_bytes)
+        if skipped < cp.input_bytes:
+            print(f"error: input ended after {skipped:,} bytes; checkpoint "
+                  f"expected {cp.input_bytes:,}. Wrong input file?",
+                  file=sys.stderr)
+            sys.exit(1)
+
+    def _persist(input_bytes: int) -> None:
+        """Flush output then atomically save the checkpoint. Called after
+        each chunk's lines are written, so the invariant on disk is: every
+        position from input bytes [0..`input_bytes`) has been written to
+        `output`. Some duplicates may slip in at restart boundaries if a
+        kill arrives between write() and the next _persist; harmless for
+        training."""
+        try:
+            output_handle.flush()
+            if output_path is not None:
+                os.fsync(output_handle.fileno())
+        except (OSError, ValueError):
+            # ValueError = fd closed (e.g. after pool.terminate); ignore.
+            pass
+        if ckpt_path is None:
+            return
+        _save_checkpoint(ckpt_path, _Checkpoint(
+            input_bytes       = input_bytes,
+            games_scanned     = games_scanned,
+            games_accepted    = games_accepted,
+            positions_emitted = emitted,
+            min_elo           = args.min_elo,
+            min_tc_seconds    = args.min_tc_seconds,
+            min_ply           = args.min_ply,
+            mirror_augment    = mirror_augment,
+        ))
+
+    # The chunk generator records end-byte-offsets into `offsets` so the
+    # result loop (ordered by imap) can map result index -> input position.
+    # `_iter_chunks_bytes` reports bytes consumed *since this call started*,
+    # so on resume we add the skipped prefix back in to keep offsets
+    # cumulative from byte 0 of the original (pre-skip) input stream.
+    base_offset = cp.input_bytes if cp is not None else 0
+    offsets: List[int] = []
+    def _chunk_iter():
+        for chunk_text, bytes_total in _iter_chunks_bytes(in_handle, args.chunk_bytes):
+            offsets.append(base_offset + bytes_total)
+            yield chunk_text
+
+    # Tracks the input-byte boundary of the last fully-processed chunk, so
+    # that on Ctrl-C / EOF mid-chunk we still persist a correct checkpoint.
+    last_offset = base_offset
 
     # Single-process fast path: useful for debugging and for unit tests.
     if args.workers <= 0:
-        for chunk in _iter_chunks(sys.stdin, args.chunk_bytes):
-            s, a, lines = _process_chunk(chunk, args.min_elo,
-                                         args.min_tc_seconds, args.min_ply,
-                                         mirror_augment)
-            games_scanned  += s
-            games_accepted += a
-            for line in lines:
-                try:
-                    sys.stdout.write(line)
-                except BrokenPipeError:
-                    return
-                emitted += 1
-                if emitted >= args.target:
-                    return
-                if emitted % args.report_every == 0:
-                    print(f"  emitted={emitted} scanned={games_scanned} "
-                          f"accepted={games_accepted}", file=sys.stderr)
-                    sys.stdout.flush()
-        print(f"EOF: emitted={emitted} scanned={games_scanned} "
-              f"accepted={games_accepted}", file=sys.stderr)
+        try:
+            for i, chunk_text in enumerate(_chunk_iter()):
+                s, a, lines = _process_chunk(chunk_text, args.min_elo,
+                                             args.min_tc_seconds, args.min_ply,
+                                             mirror_augment)
+                games_scanned  += s
+                games_accepted += a
+                for line in lines:
+                    try:
+                        output_handle.write(line)
+                    except BrokenPipeError:
+                        _persist(last_offset)
+                        return
+                    emitted += 1
+                    if emitted - last_report >= args.report_every:
+                        print(f"  emitted={emitted:,} scanned={games_scanned:,} "
+                              f"accepted={games_accepted:,}", file=sys.stderr)
+                        last_report = emitted
+                    if emitted >= args.target:
+                        last_offset = offsets[i]
+                        _persist(last_offset)
+                        return
+                last_offset = offsets[i]
+                _persist(last_offset)
+        except KeyboardInterrupt:
+            _persist(last_offset)
+            print(f"interrupted: emitted={emitted:,} (checkpoint saved)",
+                  file=sys.stderr)
+            return
+        print(f"EOF: emitted={emitted:,} scanned={games_scanned:,} "
+              f"accepted={games_accepted:,}", file=sys.stderr)
         return
 
-    # Multiprocessing path.
+    # Multiprocessing path. imap (ordered) — not imap_unordered — so the
+    # checkpoint can advance strictly with input position. Out-of-order
+    # results would mean either skipping unprocessed chunks (data loss) or
+    # double-processing them (duplicates). Throughput cost is small in
+    # practice because chunks are roughly equal in worker-time.
     pool = mp.Pool(processes=args.workers,
                    initializer=_worker_init,
                    initargs=(args.min_elo, args.min_tc_seconds, args.min_ply,
                              mirror_augment))
     try:
-        # imap_unordered with a small chunksize keeps the work queue full
-        # without big latency spikes when chunks are very uneven. The main
-        # thread iterates the chunk generator AND drains results — Python's
-        # GIL doesn't matter here since both are I/O bound.
-        for s, a, lines in pool.imap_unordered(_worker_task,
-                                               _iter_chunks(sys.stdin, args.chunk_bytes),
-                                               chunksize=2):
+        for i, (s, a, lines) in enumerate(pool.imap(_worker_task, _chunk_iter(),
+                                                    chunksize=2)):
             games_scanned  += s
             games_accepted += a
             for line in lines:
                 try:
-                    sys.stdout.write(line)
+                    output_handle.write(line)
                 except BrokenPipeError:
                     pool.terminate()
+                    _persist(last_offset)
                     return
                 emitted += 1
+                if emitted - last_report >= args.report_every:
+                    print(f"  emitted={emitted:,} scanned={games_scanned:,} "
+                          f"accepted={games_accepted:,}", file=sys.stderr)
+                    last_report = emitted
                 if emitted >= args.target:
+                    last_offset = offsets[i]
+                    _persist(last_offset)
                     pool.terminate()
-                    print(f"done: emitted={emitted} scanned={games_scanned} "
-                          f"accepted={games_accepted}", file=sys.stderr)
+                    print(f"done: emitted={emitted:,} scanned={games_scanned:,} "
+                          f"accepted={games_accepted:,}", file=sys.stderr)
                     return
-                if emitted % args.report_every == 0:
-                    print(f"  emitted={emitted} scanned={games_scanned} "
-                          f"accepted={games_accepted}", file=sys.stderr)
-                    sys.stdout.flush()
+            last_offset = offsets[i]
+            _persist(last_offset)
+    except KeyboardInterrupt:
+        pool.terminate()
+        _persist(last_offset)
+        print(f"interrupted: emitted={emitted:,} "
+              f"(checkpoint saved to {ckpt_path})", file=sys.stderr)
+        return
     finally:
         pool.close()
         pool.join()
+        if output_path is not None:
+            try:
+                output_handle.close()
+            except Exception:
+                pass
 
-    print(f"EOF: emitted={emitted} scanned={games_scanned} "
-          f"accepted={games_accepted}", file=sys.stderr)
+    print(f"EOF: emitted={emitted:,} scanned={games_scanned:,} "
+          f"accepted={games_accepted:,}", file=sys.stderr)
 
 
 if __name__ == "__main__":
