@@ -1,0 +1,19 @@
+{
+  "id": "simbae11/tcec-chess-engine",
+  "title": "tcec-chess-engine",
+  "code_file": "eclipse_wdl_train.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_tpu": false,
+  "enable_internet": false,
+  "dataset_sources": [
+    "simbae11/eclipse-partial",
+    "simbae11/eclipse-trainer"
+  ],
+  "kernel_sources": [],
+  "competition_sources": [],
+  "model_sources": [],
+  "docker_image_pinning_type": "latest"
+}
