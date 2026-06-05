@@ -15,6 +15,10 @@
 
 namespace eclipse::mcts {
 
+// PUCT runtime knobs. Tunable via UCI Cpuct / FpuOffset.
+float g_cpuct      = 1.41f;
+float g_fpu_offset = 0.25f;
+
 namespace {
 
 // Logging cadence shared across workers. Time-based (1s) rather than node-based
@@ -264,7 +268,7 @@ void MCTS::iterate() {
         Node* best_child = nullptr;
         float best_score = -1e30f;
         for (const auto& child : node->children) {
-            const float s = child->puct_score(parent_n, kCpuct, parent_q);
+            const float s = child->puct_score(parent_n, g_cpuct, parent_q);
             if (s > best_score) {
                 best_score = s;
                 best_child = child.get();

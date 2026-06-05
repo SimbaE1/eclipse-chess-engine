@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "attacks.hpp"
+#include "mcts.hpp"
 #include "movegen.hpp"
 #include "nnue.hpp"
 #include "policy.hpp"
@@ -96,6 +97,8 @@ void cmd_uci() {
               << "option name Hash type spin default 16 min 1 max 16384\n"
               << "option name OverrideMargin type spin default 50 min 0 max 1000\n"
               << "option name AbThreads type spin default 1 min 0 max 128\n"
+              << "option name Cpuct type string default 1.41\n"
+              << "option name FpuOffset type string default 0.25\n"
               << "uciok" << std::endl;
 }
 
@@ -144,6 +147,12 @@ void cmd_setoption(const std::vector<std::string>& tok) {
     } else if (name == "AbThreads") {
         const int n = std::atoi(value.c_str());
         g_search_info.ab_threads = std::clamp(n, 0, 128);
+    } else if (name == "Cpuct") {
+        const float f = std::strtof(value.c_str(), nullptr);
+        if (f > 0.0f && f < 100.0f) mcts::g_cpuct = f;
+    } else if (name == "FpuOffset") {
+        const float f = std::strtof(value.c_str(), nullptr);
+        if (f > -1.0f && f < 2.0f) mcts::g_fpu_offset = f;
     }
     // Unknown options are silently ignored per UCI convention.
 }

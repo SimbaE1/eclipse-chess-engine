@@ -22,6 +22,13 @@ namespace eclipse::mcts {
 inline constexpr int     kWShift = 20;
 inline constexpr int64_t kWScale = 1LL << kWShift;
 
+// PUCT search constants — exposed at runtime so the UCI client can A/B them
+// without rebuilding. Defaults match the values we shipped before; both are
+// in the typical AlphaZero range. Read by every puct_score() call, so kept
+// as float globals rather than going through a SearchInfo pointer.
+extern float g_cpuct;        // exploration coefficient
+extern float g_fpu_offset;   // First-Play Urgency discount on parent_q for unvisited children
+
 struct Node {
     Move  move   = MoveNone;
     Node* parent = nullptr;
@@ -78,11 +85,11 @@ struct Node {
         float q;
         if (n_eff == 0) {
             // First Play Urgency (FPU): discount the parent's Q.
-            // parent_q is the value of the parent position from the perspective 
-            // of the player who just moved to reach this node. 
+            // parent_q is the value of the parent position from the perspective
+            // of the player who just moved to reach this node.
             // We subtract a small discount to favor exploration of unvisited nodes
-            // without being reckless.
-            q = parent_q - 0.25f;
+            // without being reckless. Tunable via UCI `FpuOffset`.
+            q = parent_q - g_fpu_offset;
         } else {
             const float w_eff = W() - static_cast<float>(vl);
             q = w_eff / static_cast<float>(n_eff);
@@ -119,8 +126,6 @@ private:
     Position&   root_pos;
     SearchInfo& search_info;
     std::unique_ptr<Node> root;
-
-    static constexpr float kCpuct = 1.41f;
 };
 
 }  // namespace eclipse::mcts

@@ -144,7 +144,9 @@ Full pipeline lives in `scripts/`:
 
 Recommended workflow for the Mac Pro: extract data locally (network-bound),
 upload to Kaggle, train on a T4 in a notebook, download the `.pt`, pack locally.
-See conversation history for details.
+See [`KAGGLE.md`](KAGGLE.md) for the end-to-end Kaggle pipeline and
+[`notebooks/eclipse_wdl_train.ipynb`](notebooks/eclipse_wdl_train.ipynb) for
+the notebook itself.
 
 ## Architecture overview
 
