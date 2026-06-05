@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// HalfKAv2-1024x2-128-32 NNUE evaluation.
+// HalfKAv2-1024x2-256-64-3 NNUE evaluation.
 //
 // Architecture (Stockfish-modern shape):
 //   Input features: HalfKAv2 - king-relative, perspective-doubled.
@@ -15,9 +15,9 @@
 //   Feature transformer: 45056 -> 1024, int16 weights + bias.
 //   Concatenation: [accumulator_us, accumulator_them] -> 2048
 //   Activation: clipped ReLU [0, kFtQuant=127] -> uint8[2048]
-//   L1: 2048 -> 128, int8 weights, int32 bias.
-//   L2:  128 -> 32,  int8 weights, int32 bias.
-//   L3:   32 -> 1,   int8 weights, int32 bias -> centipawns.
+//   L1: 2048 -> 256, int8 weights, int32 bias.
+//   L2:  256 -> 64,  int8 weights, int32 bias.
+//   L3:   64 -> 3,   int8 weights, int32 bias -> WDL logits.
 //
 // Phase 1: scalar forward pass, non-incremental (recompute accumulator per eval).
 // Phase 2: incremental updates wired through StateInfo / do_move / undo_move.

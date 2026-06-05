@@ -573,12 +573,10 @@ def main() -> None:
                         print(f"  emitted={emitted:,} scanned={games_scanned:,} "
                               f"accepted={games_accepted:,}", file=sys.stderr)
                         last_report = emitted
-                    if emitted >= args.target:
-                        last_offset = offsets[i]
-                        _persist(last_offset)
-                        return
                 last_offset = offsets[i]
                 _persist(last_offset)
+                if emitted >= args.target:
+                    return
         except KeyboardInterrupt:
             _persist(last_offset)
             print(f"interrupted: emitted={emitted:,} (checkpoint saved)",
@@ -614,15 +612,13 @@ def main() -> None:
                     print(f"  emitted={emitted:,} scanned={games_scanned:,} "
                           f"accepted={games_accepted:,}", file=sys.stderr)
                     last_report = emitted
-                if emitted >= args.target:
-                    last_offset = offsets[i]
-                    _persist(last_offset)
-                    pool.terminate()
-                    print(f"done: emitted={emitted:,} scanned={games_scanned:,} "
-                          f"accepted={games_accepted:,}", file=sys.stderr)
-                    return
             last_offset = offsets[i]
             _persist(last_offset)
+            if emitted >= args.target:
+                pool.terminate()
+                print(f"done: emitted={emitted:,} scanned={games_scanned:,} "
+                      f"accepted={games_accepted:,}", file=sys.stderr)
+                return
     except KeyboardInterrupt:
         pool.terminate()
         _persist(last_offset)

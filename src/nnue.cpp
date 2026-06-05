@@ -33,9 +33,9 @@ namespace {
 //   uint32  version          (kVersion)
 //   uint32  ft_in_features   (must equal kFtNumFeatures = 45056)
 //   uint32  ft_out           (must equal kFtOutSize = 1024, per perspective)
-//   uint32  l1_out           (must equal kL1OutSize = 128)
-//   uint32  l2_out           (must equal kL2OutSize = 32)
-//   uint32  l3_out           (must equal kL3OutSize = 1)
+//   uint32  l1_out           (must equal kL1OutSize = 256)
+//   uint32  l2_out           (must equal kL2OutSize = 64)
+//   uint32  l3_out           (must equal kL3OutSize = 3)
 //   float   output_cp_per_unit   - centipawns per real-unit of L3 output;
 //                                  see kOutputCpDivisor explanation below
 //   int16   ft_b[ft_out]
@@ -667,7 +667,7 @@ void evaluate_batch(const Accumulator* accs, const Color* stms, Score* scores, i
 #if defined(__AVX2__)
     {
         const __m256i clamp_hi = _mm256_set1_epi16(static_cast<std::int16_t>(kFtQuant));
-        const __m256i perm     = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+        const __m256i perm     = _mm256_setr_epi32(0, 1, 4, 5, 2, 3, 6, 7);
         for (int b = 0; b < n; ++b) {
             const Accumulator& acc = accs[b];
             const Color       stm  = stms[b];

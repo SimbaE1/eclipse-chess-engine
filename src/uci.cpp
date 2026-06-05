@@ -148,11 +148,13 @@ void cmd_setoption(const std::vector<std::string>& tok) {
         const int n = std::atoi(value.c_str());
         g_search_info.ab_threads = std::clamp(n, 0, 128);
     } else if (name == "Cpuct") {
-        const float f = std::strtof(value.c_str(), nullptr);
-        if (f > 0.0f && f < 100.0f) mcts::g_cpuct = f;
+        char* end = nullptr;
+        const float f = std::strtof(value.c_str(), &end);
+        if (end != value.c_str() && f > 0.0f && f < 100.0f) mcts::g_cpuct = f;
     } else if (name == "FpuOffset") {
-        const float f = std::strtof(value.c_str(), nullptr);
-        if (f > -1.0f && f < 2.0f) mcts::g_fpu_offset = f;
+        char* end = nullptr;
+        const float f = std::strtof(value.c_str(), &end);
+        if (end != value.c_str() && f > -1.0f && f < 2.0f) mcts::g_fpu_offset = f;
     }
     // Unknown options are silently ignored per UCI convention.
 }
