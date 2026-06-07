@@ -44,6 +44,10 @@ struct SearchCtx {
     // History heuristic: [color][from][to].
     std::int32_t history[2][64][64]{};
 
+    // Countermove heuristic: the quiet move that caused a beta cutoff in
+    // response to the opponent's move [color][from][to].
+    Move countermove[2][64][64]{};
+
     // Zobrist key path from the search root.  Populated by negamax push/pop
     // around each do_move so we can detect in-search repetitions.
     std::vector<std::uint64_t> key_history;
@@ -65,8 +69,9 @@ struct SearchCtx {
 };
 
 // Score a move for ordering. Captures sorted by MVV-LVA, then killers,
-// then history.
-int order_score(const Position& pos, Move m, int ply, const SearchCtx& ctx) {
+// then countermove, then history.
+int order_score(const Position& pos, Move m, int ply, const SearchCtx& ctx,
+                Move prev_move = MoveNone) {
     const Piece     vict_p = pos.piece_on(m.to());
     const Piece     aggr_p = pos.piece_on(m.from());
     const PieceType vict   = type_of(vict_p);
@@ -85,6 +90,12 @@ int order_score(const Position& pos, Move m, int ply, const SearchCtx& ctx) {
         if (ply < 64) {
             if (m == ctx.killers[ply][0]) return 1'000'000;
             if (m == ctx.killers[ply][1]) return 900'000;
+        }
+        // Countermove: move that historically refuted the previous move.
+        if (prev_move != MoveNone) {
+            const Color pc = pos.side_to_move() == White ? Black : White;
+            if (ctx.countermove[pc][prev_move.from()][prev_move.to()] == m)
+                return 800'000;
         }
         s = ctx.history[pos.side_to_move()][m.from()][m.to()];
     }
@@ -105,7 +116,8 @@ void generate_captures(Position& pos, MoveList& out) {
 }
 
 Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
-              Move& out_best, SearchCtx& ctx, Move excluded = MoveNone);
+              Move& out_best, SearchCtx& ctx, Move excluded = MoveNone,
+              Move prev_move = MoveNone);
 
 Score qsearch(Position& pos, Score alpha, Score beta, int ply, SearchCtx& ctx) {
     ++ctx.nodes;
@@ -160,7 +172,7 @@ Score qsearch(Position& pos, Score alpha, Score beta, int ply, SearchCtx& ctx) {
 }
 
 Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
-              Move& out_best, SearchCtx& ctx, Move excluded) {
+              Move& out_best, SearchCtx& ctx, Move excluded, Move prev_move) {
     ++ctx.nodes;
     out_best = MoveNone;
 
@@ -211,7 +223,7 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
             StateInfo st;
             pos.do_null_move(st);
             Move dummy;
-            const Score s = -negamax(pos, depth - 1 - 3, -beta, -beta + 1, ply + 1, dummy, ctx);
+            const Score s = -negamax(pos, depth - 1 - 3, -beta, -beta + 1, ply + 1, dummy, ctx, MoveNone, MoveNone);
             pos.undo_null_move(st);
             if (s >= beta) return beta;
         }
@@ -239,7 +251,7 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
         const Score margin   = depth; // margin = 1cp per depth
         
         Move dummy;
-        const Score s = negamax(pos, depth / 2, tt_score - margin - 1, tt_score - margin, ply + 1, dummy, ctx, tt_move);
+        const Score s = negamax(pos, depth / 2, tt_score - margin - 1, tt_score - margin, ply + 1, dummy, ctx, tt_move, prev_move);
         
         if (s < tt_score - margin) {
             extension = 1;
@@ -255,12 +267,33 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
         return pos.in_check() ? -static_cast<Score>(kMateScore - ply) : Score{0};
     }
 
+    // Futility pruning: if static eval is far below alpha at low depth, quiet
+    // moves cannot realistically raise it so we skip them (captures + checks
+    // are still searched).
+    static constexpr Score kFutilityMargin[4] = {0, 150, 300, 500};
+    const bool can_futility_prune =
+        !pos.in_check()
+        && depth <= 3
+        && excluded == MoveNone
+        && alpha > -kMateInMaxPly && alpha < kMateInMaxPly
+        && static_eval + kFutilityMargin[depth] <= alpha;
+
+    // LMP: at depth 1-2, after trying N quiet moves, skip the rest.
+    // Not applied in check (we must search all evasions) or near mate scores.
+    static constexpr int kLmpCount[3] = {0, 8, 15};
+    const bool can_lmp =
+        !pos.in_check()
+        && depth <= 2
+        && excluded == MoveNone
+        && alpha > -kMateInMaxPly && alpha < kMateInMaxPly;
+    int quiet_tried = 0;
+
     // Order moves. TT move comes first.
     std::array<int, 256> scores{};
     for (int i = 0; i < moves.size; ++i) {
         const std::size_t idx = static_cast<std::size_t>(i);
         if (moves[idx] == tt_move) scores[idx] = 3'000'000;
-        else                       scores[idx] = order_score(pos, moves[idx], ply, ctx);
+        else                       scores[idx] = order_score(pos, moves[idx], ply, ctx, prev_move);
     }
     for (int i = 1; i < moves.size; ++i) {
         for (int j = i; j > 0 && scores[static_cast<std::size_t>(j)] > scores[static_cast<std::size_t>(j - 1)]; --j) {
@@ -276,6 +309,19 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
         const Move m = moves[idx];
         if (m == excluded) continue;
 
+        const bool is_quiet = pos.piece_on(m.to()) == NoPiece
+                           && m.type() != Move::EnPassant
+                           && m.type() != Move::Promotion;
+
+        // Futility pruning: skip quiet moves that can't raise alpha.
+        if (can_futility_prune && i > 0 && is_quiet) continue;
+
+        // LMP: once we've tried enough quiet moves at low depth, stop.
+        if (can_lmp && is_quiet) {
+            if (quiet_tried >= kLmpCount[depth]) continue;
+        }
+        if (is_quiet) ++quiet_tried;
+
         StateInfo st;
         const std::uint64_t parent_key = pos.key();
         pos.do_move(m, st);
@@ -285,14 +331,11 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
         Score s;
         if (i == 0) {
             // PV node: search with full window.
-            s = -negamax(pos, depth - 1 + extension, -beta, -alpha, ply + 1, dummy, ctx);
+            s = -negamax(pos, depth - 1 + extension, -beta, -alpha, ply + 1, dummy, ctx, MoveNone, m);
         } else {
             // LMR: reduce depth for late-ordered quiet moves.
             int reduction = 0;
-            if (depth >= 3 && i >= 3 && !pos.in_check() &&
-                pos.piece_on(m.to()) == NoPiece &&
-                m.type() != Move::EnPassant) {
-
+            if (depth >= 3 && i >= 3 && !pos.in_check() && is_quiet) {
                 const int d_idx = std::min(depth, 63);
                 const int i_idx = std::min(i, 255);
                 reduction = static_cast<int>(g_lmr_table[d_idx][i_idx]);
@@ -307,14 +350,14 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
             }
 
             // Non-PV node: search with null window first.
-            s = -negamax(pos, depth - 1 - reduction, -alpha - 1, -alpha, ply + 1, dummy, ctx);
+            s = -negamax(pos, depth - 1 - reduction, -alpha - 1, -alpha, ply + 1, dummy, ctx, MoveNone, m);
             if (s > alpha && reduction > 0) {
                 // Failed high on reduced search: re-search with full depth but null window.
-                s = -negamax(pos, depth - 1, -alpha - 1, -alpha, ply + 1, dummy, ctx);
+                s = -negamax(pos, depth - 1, -alpha - 1, -alpha, ply + 1, dummy, ctx, MoveNone, m);
             }
             if (s > alpha && s < beta) {
                 // Failed high on null window: re-search with full window.
-                s = -negamax(pos, depth - 1, -beta, -alpha, ply + 1, dummy, ctx);
+                s = -negamax(pos, depth - 1, -beta, -alpha, ply + 1, dummy, ctx, MoveNone, m);
             }
         }
 
@@ -325,7 +368,7 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
         if (s > alpha) alpha = s;
         if (alpha >= beta) {
             // Beta cutoff. Update heuristics for quiet moves.
-            if (pos.piece_on(m.to()) == NoPiece && m.type() != Move::EnPassant) {
+            if (is_quiet) {
                 if (ply < 64) {
                     const std::size_t pidx = static_cast<std::size_t>(ply);
                     if (m != ctx.killers[pidx][0]) {
@@ -337,14 +380,15 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
                 ctx.history[us][m.from()][m.to()] += static_cast<std::int32_t>(depth * depth);
 
                 // History aging via right-shift over the flat backing array.
-                // The previous form ran 8192 divides through three nested
-                // loops each time the table grew past 1M — a measurable
-                // hiccup on cutoff-heavy positions. >>= 1 is the same
-                // arithmetic for non-negative values and amortizes the
-                // cost to a single memset-speed pass.
                 if (ctx.history[us][m.from()][m.to()] > 1'000'000) {
                     std::int32_t* base = &ctx.history[0][0][0];
-                    for (int i = 0; i < 2 * 64 * 64; ++i) base[i] >>= 1;
+                    for (int k = 0; k < 2 * 64 * 64; ++k) base[k] >>= 1;
+                }
+
+                // Countermove: record that m refutes prev_move.
+                if (prev_move != MoveNone) {
+                    const Color opp = us == White ? Black : White;
+                    ctx.countermove[opp][prev_move.from()][prev_move.to()] = m;
                 }
             }
             break;  // beta cutoff

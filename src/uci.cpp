@@ -254,6 +254,11 @@ void cmd_go(const std::vector<std::string>& tok) {
         const int  divisor = std::clamp(mlh_our_moves, 5, 60);
 
         limits.time_ms = remain / divisor + inc * 4 / 5;
+        // Safety: never burn more than 1/3 of remaining time on one move, and
+        // subtract 50 ms for move overhead to avoid flagging on increment TCs.
+        const int safety_cap = remain / 3;
+        if (limits.time_ms > safety_cap) limits.time_ms = safety_cap;
+        limits.time_ms -= 50;
         if (limits.time_ms < 1) limits.time_ms = 1;
     }
 
