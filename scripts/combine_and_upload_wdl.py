@@ -5,8 +5,7 @@ Run after all extract_*.log pipelines show EOF:
     python3 scripts/combine_and_upload_wdl.py
 
 What it does:
-  1. Cats data/wdl_training.txt (Jan) + data/wdl_feb2025.txt + data/wdl_2025_0[3-5].txt
-     into data/wdl_combined.txt
+  1. Cats all monthly files (2024 + 2025 + 2026) into data/wdl_combined.txt
   2. Gzips to data/wdl_training.txt.gz (replaces the old single-month gz)
   3. Uploads as a new version of simbae11/eclipse-partial
 
@@ -30,11 +29,38 @@ TOKEN    = "KGAT_eda6abf5bb3456fbfdb4dd55810c2d08"
 DATASET  = "simbae11/eclipse-partial"
 
 SOURCES = [
+    # 2024
+    DATA / "wdl_2024_01.txt",
+    DATA / "wdl_2024_02.txt",
+    DATA / "wdl_2024_03.txt",
+    DATA / "wdl_2024_04.txt",
+    DATA / "wdl_2024_05.txt",
+    DATA / "wdl_2024_06.txt",
+    DATA / "wdl_2024_07.txt",
+    DATA / "wdl_2024_08.txt",
+    DATA / "wdl_2024_09.txt",
+    DATA / "wdl_2024_10.txt",
+    DATA / "wdl_2024_11.txt",
+    DATA / "wdl_2024_12.txt",
+    # 2025
     DATA / "wdl_training.txt",       # Jan 2025 (2.36M)
-    DATA / "wdl_feb2025.txt",        # Feb 2025 (note: not wdl_feb.txt)
-    DATA / "wdl_2025_03.txt",        # Mar 2025
-    DATA / "wdl_2025_04.txt",        # Apr 2025
-    DATA / "wdl_2025_05.txt",        # May 2025
+    DATA / "wdl_feb2025.txt",        # Feb 2025
+    DATA / "wdl_2025_03.txt",
+    DATA / "wdl_2025_04.txt",
+    DATA / "wdl_2025_05.txt",
+    DATA / "wdl_2025_06.txt",
+    DATA / "wdl_2025_07.txt",
+    DATA / "wdl_2025_08.txt",
+    DATA / "wdl_2025_09.txt",
+    DATA / "wdl_2025_10.txt",
+    DATA / "wdl_2025_11.txt",
+    DATA / "wdl_2025_12.txt",
+    # 2026
+    DATA / "wdl_2026_01.txt",
+    DATA / "wdl_2026_02.txt",
+    DATA / "wdl_2026_03.txt",
+    DATA / "wdl_2026_04.txt",
+    DATA / "wdl_2026_05.txt",
 ]
 
 COMBINED = DATA / "wdl_combined.txt"
@@ -89,7 +115,7 @@ def main():
                 "licenses": [{"name": "other"}]}
         (tmp / "dataset-metadata.json").write_text(json.dumps(meta))
 
-        msg = (f"combined WDL: {total_lines:,} positions from Jan-May 2025, "
+        msg = (f"combined WDL: {total_lines:,} positions from 2024-2026, "
                f"2500+ ELO, 300s+ TC, mirror aug")
         env = {**os.environ, "KAGGLE_API_TOKEN": TOKEN}
         result = subprocess.run(
