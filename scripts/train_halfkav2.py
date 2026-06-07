@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 """
-HalfKAv2-1024x2-128-32 training loop for Eclipse.
+HalfKAv2-1024x2-512-128 training loop for Eclipse.
 
 The model here is the float32 mirror of the inference path in src/nnue.cpp.
 After training, save state_dict (.pt) and convert with:
@@ -51,6 +51,10 @@ Hit those once the engine is generating wins.
 from __future__ import annotations  # keeps `int | None` syntax working on 3.9
 
 import argparse
+import gzip
+import math
+import random
+import struct as _struct
 import sys
 from pathlib import Path
 
@@ -60,10 +64,14 @@ try:
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
-    from torch.utils.data import DataLoader, Dataset
+    from torch.utils.data import DataLoader, Dataset, IterableDataset
 except ImportError:
     print("error: training requires PyTorch. pip install torch", file=sys.stderr)
     sys.exit(1)
+
+# Binary format produced by preprocess_halfkav2.py (must stay in sync).
+_BIN_MAGIC = b'HKAV2BIN'
+_BIN_HSIZE = 16   # 8 magic + 8 N (int64 LE)
 
 # Mirror src/nnue.hpp - any drift here = silently wrong inference.
 #
@@ -77,9 +85,9 @@ except ImportError:
 FT_IN_FEATURES = 45056
 FT_OUT         = 1024                # keep in sync with kFtOutSize in src/nnue.hpp
 L1_IN          = 2 * FT_OUT          # 2048 (concat of both perspectives)
-L1_OUT         = 256                 # Increased for more capacity
-L2_OUT         = 64                  # Increased for more capacity
-L3_OUT         = 3                   # WDL Head: [Win, Draw, Loss]
+L1_OUT         = 512
+L2_OUT         = 128
+L3_OUT         = 1                   # Value head: single logit (sigmoid = win prob)
 
 # Piece-type slots within a (king_sq, piece_sq) cell. See FT_IN_FEATURES.
 N_PIECE_SLOTS  = 11
@@ -191,132 +199,189 @@ def fen_to_features(fen: str):
 MAX_ACTIVE = 32
 
 
+def _open_data(path: Path):
+    """Open a training file, transparently decompressing .gz if needed."""
+    if str(path).endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8")
+    return open(path, encoding="utf-8")
+
+
+def _parse_line(line: str, cp_scale: float):
+    """Parse one data line. Returns (us_arr, them_arr, win_prob float32) or None."""
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    parts = line.split(";")
+    if len(parts) == 4:
+        try:
+            fen     = parts[0].strip()
+            win_prob = np.float32(float(parts[1]) + 0.5 * float(parts[2]))
+        except ValueError:
+            return None
+    elif len(parts) == 2:
+        try:
+            fen      = parts[0].strip()
+            win_prob = np.float32(1.0 / (1.0 + math.exp(-float(parts[1]) / cp_scale)))
+        except ValueError:
+            return None
+    else:
+        return None
+    try:
+        us, them = fen_to_features(fen)
+    except (KeyError, IndexError, ValueError):
+        return None
+    us_arr   = np.full(MAX_ACTIVE, FT_IN_FEATURES, dtype=np.int32)
+    them_arr = np.full(MAX_ACTIVE, FT_IN_FEATURES, dtype=np.int32)
+    us_arr[:min(len(us),   MAX_ACTIVE)] = us[:MAX_ACTIVE]
+    them_arr[:min(len(them), MAX_ACTIVE)] = them[:MAX_ACTIVE]
+    return us_arr, them_arr, win_prob
+
+
 class HalfKAv2Dataset(Dataset):
-    """Reads `<fen>;<W>;<D>;<L>` or legacy `<fen>;<score_cp>` lines into flat
-    numpy arrays. Format is autodetected per line by counting separators.
-
-    Memory model: three contiguous arrays
-        us_idx   : int32   [N, MAX_ACTIVE]   (padded with FT_IN_FEATURES sentinel)
-        them_idx : int32   [N, MAX_ACTIVE]
-        targets  : float32 [N, 3]            (W, D, L) or (sigmoid(cp), 0, sigmoid(-cp))
-
-    targets is always shape [N, 3]; the cp path back-fills draw=0 to keep the
-    array shape uniform (and the trainer warns when cp-labeled rows are seen,
-    since the resulting WDL targets are degenerate).
-
-    For 10M positions: 10M * (32+32) * 4 + 10M * 3 * 4 = ~2.7 GB.
-    """
+    """In-memory dataset. Use for validation sets (≤ a few million positions).
+    Supports plain text and .gz files. Single-pass when max_lines is set."""
 
     def __init__(self, path: Path, max_lines: int | None = None, cp_scale: float = 410.0):
-        # Two-pass: count usable lines, then allocate flat arrays of the right
-        # size and fill them. Avoids Python list growth + per-row object
-        # overhead during construction.
-        n = 0
-        with path.open() as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                n += 1
-                if max_lines is not None and n >= max_lines:
-                    break
-        if n == 0:
+        n_alloc = max_lines if max_lines is not None else self._count_lines(path)
+        if n_alloc == 0:
             raise RuntimeError(f"no training rows in {path}")
 
-        self.us_idx   = np.full((n, MAX_ACTIVE), FT_IN_FEATURES, dtype=np.int32)
-        self.them_idx = np.full((n, MAX_ACTIVE), FT_IN_FEATURES, dtype=np.int32)
-        self.targets  = np.zeros((n, 3), dtype=np.float32)  # always (W, D, L)
+        self.us_idx   = np.full((n_alloc, MAX_ACTIVE), FT_IN_FEATURES, dtype=np.int32)
+        self.them_idx = np.full((n_alloc, MAX_ACTIVE), FT_IN_FEATURES, dtype=np.int32)
+        self.targets  = np.zeros((n_alloc, 1), dtype=np.float32)
 
         i = 0
-        skipped = 0
-        n_wdl_rows = 0
-        n_cp_rows  = 0
-        with path.open() as f:
-            for ln, line in enumerate(f, start=1):
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if i >= n:
+        with _open_data(path) as f:
+            for line in f:
+                if i >= n_alloc:
                     break
-
-                parts = line.split(";")
-                # 4 fields => WDL (fen, W, D, L); 2 fields => legacy cp.
-                if len(parts) == 4:
-                    try:
-                        fen = parts[0].strip()
-                        w   = float(parts[1].strip())
-                        d   = float(parts[2].strip())
-                        l   = float(parts[3].strip())
-                    except ValueError:
-                        skipped += 1
-                        continue
-                    target = (w, d, l)
-                    n_wdl_rows += 1
-                elif len(parts) == 2:
-                    try:
-                        fen   = parts[0].strip()
-                        score = float(parts[1].strip())
-                    except ValueError:
-                        skipped += 1
-                        continue
-                    # cp -> WDL via sigmoid mapping. We back-fill draw=0 to
-                    # keep the array shape uniform; the trainer will warn
-                    # about cp rows since this collapses to a W/L target.
-                    # Kept only for compatibility with old cp datasets.
-                    import math
-                    pw = 1.0 / (1.0 + math.exp(-score / cp_scale))
-                    target = (pw, 0.0, 1.0 - pw)
-                    n_cp_rows += 1
-                else:
-                    skipped += 1
+                parsed = _parse_line(line, cp_scale)
+                if parsed is None:
                     continue
-
-                try:
-                    us, them = fen_to_features(fen)
-                except (KeyError, IndexError, ValueError) as e:
-                    if skipped < 5:
-                        print(f"  skip line {ln}: feature error: {e}", file=sys.stderr)
-                    skipped += 1
-                    continue
-                k_us   = min(len(us),   MAX_ACTIVE)
-                k_them = min(len(them), MAX_ACTIVE)
-                self.us_idx[i,   :k_us]   = us[:k_us]
-                self.them_idx[i, :k_them] = them[:k_them]
-                self.targets[i, 0] = target[0]
-                self.targets[i, 1] = target[1]
-                self.targets[i, 2] = target[2]
+                self.us_idx[i], self.them_idx[i], self.targets[i, 0] = parsed
                 i += 1
                 if i % 500_000 == 0:
-                    print(f"  loaded {i}/{n} positions", file=sys.stderr)
+                    print(f"  loaded {i} positions", file=sys.stderr)
 
-        # If we skipped some, the tail of the arrays is unused. Truncate so
-        # __len__ is accurate and we don't train on zero-rows that mean
-        # "completely empty board" (which would actually be a valid HalfKAv2
-        # encoding - all padding).
-        if i < n:
+        if i < n_alloc:
             self.us_idx   = self.us_idx[:i]
             self.them_idx = self.them_idx[:i]
             self.targets  = self.targets[:i]
+        print(f"loaded {i} positions", file=sys.stderr)
 
-        print(f"loaded {i} positions ({skipped} skipped, "
-              f"wdl_rows={n_wdl_rows}, cp_rows={n_cp_rows})")
-        if n_cp_rows > 0 and n_wdl_rows == 0:
-            print("WARNING: all rows are legacy cp format. The derived WDL "
-                  "targets put 0 mass on draw — the resulting net will be "
-                  "a W/L binary classifier, not a real WDL net. Re-extract "
-                  "with scripts/extract_lichess_wdl.py for proper WDL.",
-                  file=sys.stderr)
-        elif n_cp_rows > 0:
-            mix = 100.0 * n_cp_rows / max(1, n_cp_rows + n_wdl_rows)
-            print(f"WARNING: {mix:.1f}% of rows are legacy cp format with "
-                  f"degenerate draw=0 targets.", file=sys.stderr)
+    @staticmethod
+    def _count_lines(path: Path) -> int:
+        n = 0
+        with _open_data(path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    n += 1
+        return n
 
     def __len__(self):
         return len(self.targets)
 
     def __getitem__(self, idx):
-        # Return numpy slices - cheap, no allocation. collate() stacks them.
         return self.us_idx[idx], self.them_idx[idx], self.targets[idx]
+
+
+class HalfKAv2StreamDataset(IterableDataset):
+    """Memory-bounded streaming dataset for files too large to fit in RAM.
+
+    Reads the file sequentially and maintains a reservoir shuffle buffer so
+    samples within each buffer-sized window are randomly shuffled.
+
+    Memory per worker: shuffle_buffer * (32+32)*4 + shuffle_buffer*4 bytes.
+    At shuffle_buffer=500_000 that is ~133 MB per worker.
+
+    Multi-worker: each DataLoader worker takes every Nth data line
+    (worker i reads lines i, i+N, i+2N, ...) so workers see non-overlapping,
+    complementary subsets without inter-process coordination.
+    """
+
+    def __init__(self, path: Path, skip_lines: int = 0,
+                 max_lines: int | None = None, cp_scale: float = 410.0,
+                 shuffle_buffer: int = 500_000):
+        self.path           = path
+        self.skip_lines     = skip_lines
+        self.max_lines      = max_lines
+        self.cp_scale       = cp_scale
+        self.shuffle_buffer = shuffle_buffer
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id   = worker_info.id          if worker_info else 0
+        n_workers   = worker_info.num_workers if worker_info else 1
+
+        # Each worker owns 1/n_workers of max_lines so the total across all
+        # workers equals max_lines, not max_lines * n_workers.
+        if self.max_lines is not None:
+            per_worker_max = (self.max_lines + n_workers - 1) // n_workers
+        else:
+            per_worker_max = None
+
+        buf_us   = np.full((self.shuffle_buffer, MAX_ACTIVE), FT_IN_FEATURES, dtype=np.int32)
+        buf_them = np.full((self.shuffle_buffer, MAX_ACTIVE), FT_IN_FEATURES, dtype=np.int32)
+        buf_tgt  = np.zeros(self.shuffle_buffer, dtype=np.float32)
+        buf_fill = 0
+        emitted  = 0
+        data_idx = 0  # counts parseable data lines seen after the skip
+
+        with _open_data(self.path) as f:
+            # Skip the val lines that HalfKAv2Dataset already holds in memory.
+            if self.skip_lines > 0:
+                skipped = 0
+                for raw in f:
+                    if raw.strip() and not raw.strip().startswith("#"):
+                        skipped += 1
+                        if skipped >= self.skip_lines:
+                            break
+
+            for raw in f:
+                if per_worker_max is not None and emitted >= per_worker_max:
+                    break
+                stripped = raw.strip()
+                if not stripped or stripped.startswith('#'):
+                    continue
+                # Stride check BEFORE parsing: each worker only parses its own
+                # lines (previously all workers parsed every line — 8x wasted CPU).
+                if data_idx % n_workers != worker_id:
+                    data_idx += 1
+                    continue
+                data_idx += 1
+                parsed = _parse_line(raw, self.cp_scale)
+                if parsed is None:
+                    continue
+
+                us_arr, them_arr, win_prob = parsed
+
+                if buf_fill < self.shuffle_buffer:
+                    buf_us[buf_fill]   = us_arr
+                    buf_them[buf_fill] = them_arr
+                    buf_tgt[buf_fill]  = win_prob
+                    buf_fill += 1
+                else:
+                    # Reservoir replacement: evict a random slot and yield it.
+                    idx = random.randrange(buf_fill)
+                    yield (buf_us[idx].copy(),
+                           buf_them[idx].copy(),
+                           buf_tgt[idx:idx + 1].copy())
+                    buf_us[idx]   = us_arr
+                    buf_them[idx] = them_arr
+                    buf_tgt[idx]  = win_prob
+                    emitted += 1
+
+        # Drain buffer in shuffled order.
+        perm = list(range(buf_fill))
+        random.shuffle(perm)
+        for idx in perm:
+            if per_worker_max is not None and emitted >= per_worker_max:
+                break
+            yield (buf_us[idx].copy(),
+                   buf_them[idx].copy(),
+                   buf_tgt[idx:idx + 1].copy())
+            emitted += 1
 
 
 def collate(batch):
@@ -329,6 +394,40 @@ def collate(batch):
     return (torch.from_numpy(us).long(),
             torch.from_numpy(them).long(),
             torch.from_numpy(tgt))
+
+
+_BIN_RECORD_DTYPE = np.dtype([
+    ('us',   np.uint16, (MAX_ACTIVE,)),
+    ('them', np.uint16, (MAX_ACTIVE,)),
+    ('tgt',  np.float16),
+])
+
+
+class HalfKAv2BinaryDataset(Dataset):
+    """Memory-mapped dataset produced by preprocess_halfkav2.py.
+
+    Supports random access with zero FEN parsing — workers do array indexing
+    only, so DataLoader(shuffle=True) replaces the reservoir buffer entirely.
+    """
+
+    def __init__(self, path: Path, start: int = 0, end: int | None = None):
+        with open(path, 'rb') as f:
+            if f.read(8) != _BIN_MAGIC:
+                raise ValueError(f'{path} is not a HKAV2BIN file')
+            n_total = _struct.unpack('<q', f.read(8))[0]
+        self._mm  = np.memmap(path, dtype=_BIN_RECORD_DTYPE, mode='r',
+                              offset=_BIN_HSIZE, shape=(n_total,))
+        self.start = start
+        self.end   = n_total if end is None else min(end, n_total)
+
+    def __len__(self) -> int:
+        return self.end - self.start
+
+    def __getitem__(self, idx: int):
+        r = self._mm[self.start + idx]
+        return (r['us'].astype(np.int64),
+                r['them'].astype(np.int64),
+                np.array([float(r['tgt'])], dtype=np.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +468,7 @@ class HalfKAv2Net(nn.Module):
         x = self.act(self.l1(x))
         x = self.act(self.l2(x))
         x = self.l3(x)
-        return x  # [B, 3]
+        return x  # [B, 1]
 
     def export_state_dict_for_quantization(self):
         """Repack the embedding into a plain weight matrix so convert_halfkav2_nnue.py
@@ -417,31 +516,70 @@ def pick_device(requested: str) -> torch.device:
     return torch.device(requested)
 
 
+def _is_binary(path: Path) -> bool:
+    try:
+        with open(path, 'rb') as f:
+            return f.read(8) == _BIN_MAGIC
+    except OSError:
+        return False
+
+
 def train(args):
     device = pick_device(args.device)
     print(f"training on {device}")
 
-    full_ds = HalfKAv2Dataset(args.data, max_lines=args.max_lines, cp_scale=args.cp_scale)
+    out_pt = Path(args.out)
+    out_pt.parent.mkdir(parents=True, exist_ok=True)
 
-    # Validation hold-out: take a deterministic ~5% slice for val loss. Using
-    # a fixed index range (not random) so val examples never leak into train
-    # across restarts. 5% is enough to spot overfitting trends and small
-    # enough not to starve training (we have millions).
-    n_total = len(full_ds)
-    n_val   = max(1024, int(n_total * args.val_frac))
-    n_val   = min(n_val, n_total // 10)  # cap at 10% for tiny datasets
-    n_train = n_total - n_val
-    print(f"split: {n_train} train / {n_val} val")
-    train_ds = torch.utils.data.Subset(full_ds, range(n_train))
-    val_ds   = torch.utils.data.Subset(full_ds, range(n_train, n_total))
+    use_binary = _is_binary(args.data)
+    if use_binary:
+        print(f"binary dataset detected: {args.data}")
+        val_ds   = HalfKAv2BinaryDataset(args.data, end=args.val_size)
+        train_ds = HalfKAv2BinaryDataset(args.data, start=len(val_ds))
+        n_val    = len(val_ds)
+        print(f"val: {n_val:,}  train: {len(train_ds):,} positions (random-access)")
+        shuffle_train = True
+    else:
+        # Val: load the first val_size lines into memory once (deterministic).
+        print(f"loading {args.val_size:,} val positions into memory ...")
+        val_ds = HalfKAv2Dataset(args.data, max_lines=args.val_size, cp_scale=args.cp_scale)
+        n_val  = len(val_ds)
 
-    loader     = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                            num_workers=args.num_workers, collate_fn=collate,
-                            drop_last=True, pin_memory=(device.type == "cuda"))
-    val_loader = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False,
-                            num_workers=max(1, args.num_workers // 2),
-                            collate_fn=collate, drop_last=False,
-                            pin_memory=(device.type == "cuda"))
+        # Train: stream all remaining positions with a reservoir shuffle buffer.
+        train_ds = HalfKAv2StreamDataset(
+            args.data,
+            skip_lines=n_val,
+            max_lines=args.max_lines,
+            cp_scale=args.cp_scale,
+            shuffle_buffer=args.shuffle_buffer,
+        )
+        suffix = f" (max {args.max_lines:,}/epoch)" if args.max_lines else ""
+        print(f"val: {n_val:,} positions (in memory)  train: streaming{suffix}")
+        shuffle_train = False
+
+    nw = args.num_workers
+    loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=shuffle_train,
+        num_workers=nw,
+        collate_fn=collate,
+        drop_last=True,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=(nw > 0),
+        prefetch_factor=(4 if nw > 0 else None),
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=max(1, nw // 2),
+        collate_fn=collate,
+        drop_last=False,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=True,
+        prefetch_factor=4,
+    )
 
     net = HalfKAv2Net().to(device)
     # Weight decay (L2 regularization) helps prevent overfitting in the larger network.
@@ -453,11 +591,8 @@ def train(args):
     cosine = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
     warmup_steps = args.warmup_steps
 
-    def soft_label_ce(logits, target):
-        # The right loss for a probability-distribution target. MSE on
-        # softmax outputs (the previous bug) under-trains the tails.
-        log_probs = F.log_softmax(logits, dim=1)
-        return -(target * log_probs).sum(dim=1).mean()
+    # Random baseline: BCE(sigmoid(0), 0.5) = log(2) ≈ 0.693
+    print(f"random baseline BCE loss: {0.6931:.4f}")
 
     step = 0
     for epoch in range(args.epochs):
@@ -474,8 +609,8 @@ def train(args):
                 for g in opt.param_groups:
                     g["lr"] = args.lr * lr_scale
 
-            pred_logits = net(us, them)
-            loss = soft_label_ce(pred_logits, target)
+            pred_logits = net(us, them)  # [B, 1]
+            loss = F.binary_cross_entropy_with_logits(pred_logits.squeeze(1), target.squeeze(1))
 
             opt.zero_grad()
             loss.backward()
@@ -491,28 +626,33 @@ def train(args):
             if step % 200 == 0:
                 print(f"  epoch {epoch} step {step} loss {loss.item():.5f}")
 
-        # Validation pass: report val loss + simple win-accuracy (argmax==target_argmax).
+        # Validation: BCE loss + MAE in centipawns (logit * cp_scale ≈ centipawns).
         net.eval()
         val_loss_sum = 0.0
-        val_acc_sum  = 0
+        val_mae_sum  = 0.0
         val_count    = 0
         with torch.no_grad():
             for us, them, target in val_loader:
                 us, them, target = us.to(device), them.to(device), target.to(device)
                 logits = net(us, them)
-                val_loss_sum += soft_label_ce(logits, target).item() * target.shape[0]
-                val_acc_sum  += (logits.argmax(dim=1) == target.argmax(dim=1)).sum().item()
+                val_loss_sum += F.binary_cross_entropy_with_logits(
+                    logits.squeeze(1), target.squeeze(1)).item() * target.shape[0]
+                pred_cp = logits.squeeze(1) * args.cp_scale
+                tgt_cp  = torch.special.logit(target.squeeze(1).clamp(1e-6, 1.0 - 1e-6)) * args.cp_scale
+                val_mae_sum  += (pred_cp - tgt_cp).abs().sum().item()
                 val_count    += target.shape[0]
         val_loss = val_loss_sum / max(1, val_count)
-        val_acc  = val_acc_sum  / max(1, val_count)
+        val_mae  = val_mae_sum  / max(1, val_count)
 
         cosine.step()
         print(f"epoch {epoch} train_loss {epoch_loss / max(nbatch, 1):.5f} "
-              f"val_loss {val_loss:.5f} val_argmax_acc {val_acc:.3f} "
+              f"val_loss {val_loss:.5f} val_mae_cp {val_mae:.1f} "
               f"(lr next: {cosine.get_last_lr()[0]:.6f})")
 
-    out_pt = Path(args.out)
-    out_pt.parent.mkdir(parents=True, exist_ok=True)
+        ckpt = out_pt.with_name(out_pt.stem + f"_epoch{epoch}" + out_pt.suffix)
+        torch.save(net.export_state_dict_for_quantization(), ckpt)
+        print(f"saved {ckpt}")
+
     torch.save(net.export_state_dict_for_quantization(), out_pt)
     print(f"saved {out_pt}")
     print("now run: python scripts/convert_halfkav2_nnue.py from-torch "
@@ -532,13 +672,18 @@ def main():
     p.add_argument("--batch-size", type=int, default=4096)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--num-workers", type=int, default=4)
-    p.add_argument("--val-frac", type=float, default=0.05,
-                   help="fraction of dataset held out for validation loss")
+    p.add_argument("--val-size", type=int, default=200_000,
+                   help="number of lines read into memory for the validation set. "
+                        "These are the first N lines of the file; the rest streams.")
+    p.add_argument("--shuffle-buffer", type=int, default=500_000,
+                   help="reservoir shuffle buffer size per DataLoader worker. "
+                        "Larger = better shuffle, more RAM. 500k ≈ 133 MB/worker.")
     p.add_argument("--warmup-steps", type=int, default=500,
                    help="linear LR warmup for the first N steps (mitigates "
                         "Adam's noisy first-moment estimates on large batches)")
     p.add_argument("--max-lines", type=int, default=None,
-                   help="cap on training rows (useful for quick sanity runs)")
+                   help="cap on training positions per epoch. Without this the "
+                        "full file is streamed each epoch.")
     p.add_argument("--cp-scale", type=float, default=410.0,
                    help="sigmoid scale; also written as output_cp_per_unit "
                         "in the .nnue header. Keep the two consistent.")
