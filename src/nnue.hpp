@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// HalfKAv2-1024x2-256-64-3 NNUE evaluation.
+// HalfKAv2-1024x2-512-128-1 NNUE evaluation.
 //
 // Architecture (Stockfish-modern shape):
 //   Input features: HalfKAv2 - king-relative, perspective-doubled.
@@ -15,9 +15,9 @@
 //   Feature transformer: 45056 -> 1024, int16 weights + bias.
 //   Concatenation: [accumulator_us, accumulator_them] -> 2048
 //   Activation: clipped ReLU [0, kFtQuant=127] -> uint8[2048]
-//   L1: 2048 -> 256, int8 weights, int32 bias.
-//   L2:  256 -> 64,  int8 weights, int32 bias.
-//   L3:   64 -> 3,   int8 weights, int32 bias -> WDL logits.
+//   L1: 2048 -> 512, int8 weights, int32 bias.
+//   L2:  512 -> 128, int8 weights, int32 bias.
+//   L3:  128 -> 1,   int8 weights, int32 bias -> value logit.
 //
 // Phase 1: scalar forward pass, non-incremental (recompute accumulator per eval).
 // Phase 2: incremental updates wired through StateInfo / do_move / undo_move.
@@ -43,9 +43,9 @@ namespace eclipse::nnue {
 // kFtOutSize is defined in accumulator.hpp.
 
 constexpr int kL1InSize         = 2 * kFtOutSize; // = 2048
-constexpr int kL1OutSize        = 256;
-constexpr int kL2OutSize        = 64;
-constexpr int kL3OutSize        = 3;
+constexpr int kL1OutSize        = 512;
+constexpr int kL2OutSize        = 128;
+constexpr int kL3OutSize        = 1;
 
 constexpr int kFtKingSquares    = 64;
 constexpr int kFtPieceSquares   = 64;

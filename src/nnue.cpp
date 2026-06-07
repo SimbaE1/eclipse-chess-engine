@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -33,9 +34,9 @@ namespace {
 //   uint32  version          (kVersion)
 //   uint32  ft_in_features   (must equal kFtNumFeatures = 45056)
 //   uint32  ft_out           (must equal kFtOutSize = 1024, per perspective)
-//   uint32  l1_out           (must equal kL1OutSize = 256)
-//   uint32  l2_out           (must equal kL2OutSize = 64)
-//   uint32  l3_out           (must equal kL3OutSize = 3)
+//   uint32  l1_out           (must equal kL1OutSize = 512)
+//   uint32  l2_out           (must equal kL2OutSize = 128)
+//   uint32  l3_out           (must equal kL3OutSize = 1)
 //   float   output_cp_per_unit   - centipawns per real-unit of L3 output;
 //                                  see kOutputCpDivisor explanation below
 //   int16   ft_b[ft_out]
@@ -285,6 +286,7 @@ void apply_piece(Accumulator& acc, const Position& pos,
             piece_sq = flip_rank(piece_sq);
         }
         const int  idx = feature_index(king_sq, piece_sq, pt, is_ours);
+        assert(idx >= 0 && idx < kFtNumFeatures && "feature_index out of range");
         const std::int16_t* col = &g_ft_w[static_cast<std::size_t>(idx) * kFtOutSize];
 
 #if defined(__AVX2__)
@@ -546,7 +548,13 @@ Score evaluate(const Position& pos) noexcept {
     Accumulator& acc = pos.accumulator();
     if (!acc.computed) refresh(pos, acc);
     if (!acc.computed) {
-        // refresh() left it false -> the network is not loaded. Fall back.
+        // refresh() left it false; either the network is not loaded (expected
+        // during startup) or there is a logic error.  Log the latter case so
+        // silent material-eval fallbacks don't hide bugs in production.
+        if (g_loaded) {
+            std::fprintf(stderr,
+                "info string warning: NNUE refresh failed despite network being loaded\n");
+        }
         return material_evaluate(pos);
     }
 
@@ -606,42 +614,14 @@ Score evaluate(const Position& pos) noexcept {
     alignas(64) std::uint8_t l2_out[kL2OutSize];
     affine_clipped_relu<kL1OutSize, kL2OutSize>(l1_out, g_l2_w.data(), g_l2_b.data(), l2_out);
 
-    // Final layer: kL2OutSize -> kL3OutSize (3), no ReLU.
-    std::array<float, 3> logits;
-    for (int j = 0; j < kL3OutSize; ++j) {
-        std::int32_t y = g_l3_b[static_cast<std::size_t>(j)];
-        const std::int8_t* w3 = &g_l3_w[static_cast<std::size_t>(j * kL2OutSize)];
-        for (int i = 0; i < kL2OutSize; ++i) {
-            y += static_cast<std::int32_t>(w3[static_cast<std::size_t>(i)]) * static_cast<std::int32_t>(l2_out[static_cast<std::size_t>(i)]);
-        }
-        logits[static_cast<std::size_t>(j)] = static_cast<float>(y);
+    // Final layer: kL2OutSize -> 1, no ReLU. Output is a raw logit;
+    // sigmoid(logit / kOutputCpDivisor * cp_per_unit) = win probability from STM.
+    std::int32_t y = g_l3_b[0];
+    for (int i = 0; i < kL2OutSize; ++i) {
+        y += static_cast<std::int32_t>(g_l3_w[static_cast<std::size_t>(i)]) *
+             static_cast<std::int32_t>(l2_out[static_cast<std::size_t>(i)]);
     }
-
-    // Softmax over logits to get [P(Win), P(Draw), P(Loss)]
-    float max_l = logits[0];
-    if (logits[1] > max_l) max_l = logits[1];
-    if (logits[2] > max_l) max_l = logits[2];
-
-    float sum_p = 0.0f;
-    std::array<float, 3> probs;
-    constexpr float kLogitScale = static_cast<float>(kWeightScale * kFtQuant);
-    for (int j = 0; j < 3; ++j) {
-        probs[static_cast<std::size_t>(j)] = std::exp((logits[static_cast<std::size_t>(j)] - max_l) / kLogitScale);
-        sum_p += probs[static_cast<std::size_t>(j)];
-    }
-
-    // Inverse-sigmoid (logit) of P(W) + 0.5·P(D). Half of P(D) is treated as
-    // expected score, matching the standard Elo-style win-expectancy convention.
-    // The transform is unbounded — a clearly winning position with P_W=0.99
-    // produces cp ≈ 4.6·scale; the previous linear formula `(P_W − P_L)·scale`
-    // was hard-capped at ±scale, which compressed every eval near the ceiling
-    // and starved MCTS priors of signal in winning positions (e.g. K+Q showed
-    // the same +355 cp as K+R because both saturated).
-    const float pw = probs[0] / sum_p;
-    const float pd = probs[1] / sum_p;
-    const float win_expectancy = std::clamp(pw + 0.5f * pd, 1e-6f, 1.0f - 1e-6f);
-    const float cp = std::log(win_expectancy / (1.0f - win_expectancy)) * g_output_cp_per_unit;
-
+    const float cp = static_cast<float>(y) / kOutputCpDivisor * g_output_cp_per_unit;
     return static_cast<Score>(cp);
 }
 
@@ -660,6 +640,13 @@ void evaluate_batch(const Accumulator* accs, const Color* stms, Score* scores, i
     alignas(64) static thread_local std::uint8_t l1_scratch[kMaxBatch * kL1OutSize];
     alignas(64) static thread_local std::uint8_t l2_scratch[kMaxBatch * kL2OutSize];
 
+    if (batch_size > kMaxBatch) {
+        std::fprintf(stderr,
+            "info string NNUE evaluate_batch: batch_size %d > kMaxBatch %d; "
+            "positions beyond the limit are silently skipped\n",
+            batch_size, kMaxBatch);
+    }
+    assert(batch_size <= kMaxBatch && "NNUE batch exceeds kMaxBatch; increase it or split the batch");
     const int n = std::min(batch_size, kMaxBatch);
 
     // 1. Feature Transformer (Accumulator -> FT_out). Same packus_epi16
@@ -722,36 +709,15 @@ void evaluate_batch(const Accumulator* accs, const Color* stms, Score* scores, i
     }
 #endif
 
-    // 4. Final L3 and Score Calculation
+    // 4. Final L3 and Score Calculation (single output: raw logit -> cp)
     for (int b = 0; b < n; ++b) {
         const std::uint8_t* l2_out = &l2_scratch[b * kL2OutSize];
-        std::array<float, 3> logits;
-        for (int j = 0; j < kL3OutSize; ++j) {
-            std::int32_t y = g_l3_b[static_cast<std::size_t>(j)];
-            const std::int8_t* w3 = &g_l3_w[static_cast<std::size_t>(j * kL2OutSize)];
-            for (int i = 0; i < kL2OutSize; ++i) {
-                y += static_cast<std::int32_t>(w3[static_cast<std::size_t>(i)]) * static_cast<std::int32_t>(l2_out[static_cast<std::size_t>(i)]);
-            }
-            logits[static_cast<std::size_t>(j)] = static_cast<float>(y);
+        std::int32_t y = g_l3_b[0];
+        for (int i = 0; i < kL2OutSize; ++i) {
+            y += static_cast<std::int32_t>(g_l3_w[static_cast<std::size_t>(i)]) *
+                 static_cast<std::int32_t>(l2_out[static_cast<std::size_t>(i)]);
         }
-
-        float max_l = logits[0];
-        if (logits[1] > max_l) max_l = logits[1];
-        if (logits[2] > max_l) max_l = logits[2];
-
-        float sum_p = 0.0f;
-        std::array<float, 3> probs;
-        constexpr float kLogitScale = static_cast<float>(kWeightScale * kFtQuant);
-        for (int j = 0; j < 3; ++j) {
-            probs[static_cast<std::size_t>(j)] = std::exp((logits[static_cast<std::size_t>(j)] - max_l) / kLogitScale);
-            sum_p += probs[static_cast<std::size_t>(j)];
-        }
-
-        // Inverse-sigmoid (logit) — see evaluate() for the rationale.
-        const float pw = probs[0] / sum_p;
-        const float pd = probs[1] / sum_p;
-        const float we = std::clamp(pw + 0.5f * pd, 1e-6f, 1.0f - 1e-6f);
-        scores[b] = static_cast<Score>(std::log(we / (1.0f - we)) * g_output_cp_per_unit);
+        scores[b] = static_cast<Score>(static_cast<float>(y) / kOutputCpDivisor * g_output_cp_per_unit);
     }
 }
 

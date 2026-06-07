@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include <cassert>
 #include <cstdint>
 #include <string>
 
@@ -65,6 +66,7 @@ public:
         return Type(data_ & (0x3u << 14));
     }
     constexpr PieceType promotion_piece() const noexcept {
+        assert(type() == Promotion && "promotion_piece() called on a non-promotion move");
         return PieceType(((data_ >> 12) & 0x3u) + Knight);
     }
 

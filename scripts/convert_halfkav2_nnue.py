@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 """
-HalfKAv2-1024x2-128-32 weight packer for Eclipse's .nnue binary format.
+HalfKAv2-1024x2-512-128 weight packer for Eclipse's .nnue binary format.
 
 This script is the bridge between PyTorch training and the C++ inference path.
 It has two modes:
@@ -16,11 +16,11 @@ It has two modes:
                 HalfKAv2 model with a layout matching the C++ side:
                     ft.weight        shape [1024, 45056]  (PyTorch convention)
                     ft.bias          shape [1024]
-                    l1.weight        shape [128, 2048]
-                    l1.bias          shape [128]
-                    l2.weight        shape [32, 128]
-                    l2.bias          shape [32]
-                    l3.weight        shape [1, 32]
+                    l1.weight        shape [512, 2048]
+                    l1.bias          shape [512]
+                    l2.weight        shape [128, 512]
+                    l2.bias          shape [128]
+                    l3.weight        shape [1, 128]
                     l3.bias          shape [1]
                 Real-valued floats, no quantization applied - this script
                 handles all quantization.
@@ -45,9 +45,9 @@ VERSION             = 1
 FT_IN_FEATURES      = 45056          # HalfKAv2: 64 * 64 * 11
 FT_OUT              = 1024           # keep in sync with kFtOutSize in src/nnue.hpp
 L1_IN               = 2 * FT_OUT     # 2048 (concat of both perspectives)
-L1_OUT              = 256
-L2_OUT              = 64
-L3_OUT              = 3
+L1_OUT              = 512
+L2_OUT              = 128
+L3_OUT              = 1
 
 # Quantization scales - must match the C++ side exactly.
 FT_QUANT            = 127            # FT activation scale (kFtQuant)

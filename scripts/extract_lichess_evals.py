@@ -29,8 +29,10 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import re
 import sys
+from pathlib import Path
 from typing import Iterable, Optional
 
 try:
@@ -147,16 +149,53 @@ def emit_eval_positions(headers: dict, moves_text: str,
         yield board.fen(), stm_cp
 
 
+class _RawStdinCounter:
+    """Wraps sys.stdin.buffer, yields decoded text lines, tracks raw bytes read."""
+
+    def __init__(self):
+        self.bytes_read = 0
+        self._buf = b""
+
+    def __iter__(self):
+        while True:
+            chunk = sys.stdin.buffer.read(1 << 16)
+            if not chunk:
+                if self._buf:
+                    yield self._buf.decode("utf-8", errors="replace")
+                    self._buf = b""
+                break
+            self.bytes_read += len(chunk)
+            combined = self._buf + chunk
+            lines = combined.split(b"\n")
+            self._buf = lines[-1]
+            for line in lines[:-1]:
+                yield line.decode("utf-8", errors="replace") + "\n"
+
+
+def _fast_forward(n_bytes: int) -> None:
+    """Read and discard n_bytes from sys.stdin.buffer."""
+    remaining = n_bytes
+    while remaining > 0:
+        chunk = sys.stdin.buffer.read(min(remaining, 1 << 20))
+        if not chunk:
+            break
+        remaining -= len(chunk)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--target", type=int, required=True,
-                   help="emit this many positions and exit (triggers SIGPIPE upstream)")
+    p.add_argument("--target", type=int, default=None,
+                   help="stop after this many positions (triggers SIGPIPE upstream). "
+                        "Omit to run to EOF and extract everything.")
+    p.add_argument("--output", type=Path, default=None,
+                   help="write positions here instead of stdout; enables checkpointing")
+    p.add_argument("--no-resume", action="store_true",
+                   help="ignore any existing checkpoint and restart from scratch")
     p.add_argument("--min-elo", type=int, default=2500,
-                   help="reject games where either player rated below this. "
-                        "2500+ gets you a small slice of titled-player rapid/classical.")
+                   help="reject games where either player rated below this")
     p.add_argument("--min-tc-seconds", type=int, default=300,
-                   help="reject games with TimeControl base time below this (in seconds).")
+                   help="reject games with TimeControl base time below this (in seconds)")
     p.add_argument("--min-ply", type=int, default=10,
                    help="don't emit positions before this ply (skip the book region)")
     p.add_argument("--mate-cp", type=int, default=1500,
@@ -168,16 +207,37 @@ def main():
     emitted = 0
     games_scanned = 0
     games_accepted = 0
+    out = sys.stdout
+    ckpt_path: Optional[Path] = None
+
+    if args.output:
+        ckpt_path = Path(str(args.output) + ".ckpt")
+        skip_bytes = 0
+        if not args.no_resume and ckpt_path.exists():
+            try:
+                ckpt = json.loads(ckpt_path.read_text())
+                skip_bytes = int(ckpt.get("bytes_consumed", 0))
+                emitted    = int(ckpt.get("emitted", 0))
+                print(f"  resuming: skip={skip_bytes}b emitted={emitted}", file=sys.stderr)
+            except Exception:
+                skip_bytes = 0
+                emitted = 0
+        if skip_bytes > 0:
+            _fast_forward(skip_bytes)
+        mode = "a" if emitted > 0 and not args.no_resume else "w"
+        out = open(args.output, mode)  # noqa: SIM115
+
+    reader = _RawStdinCounter()
+    if args.output and emitted > 0:
+        reader.bytes_read = skip_bytes  # type: ignore[possibly-undefined]
 
     try:
-        for headers, moves_text in stream_games(sys.stdin):
+        for headers, moves_text in stream_games(reader):
             games_scanned += 1
             if games_scanned % 200000 == 0:
                 print(f"  scanned={games_scanned} accepted={games_accepted} "
                       f"emitted={emitted}", file=sys.stderr)
 
-            # Cheap filters first: Elo + time control header reads, no
-            # tokenization of moves.
             try:
                 welo = int(headers.get("WhiteElo", 0))
                 belo = int(headers.get("BlackElo", 0))
@@ -188,26 +248,37 @@ def main():
             tc = parse_tc_base(headers.get("TimeControl", ""))
             if tc is None or tc < args.min_tc_seconds:
                 continue
-            # Skip games with no eval annotations entirely - very fast reject.
             if "%eval" not in moves_text:
                 continue
 
             games_accepted += 1
             for fen, cp in emit_eval_positions(headers, moves_text,
                                                 args.min_ply, args.mate_cp):
-                print(f"{fen};{cp}")
+                print(f"{fen};{cp}", file=out)
                 emitted += 1
                 if emitted % args.report_every == 0:
+                    if ckpt_path is not None:
+                        ckpt_path.write_text(json.dumps({
+                            "bytes_consumed": reader.bytes_read,
+                            "emitted": emitted,
+                        }))
                     print(f"  emitted={emitted} scanned={games_scanned} "
                           f"accepted={games_accepted}", file=sys.stderr)
-                    sys.stdout.flush()
-                if emitted >= args.target:
+                    out.flush()
+                if args.target is not None and emitted >= args.target:
+                    if ckpt_path is not None:
+                        ckpt_path.write_text(json.dumps({
+                            "bytes_consumed": reader.bytes_read,
+                            "emitted": emitted,
+                        }))
                     print(f"done: emitted={emitted} scanned={games_scanned} "
                           f"accepted={games_accepted}", file=sys.stderr)
                     return
     except BrokenPipeError:
-        # Downstream closed (Ctrl-C upstream curl etc.). Quiet exit.
         return
+    finally:
+        if out is not sys.stdout:
+            out.close()
 
     print(f"EOF: emitted={emitted} scanned={games_scanned} "
           f"accepted={games_accepted}", file=sys.stderr)

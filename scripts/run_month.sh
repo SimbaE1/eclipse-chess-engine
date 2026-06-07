@@ -16,6 +16,10 @@ URL="https://database.lichess.org/standard/lichess_db_standard_rated_${MONTH}.pg
 
 printf 'WhiteElo >= "2500"\nBlackElo >= "2500"\n' > /tmp/elo_filter.pgn
 
+# Ignore SIGTERM/SIGPIPE from killed pipeline children — without this, bash
+# re-delivers the child's fatal signal to the watcher script itself.
+trap '' SIGTERM SIGPIPE
+
 echo "$$" > "$PIDFILE"
 echo "[watcher/$MONTH] started PID=$$" >> "$LOGFILE"
 
@@ -31,7 +35,7 @@ while true; do
     # Disable errexit around the pipeline so curl/zstd failures don't kill the
     # watcher before PIPESTATUS can be read and the retry loop can fire.
     set +e
-    curl -fsSL "$URL" \
+    curl -fsSL --speed-limit 512 --speed-time 30 "$URL" \
       | zstd -dc \
       | pgn-extract -s --quiet -t /tmp/elo_filter.pgn 2>/dev/null \
       | python3 "$SCRIPTS/extract_lichess_wdl.py" \

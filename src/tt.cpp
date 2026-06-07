@@ -37,10 +37,15 @@ bool TranspositionTable::probe(std::uint64_t key, TTEntry& out) const {
 
 void TranspositionTable::store(std::uint64_t key, Move move, Score score, int depth, TTFlag flag, int ply) {
     TTEntry& e = table_[key & mask_];
-    
-    // Replacement strategy: depth-preferred.
-    // If the new entry is deeper or from a different position, overwrite.
-    if (e.key != key || depth >= e.depth) {
+
+    // An exact mate proof should never be discarded in favour of a deeper
+    // non-mate or a weaker-bound mate entry — the faster mate distance is
+    // always the most useful information regardless of search depth.
+    const bool new_is_exact_mate = (flag == TT_EXACT)
+                                && (score >=  TTEntry::kTTMateScore
+                                 || score <= -TTEntry::kTTMateScore);
+
+    if (e.key != key || new_is_exact_mate || depth >= e.depth) {
         e.save(key, move, score, depth, flag, ply);
     }
 }

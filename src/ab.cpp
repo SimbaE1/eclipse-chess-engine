@@ -44,6 +44,13 @@ struct SearchCtx {
     // History heuristic: [color][from][to].
     std::int32_t history[2][64][64]{};
 
+    // Zobrist key path from the search root.  Populated by negamax push/pop
+    // around each do_move so we can detect in-search repetitions.
+    std::vector<std::uint64_t> key_history;
+
+    SearchCtx(Clock::time_point s, std::int64_t b)
+        : start(s), budget_ms(b), nodes(0), aborted(false) {}
+
     bool time_up() noexcept {
         // Cheap node-stride check before the clock read so we don't read the
         // clock on every leaf. 4095 is one read per ~4096 leaves; at 1M nps
@@ -104,6 +111,9 @@ Score qsearch(Position& pos, Score alpha, Score beta, int ply, SearchCtx& ctx) {
     ++ctx.nodes;
     if (ctx.time_up()) { ctx.aborted = true; return 0; }
 
+    // Fifty-move rule: no pawn move or capture in 100 half-moves → draw.
+    if (pos.halfmove_clock() >= 100) return kDraw;
+
     // Stand-pat: assume we can do nothing and accept the static eval. The
     // search then only considers moves that BEAT the stand-pat — i.e.
     // captures that improve our position. This is what makes qsearch
@@ -157,6 +167,21 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
     if (ctx.time_up()) { ctx.aborted = true; return 0; }
     if (depth <= 0) return qsearch(pos, alpha, beta, ply, ctx);
 
+    // Fifty-move rule.
+    if (pos.halfmove_clock() >= 100) return kDraw;
+
+    // Repetition detection: walk backwards through the key path by 2 (same
+    // side to move) up to halfmove_clock steps.  A single prior occurrence
+    // means 2-fold; we return draw to avoid handing the opponent a 3-fold.
+    {
+        const int hmc     = pos.halfmove_clock();
+        const int hist_sz = static_cast<int>(ctx.key_history.size());
+        for (int i = hist_sz - 2; i >= 0 && (hist_sz - i) <= hmc; i -= 2) {
+            if (ctx.key_history[static_cast<std::size_t>(i)] == pos.key())
+                return kDraw;
+        }
+    }
+
     const Score static_eval = evaluate(pos);
     
     // Reverse Futility Pruning (RFP): also known as Static Null Move Pruning.
@@ -173,10 +198,16 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
     // and giving the opponent a free move actively misrepresents the
     // position there).
     if (!pos.in_check() && depth >= 3 && static_eval >= beta) {
-        const Color us       = pos.side_to_move();
-        const Bitboard non_p = pos.pieces(us, Knight) | pos.pieces(us, Bishop)
-                             | pos.pieces(us, Rook)   | pos.pieces(us, Queen);
-        if (non_p) {
+        const Color us         = pos.side_to_move();
+        const Bitboard minors  = pos.pieces(us, Knight) | pos.pieces(us, Bishop);
+        const Bitboard majors  = pos.pieces(us, Rook)   | pos.pieces(us, Queen);
+        const Bitboard non_p   = minors | majors;
+        // Skip null move in positions with only minor pieces — K+B vs K and
+        // K+N vs K can exhibit zugzwang and the tempo gift actively misleads
+        // the search. Rooks/queens make zugzwang essentially impossible, and
+        // ≥2 minor pieces are also safe enough.
+        const bool safe_for_nm = majors || (non_p && (non_p & (non_p - 1)));
+        if (safe_for_nm) {
             StateInfo st;
             pos.do_null_move(st);
             Move dummy;
@@ -246,8 +277,10 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
         if (m == excluded) continue;
 
         StateInfo st;
+        const std::uint64_t parent_key = pos.key();
         pos.do_move(m, st);
-        
+        ctx.key_history.push_back(parent_key);
+
         Move  dummy;
         Score s;
         if (i == 0) {
@@ -259,17 +292,17 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
             if (depth >= 3 && i >= 3 && !pos.in_check() &&
                 pos.piece_on(m.to()) == NoPiece &&
                 m.type() != Move::EnPassant) {
-                
+
                 const int d_idx = std::min(depth, 63);
                 const int i_idx = std::min(i, 255);
                 reduction = static_cast<int>(g_lmr_table[d_idx][i_idx]);
-                
+
                 // Reduce less if it's a killer or has good history.
-                if (m == ctx.killers[static_cast<std::size_t>(ply)][0] || 
+                if (m == ctx.killers[static_cast<std::size_t>(ply)][0] ||
                     m == ctx.killers[static_cast<std::size_t>(ply)][1]) {
                     reduction -= 1;
                 }
-                
+
                 reduction = std::clamp(reduction, 0, depth - 1);
             }
 
@@ -285,6 +318,7 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
             }
         }
 
+        ctx.key_history.pop_back();
         pos.undo_move(m, st);
         if (ctx.aborted) return 0;
         if (s > best) { best = s; best_move = m; }
@@ -331,7 +365,7 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
 Result find_best_move(Position& pos, int max_depth, std::int64_t time_budget_ms) {
     init_search_tables();
     Result r;
-    SearchCtx ctx{Clock::now(), time_budget_ms, 0, false};
+    SearchCtx ctx{Clock::now(), time_budget_ms};
 
     // Iterative deepening: best move from each completed depth is preserved
     // even if the next depth gets aborted by the time check, so the caller

@@ -376,9 +376,10 @@ void MCTS::expand_under_lock(Node* node, const Position& pos) {
         sum_p += p;
     }
 
-    // Re-normalize and create children.
+    // Re-normalize and create children.  Guard against near-zero sum (all
+    // moves heavily SEE-penalised) to avoid division producing extreme values.
     for (int i = 0; i < moves.size; ++i) {
-        const float p = (sum_p > 0.0f) ? (filtered_priors[static_cast<std::size_t>(i)] / sum_p) : (1.0f / static_cast<float>(moves.size));
+        const float p = (sum_p > 1e-6f) ? (filtered_priors[static_cast<std::size_t>(i)] / sum_p) : (1.0f / static_cast<float>(moves.size));
         node->children.push_back(std::make_unique<Node>(moves[static_cast<std::size_t>(i)], node, p));
     }
 
