@@ -102,6 +102,14 @@ int order_score(const Position& pos, Move m, int ply, const SearchCtx& ctx,
     return s;
 }
 
+// Apply a history bonus/malus clamped to [-kHistMax, kHistMax].
+// Using a gravity formula (bonus = delta - existing * |delta| / kHistMax)
+// keeps the table self-normalizing without a periodic full rescale.
+constexpr std::int32_t kHistMax = 16384;
+inline void update_history(std::int32_t& entry, int bonus) {
+    entry += static_cast<std::int32_t>(bonus) - entry * std::abs(bonus) / kHistMax;
+}
+
 // Captures + en-passants only. For check evasions in qsearch we fall back
 // to full legal generation; otherwise we'd risk hanging into a mate.
 void generate_captures(Position& pos, MoveList& out) {
@@ -243,16 +251,23 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
         }
     }
 
+    // IIR: when no TT move at depth >= 4 we don't have a good first move to
+    // order on, so reduce depth by 1 — the resulting shallower search still
+    // fills the TT entry and improves the real search on re-entry.
+    if (excluded == MoveNone && tt_move == MoveNone && depth >= 4) {
+        depth -= 1;
+    }
+
     // Singular extension: if we have a TT move that is a lower bound (cut-move)
     // with enough depth, check if it's singularly better than all others.
     int extension = 0;
     if (excluded == MoveNone && depth >= 8 && tt_move != MoveNone && tt_entry.depth >= depth - 3 && tt_entry.flag == TT_LOWERBOUND) {
         const Score tt_score = tt_entry.score_from_tt(tt_entry.score, ply);
         const Score margin   = depth; // margin = 1cp per depth
-        
+
         Move dummy;
         const Score s = negamax(pos, depth / 2, tt_score - margin - 1, tt_score - margin, ply + 1, dummy, ctx, tt_move, prev_move);
-        
+
         if (s < tt_score - margin) {
             extension = 1;
         }
@@ -288,6 +303,14 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
         && alpha > -kMateInMaxPly && alpha < kMateInMaxPly;
     int quiet_tried = 0;
 
+    // SEE pruning for quiet moves at low depth: skip moves with a losing SEE
+    // score below a depth-scaled threshold.
+    const bool can_see_prune_quiet =
+        !pos.in_check()
+        && depth <= 4
+        && excluded == MoveNone
+        && alpha > -kMateInMaxPly;
+
     // Order moves. TT move comes first.
     std::array<int, 256> scores{};
     for (int i = 0; i < moves.size; ++i) {
@@ -301,6 +324,10 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
             std::swap(moves[static_cast<std::size_t>(j)],  moves[static_cast<std::size_t>(j - 1)]);
         }
     }
+
+    // Track quiet moves searched so we can apply history malus on beta cutoffs.
+    std::array<Move, 64> quiets_tried{};
+    int                  quiets_tried_count = 0;
 
     Score best = -kInfinite;
     Move  best_move = MoveNone;
@@ -320,18 +347,29 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
         if (can_lmp && is_quiet) {
             if (quiet_tried >= kLmpCount[depth]) continue;
         }
-        if (is_quiet) ++quiet_tried;
+        if (is_quiet) {
+            // SEE quiet pruning: skip quiet moves with very bad static exchange.
+            if (can_see_prune_quiet && i > 0 && !see_ge(pos, m, -50 * depth)) continue;
+
+            ++quiet_tried;
+            if (quiets_tried_count < 64)
+                quiets_tried[static_cast<std::size_t>(quiets_tried_count++)] = m;
+        }
 
         StateInfo st;
         const std::uint64_t parent_key = pos.key();
         pos.do_move(m, st);
         ctx.key_history.push_back(parent_key);
 
+        // Check extension: extend by 1 when the move gives check.
+        // Capped at 1 to prevent extension chains from exploding depth.
+        const int check_ext = (pos.in_check() && extension == 0) ? 1 : 0;
+
         Move  dummy;
         Score s;
         if (i == 0) {
             // PV node: search with full window.
-            s = -negamax(pos, depth - 1 + extension, -beta, -alpha, ply + 1, dummy, ctx, MoveNone, m);
+            s = -negamax(pos, depth - 1 + extension + check_ext, -beta, -alpha, ply + 1, dummy, ctx, MoveNone, m);
         } else {
             // LMR: reduce depth for late-ordered quiet moves.
             int reduction = 0;
@@ -345,19 +383,21 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
                     m == ctx.killers[static_cast<std::size_t>(ply)][1]) {
                     reduction -= 1;
                 }
+                // Never reduce a move that gives check.
+                if (check_ext) reduction = 0;
 
                 reduction = std::clamp(reduction, 0, depth - 1);
             }
 
             // Non-PV node: search with null window first.
-            s = -negamax(pos, depth - 1 - reduction, -alpha - 1, -alpha, ply + 1, dummy, ctx, MoveNone, m);
+            s = -negamax(pos, depth - 1 - reduction + check_ext, -alpha - 1, -alpha, ply + 1, dummy, ctx, MoveNone, m);
             if (s > alpha && reduction > 0) {
                 // Failed high on reduced search: re-search with full depth but null window.
-                s = -negamax(pos, depth - 1, -alpha - 1, -alpha, ply + 1, dummy, ctx, MoveNone, m);
+                s = -negamax(pos, depth - 1 + check_ext, -alpha - 1, -alpha, ply + 1, dummy, ctx, MoveNone, m);
             }
             if (s > alpha && s < beta) {
                 // Failed high on null window: re-search with full window.
-                s = -negamax(pos, depth - 1, -beta, -alpha, ply + 1, dummy, ctx, MoveNone, m);
+                s = -negamax(pos, depth - 1 + check_ext, -beta, -alpha, ply + 1, dummy, ctx, MoveNone, m);
             }
         }
 
@@ -377,12 +417,14 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
                     }
                 }
                 const Color us = pos.side_to_move();
-                ctx.history[us][m.from()][m.to()] += static_cast<std::int32_t>(depth * depth);
+                const int bonus = depth * depth;
+                update_history(ctx.history[us][m.from()][m.to()], bonus);
 
-                // History aging via right-shift over the flat backing array.
-                if (ctx.history[us][m.from()][m.to()] > 1'000'000) {
-                    std::int32_t* base = &ctx.history[0][0][0];
-                    for (int k = 0; k < 2 * 64 * 64; ++k) base[k] >>= 1;
+                // History malus: penalize all quiets searched before the cutoff move.
+                const int malus = -(depth * depth / 2);
+                for (int j = 0; j < quiets_tried_count - 1; ++j) {
+                    const Move qm = quiets_tried[static_cast<std::size_t>(j)];
+                    update_history(ctx.history[us][qm.from()][qm.to()], malus);
                 }
 
                 // Countermove: record that m refutes prev_move.
