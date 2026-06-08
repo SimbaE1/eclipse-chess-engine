@@ -217,45 +217,13 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
         }
     }
 
-    const Score static_eval = evaluate(pos);
-    
-    // Reverse Futility Pruning (RFP): also known as Static Null Move Pruning.
-    // If we are at a low depth and the evaluation is far above beta, we can
-    // skip the search and return beta.
-    if (!pos.in_check() && depth <= 6 && static_eval >= beta + 120 * depth) {
-        return static_eval;
-    }
-
-    // Null-move pruning: if we are so far ahead that passing a turn still
-    // stays above beta, we can prune this branch. Skip if in check, if depth
-    // is low, or if the side-to-move has only pawns + king (zugzwang risk
-    // in K+P endings — a tempo can be the difference between win and draw,
-    // and giving the opponent a free move actively misrepresents the
-    // position there).
-    if (!pos.in_check() && depth >= 3 && static_eval >= beta) {
-        const Color us         = pos.side_to_move();
-        const Bitboard minors  = pos.pieces(us, Knight) | pos.pieces(us, Bishop);
-        const Bitboard majors  = pos.pieces(us, Rook)   | pos.pieces(us, Queen);
-        const Bitboard non_p   = minors | majors;
-        // Skip null move in positions with only minor pieces — K+B vs K and
-        // K+N vs K can exhibit zugzwang and the tempo gift actively misleads
-        // the search. Rooks/queens make zugzwang essentially impossible, and
-        // ≥2 minor pieces are also safe enough.
-        const bool safe_for_nm = majors || (non_p && (non_p & (non_p - 1)));
-        if (safe_for_nm) {
-            StateInfo st;
-            pos.do_null_move(st);
-            Move dummy;
-            const Score s = -negamax(pos, depth - 1 - 3, -beta, -beta + 1, ply + 1, dummy, ctx, MoveNone, MoveNone);
-            pos.undo_null_move(st);
-            if (s >= beta) return beta;
-        }
-    }
-
+    // TT probe first so we can use TT score to correct static_eval.
     const Score alpha_orig = alpha;
     TTEntry tt_entry;
     Move    tt_move = MoveNone;
+    bool    tt_hit  = false;
     if (excluded == MoveNone && g_tt.probe(pos.key(), tt_entry)) {
+        tt_hit  = true;
         tt_move = tt_entry.move;
         if (tt_entry.depth >= depth) {
             const Score s = tt_entry.score_from_tt(tt_entry.score, ply);
@@ -263,6 +231,88 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
             if (tt_entry.flag == TT_LOWERBOUND) alpha = std::max(alpha, s);
             if (tt_entry.flag == TT_UPPERBOUND) beta  = std::min(beta, s);
             if (alpha >= beta) return s;
+        }
+    }
+
+    // Cache in_check once: used by every pruning guard and move-loop check below.
+    const bool in_check = pos.in_check();
+
+    // Lazy static eval: skipped for in-check positions where no pruning fires.
+    Score static_eval = 0;
+    if (!in_check) {
+        static_eval = evaluate(pos);
+        // TT score correction: if the TT gives us a tighter bound, use it.
+        if (tt_hit) {
+            const Score tt_s = tt_entry.score_from_tt(tt_entry.score, ply);
+            if ((tt_entry.flag == TT_LOWERBOUND && tt_s > static_eval) ||
+                (tt_entry.flag == TT_UPPERBOUND && tt_s < static_eval) ||
+                 tt_entry.flag == TT_EXACT) {
+                static_eval = tt_s;
+            }
+        }
+    }
+
+    // Reverse Futility Pruning (RFP): also known as Static Null Move Pruning.
+    if (!in_check && depth <= 6 && static_eval >= beta + 120 * depth) {
+        return static_eval;
+    }
+
+    // Null-move pruning.
+    if (!in_check && depth >= 3 && static_eval >= beta) {
+        const Color us         = pos.side_to_move();
+        const Bitboard minors  = pos.pieces(us, Knight) | pos.pieces(us, Bishop);
+        const Bitboard majors  = pos.pieces(us, Rook)   | pos.pieces(us, Queen);
+        const Bitboard non_p   = minors | majors;
+        const bool safe_for_nm = majors || (non_p && (non_p & (non_p - 1)));
+        if (safe_for_nm) {
+            const int R = 3 + depth / 4;
+            StateInfo st;
+            pos.do_null_move(st);
+            Move dummy;
+            const Score s = -negamax(pos, depth - 1 - R, -beta, -beta + 1, ply + 1, dummy, ctx, MoveNone, MoveNone);
+            pos.undo_null_move(st);
+            if (s >= beta) return beta;
+        }
+    }
+
+    // ProbCut: at depth >= 5, check if any capture can be proven to exceed
+    // a generous beta threshold via a shallow search. If so, cut immediately.
+    // The SEE filter skips captures unlikely to reach probcut_beta, keeping
+    // the overhead small relative to the pruning benefit.
+    if (!in_check && depth >= 5 && excluded == MoveNone
+        && std::abs(beta) < kMateInMaxPly) {
+        const Score probcut_beta  = beta + 180;
+        const int   probcut_depth = depth - 4;
+        MoveList    pc_caps;
+        generate_captures(pos, pc_caps);
+        // Order by MVV-LVA for early cutoff.
+        std::array<int, 256> pc_scores{};
+        for (int i = 0; i < pc_caps.size; ++i)
+            pc_scores[static_cast<std::size_t>(i)] = order_score(pos, pc_caps[i], ply, ctx);
+        for (int i = 1; i < pc_caps.size; ++i)
+            for (int j = i; j > 0 && pc_scores[static_cast<std::size_t>(j)] >
+                                      pc_scores[static_cast<std::size_t>(j - 1)]; --j) {
+                std::swap(pc_scores[static_cast<std::size_t>(j)],   pc_scores[static_cast<std::size_t>(j - 1)]);
+                std::swap(pc_caps  [static_cast<std::size_t>(j)],   pc_caps  [static_cast<std::size_t>(j - 1)]);
+            }
+        for (int i = 0; i < pc_caps.size && !ctx.aborted; ++i) {
+            const Move m = pc_caps[static_cast<std::size_t>(i)];
+            if (!see_ge(pos, m, probcut_beta - static_eval)) continue;
+            StateInfo st;
+            const std::uint64_t parent_key = pos.key();
+            pos.do_move(m, st);
+            ctx.key_history.push_back(parent_key);
+            Move dummy;
+            Score s = -qsearch(pos, -probcut_beta, -probcut_beta + 1, ply + 1, ctx);
+            if (s >= probcut_beta && probcut_depth > 0)
+                s = -negamax(pos, probcut_depth, -probcut_beta, -probcut_beta + 1, ply + 1, dummy, ctx, MoveNone, m);
+            ctx.key_history.pop_back();
+            pos.undo_move(m, st);
+            if (ctx.aborted) return 0;
+            if (s >= probcut_beta) {
+                g_tt.store(pos.key(), m, s, depth - 3, TT_LOWERBOUND, ply);
+                return probcut_beta;
+            }
         }
     }
 
@@ -287,7 +337,7 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
     if (moves.size == 0) {
         // Checkmate or stalemate. Mate score is depth-adjusted so the
         // shallowest mate is preferred. Stalemate = draw.
-        return pos.in_check() ? -static_cast<Score>(kMateScore - ply) : Score{0};
+        return in_check ? -static_cast<Score>(kMateScore - ply) : Score{0};
     }
 
     // Futility pruning: if static eval is far below alpha at low depth, quiet
@@ -295,26 +345,24 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
     // are still searched).
     static constexpr Score kFutilityMargin[4] = {0, 150, 300, 500};
     const bool can_futility_prune =
-        !pos.in_check()
+        !in_check
         && depth <= 3
         && excluded == MoveNone
         && alpha > -kMateInMaxPly && alpha < kMateInMaxPly
         && static_eval + kFutilityMargin[depth] <= alpha;
 
     // LMP: at depth 1-2, after trying N quiet moves, skip the rest.
-    // Not applied in check (we must search all evasions) or near mate scores.
     static constexpr int kLmpCount[3] = {0, 8, 15};
     const bool can_lmp =
-        !pos.in_check()
+        !in_check
         && depth <= 2
         && excluded == MoveNone
         && alpha > -kMateInMaxPly && alpha < kMateInMaxPly;
     int quiet_tried = 0;
 
-    // SEE pruning for quiet moves at low depth: skip moves with a losing SEE
-    // score below a depth-scaled threshold.
+    // SEE pruning for quiet moves at low depth.
     const bool can_see_prune_quiet =
-        !pos.in_check()
+        !in_check
         && depth <= 4
         && excluded == MoveNone
         && alpha > -kMateInMaxPly;
@@ -377,7 +425,7 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
         } else {
             // LMR: reduce depth for late-ordered quiet moves.
             int reduction = 0;
-            if (depth >= 3 && i >= 3 && !pos.in_check() && is_quiet) {
+            if (depth >= 3 && i >= 3 && !in_check && is_quiet) {
                 const int d_idx = std::min(depth, 63);
                 const int i_idx = std::min(i, 255);
                 reduction = static_cast<int>(g_lmr_table[d_idx][i_idx]);

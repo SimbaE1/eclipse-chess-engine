@@ -486,14 +486,7 @@ void MCTS::expand_under_lock(Node* node, const Position& pos) {
 
 float MCTS::evaluate_node(const Position& pos) {
     const Score s = evaluate(pos);
-    float v = std::tanh(static_cast<float>(s) / 400.0f);
-
-    // Dynamic Q-boost for strongly winning positions, so PUCT pushes more
-    // visits toward the winning continuation without locking it in.
-    if (s > 200) {
-        v = std::min(0.99f, v + 0.1f);
-    }
-    return v;
+    return std::tanh(static_cast<float>(s) / 400.0f);
 }
 
 }  // namespace eclipse::mcts
