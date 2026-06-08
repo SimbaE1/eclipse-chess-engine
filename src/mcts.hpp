@@ -113,6 +113,7 @@ public:
     Move search(); // deprecated/wrapper
 
     void run();
+    void save_to_cache();          // call after get_best_move() to enable tree reuse
     void adjust_root_q(Move m, Score s);
     Move get_best_move();
 

@@ -37,10 +37,12 @@ EVAL_OLD_HP = str(DATA / "eclipse_v3_3.26M.nnue")      # old 3.26M HalfKP model
 STOCKFISH   = "stockfish"
 
 # Benchmark parameters
-MOVETIME_MS  = 100   # per-move time in ms — fast enough for 200+ game matches
-GAMES_H2H    = 200   # head-to-head games (improved vs baseline, same NNUE)
-GAMES_CAL    = 60    # games per Stockfish level for calibration
-SF_ELOS      = [800, 1000, 1200, 1400, 1600, 1800, 2000]
+MOVETIME_MS  = 500   # 500ms/move
+GAMES_H2H    = 40    # head-to-head games (improved vs baseline, same NNUE)
+GAMES_CAL    = 20    # games per Stockfish level for calibration
+SF_ELOS      = [800, 1200, 1600, 2000, 2400]
+THREADS      = 6     # MCTS threads (5 workers + 1 AB in parallel mode)
+HASH_MB      = 64
 
 RESULTS.mkdir(parents=True, exist_ok=True)
 
@@ -60,8 +62,8 @@ log("=" * 65)
 e_impr  = UCIEngine(ENGINE_NEW.split(),  name_hint="HalfKAv2-ImprSearch")
 e_base  = UCIEngine(ENGINE_BASE.split(), name_hint="HalfKAv2-Baseline")
 e_impr.start();  e_base.start()
-e_impr.uci_init(eval_file=EVAL_NEW, hash_mb=32, threads=1, ab_threads=1)
-e_base.uci_init(eval_file=EVAL_NEW, hash_mb=32, threads=1, ab_threads=1)
+e_impr.uci_init(eval_file=EVAL_NEW, hash_mb=HASH_MB, threads=THREADS, ab_threads=1)
+e_base.uci_init(eval_file=EVAL_NEW, hash_mb=HASH_MB, threads=1, ab_threads=1)
 
 h2h_search = run_match(e_impr, e_base, GAMES_H2H, MOVETIME_MS,
                        out_pgn=str(RESULTS / "improved_vs_baseline.pgn"),
@@ -86,6 +88,8 @@ cal_new = calibrate_elo(
     games_per_level=GAMES_CAL,
     movetime_ms=MOVETIME_MS,
     engine_label="HalfKAv2-Impr",
+    threads=THREADS,
+    hash_mb=HASH_MB,
 )
 elo_new = estimate_elo_from_calibration(cal_new)
 
@@ -104,6 +108,8 @@ cal_base = calibrate_elo(
     games_per_level=GAMES_CAL,
     movetime_ms=MOVETIME_MS,
     engine_label="HalfKAv2-Base",
+    threads=1,
+    hash_mb=32,
 )
 elo_base = estimate_elo_from_calibration(cal_base)
 

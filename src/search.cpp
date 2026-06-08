@@ -21,10 +21,10 @@ constexpr int kAbMaxDepth = 32;
 // Sequential-mode AB budget: only used when Threads=1, so AB runs AFTER
 // MCTS on the same thread. Capped tight because every ms here is a ms
 // MCTS doesn't get.
-constexpr std::int64_t kAbSeqBudgetPctNum = 10;
+constexpr std::int64_t kAbSeqBudgetPctNum = 5;
 constexpr std::int64_t kAbSeqBudgetPctDen = 100;
-constexpr std::int64_t kAbSeqBudgetMinMs  = 50;
-constexpr std::int64_t kAbSeqBudgetMaxMs  = 1500;
+constexpr std::int64_t kAbSeqBudgetMinMs  = 25;
+constexpr std::int64_t kAbSeqBudgetMaxMs  = 500;
 
 // Validation budget: when AB disagrees with MCTS on a non-mate move, carve
 // out this fraction of the move budget to run MCTS on the position AFTER
@@ -151,6 +151,7 @@ Move search(Position& pos, SearchInfo& info) {
     }
 
     info.best_move = mcts_search.get_best_move();
+    mcts_search.save_to_cache();  // preserve subtree for tree reuse next move
 
     // ----- AB-vs-MCTS reconciliation -----
     //
@@ -187,6 +188,7 @@ Move search(Position& pos, SearchInfo& info) {
             validation_info.threads        = total_threads;  // all threads, focused
             validation_info.ab_threads     = 0;              // pure MCTS verdict
             validation_info.limits.time_ms = validation_budget;
+            validation_info.start_time     = std::chrono::steady_clock::now();
 
             mcts::MCTS validator(validation_pos, validation_info);
             validator.run();

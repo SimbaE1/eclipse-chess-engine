@@ -48,6 +48,10 @@ struct SearchCtx {
     // response to the opponent's move [color][from][to].
     Move countermove[2][64][64]{};
 
+    // Capture history: bonus for captures that caused beta cutoffs.
+    // Indexed [color][attacker_type][victim_type][to_square].
+    std::int32_t capture_history[2][7][7][64]{};
+
     // Zobrist key path from the search root.  Populated by negamax push/pop
     // around each do_move so we can detect in-search repetitions.
     std::vector<std::uint64_t> key_history;
@@ -79,10 +83,12 @@ int order_score(const Position& pos, Move m, int ply, const SearchCtx& ctx,
 
     int s = 0;
     if (vict != NoPieceType) {
-        // MVV-LVA: high-value victim, low-value aggressor first.
-        s = 2'000'000 + kPieceValue[vict] * 10 - kPieceValue[aggr];
+        // MVV-LVA + capture history bonus.
+        s = 2'000'000 + kPieceValue[vict] * 10 - kPieceValue[aggr]
+            + ctx.capture_history[pos.side_to_move()][aggr][vict][m.to()];
     } else if (m.type() == Move::EnPassant) {
-        s = 2'000'000 + kPieceValue[Pawn] * 10 - kPieceValue[Pawn];
+        s = 2'000'000 + kPieceValue[Pawn] * 10 - kPieceValue[Pawn]
+            + ctx.capture_history[pos.side_to_move()][Pawn][Pawn][m.to()];
     } else if (m.type() == Move::Promotion) {
         s = 2'000'000 + kPieceValue[m.promotion_piece()] * 10;
     } else {
@@ -165,8 +171,17 @@ Score qsearch(Position& pos, Score alpha, Score beta, int ply, SearchCtx& ctx) {
 
     for (int i = 0; i < caps.size; ++i) {
         const Move m = caps[static_cast<std::size_t>(i)];
-        // SEE pruning: skip losing captures unless we are in check.
-        if (!pos.in_check() && !see_ge(pos, m, 0)) continue;
+        if (!pos.in_check()) {
+            // SEE pruning: skip losing captures.
+            if (!see_ge(pos, m, 0)) continue;
+            // Delta pruning: if even capturing the victim can't raise alpha,
+            // skip (300cp margin covers typical eval inaccuracies).
+            if (m.type() != Move::Promotion) {
+                const PieceType vt = (m.type() == Move::EnPassant)
+                    ? Pawn : type_of(pos.piece_on(m.to()));
+                if (stand_pat + kPieceValue[vt] + 300 <= alpha) continue;
+            }
+        }
 
         StateInfo st;
         pos.do_move(m, st);
@@ -249,13 +264,6 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
             if (tt_entry.flag == TT_UPPERBOUND) beta  = std::min(beta, s);
             if (alpha >= beta) return s;
         }
-    }
-
-    // IIR: when no TT move at depth >= 4 we don't have a good first move to
-    // order on, so reduce depth by 1 — the resulting shallower search still
-    // fills the TT entry and improves the real search on re-entry.
-    if (excluded == MoveNone && tt_move == MoveNone && depth >= 4) {
-        depth -= 1;
     }
 
     // Singular extension: if we have a TT move that is a lower bound (cut-move)
@@ -361,15 +369,11 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
         pos.do_move(m, st);
         ctx.key_history.push_back(parent_key);
 
-        // Check extension: extend by 1 when the move gives check.
-        // Capped at 1 to prevent extension chains from exploding depth.
-        const int check_ext = (pos.in_check() && extension == 0) ? 1 : 0;
-
         Move  dummy;
         Score s;
         if (i == 0) {
             // PV node: search with full window.
-            s = -negamax(pos, depth - 1 + extension + check_ext, -beta, -alpha, ply + 1, dummy, ctx, MoveNone, m);
+            s = -negamax(pos, depth - 1 + extension, -beta, -alpha, ply + 1, dummy, ctx, MoveNone, m);
         } else {
             // LMR: reduce depth for late-ordered quiet moves.
             int reduction = 0;
@@ -383,21 +387,19 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
                     m == ctx.killers[static_cast<std::size_t>(ply)][1]) {
                     reduction -= 1;
                 }
-                // Never reduce a move that gives check.
-                if (check_ext) reduction = 0;
 
                 reduction = std::clamp(reduction, 0, depth - 1);
             }
 
             // Non-PV node: search with null window first.
-            s = -negamax(pos, depth - 1 - reduction + check_ext, -alpha - 1, -alpha, ply + 1, dummy, ctx, MoveNone, m);
+            s = -negamax(pos, depth - 1 - reduction, -alpha - 1, -alpha, ply + 1, dummy, ctx, MoveNone, m);
             if (s > alpha && reduction > 0) {
                 // Failed high on reduced search: re-search with full depth but null window.
-                s = -negamax(pos, depth - 1 + check_ext, -alpha - 1, -alpha, ply + 1, dummy, ctx, MoveNone, m);
+                s = -negamax(pos, depth - 1, -alpha - 1, -alpha, ply + 1, dummy, ctx, MoveNone, m);
             }
             if (s > alpha && s < beta) {
                 // Failed high on null window: re-search with full window.
-                s = -negamax(pos, depth - 1 + check_ext, -beta, -alpha, ply + 1, dummy, ctx, MoveNone, m);
+                s = -negamax(pos, depth - 1, -beta, -alpha, ply + 1, dummy, ctx, MoveNone, m);
             }
         }
 
@@ -407,7 +409,8 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
         if (s > best) { best = s; best_move = m; }
         if (s > alpha) alpha = s;
         if (alpha >= beta) {
-            // Beta cutoff. Update heuristics for quiet moves.
+            const Color us = pos.side_to_move();
+            const int bonus = depth * depth;
             if (is_quiet) {
                 if (ply < 64) {
                     const std::size_t pidx = static_cast<std::size_t>(ply);
@@ -416,8 +419,6 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
                         ctx.killers[pidx][0] = m;
                     }
                 }
-                const Color us = pos.side_to_move();
-                const int bonus = depth * depth;
                 update_history(ctx.history[us][m.from()][m.to()], bonus);
 
                 // History malus: penalize all quiets searched before the cutoff move.
@@ -432,6 +433,12 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
                     const Color opp = us == White ? Black : White;
                     ctx.countermove[opp][prev_move.from()][prev_move.to()] = m;
                 }
+            } else {
+                // Capture/promotion beta cutoff: update capture history.
+                const PieceType agg_t = type_of(pos.piece_on(m.from()));
+                const PieceType vic_t = (m.type() == Move::EnPassant)
+                    ? Pawn : type_of(pos.piece_on(m.to()));
+                update_history(ctx.capture_history[us][agg_t][vic_t][m.to()], bonus);
             }
             break;  // beta cutoff
         }

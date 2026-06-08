@@ -252,7 +252,7 @@ def play_game(
     engine1.new_game()
     engine2.new_game()
 
-    start_fen = board.fen()
+    start_fen = chess.STARTING_FEN   # engines receive full move list from start
     moves_so_far: list[str] = list(opening_moves[:board.ply()])
 
     game = chess.pgn.Game()
@@ -274,7 +274,15 @@ def play_game(
 
         mv_uci = eng.get_move(start_fen, moves_so_far, movetime_ms)
         if mv_uci is None or mv_uci == "0000":
-            # Engine failed to respond or resigned
+            # Null move: check if the board state explains it (no legal moves).
+            if board.is_checkmate():
+                winner = "e2" if engine_idx == 0 else "e1"  # side to move lost
+                return GameResult(winner=winner, termination="CHECKMATE",
+                                  moves_played=move_count)
+            if board.is_stalemate():
+                return GameResult(winner=None, termination="STALEMATE",
+                                  moves_played=move_count)
+            # Genuine engine failure / resignation → other side wins
             winner = "e2" if engine_idx == 0 else "e1"
             return GameResult(winner=winner, termination="engine-error",
                               moves_played=move_count)
@@ -429,6 +437,8 @@ def calibrate_elo(
     games_per_level: int,
     movetime_ms: int,
     engine_label: str = "Eclipse",
+    threads: int = 1,
+    hash_mb: int = 32,
 ) -> list[tuple[int, MatchStats]]:
     results = []
     for sf_elo in sf_elos:
@@ -437,7 +447,7 @@ def calibrate_elo(
         sf  = StockfishEngine(stockfish_bin.split(), name_hint=f"SF{sf_elo}")
         eng.start()
         sf.start()
-        eng.uci_init(eval_file=eval_file, hash_mb=32, threads=1, ab_threads=1)
+        eng.uci_init(eval_file=eval_file, hash_mb=hash_mb, threads=threads, ab_threads=1)
         sf.uci_init_sf(target_elo=sf_elo, hash_mb=32, threads=1)
 
         stats = run_match(eng, sf, games_per_level, movetime_ms,

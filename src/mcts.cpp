@@ -10,7 +10,6 @@
 
 #include "eval.hpp"
 #include "movegen.hpp"
-#include "policy.hpp"
 #include "see.hpp"
 
 namespace eclipse::mcts {
@@ -18,6 +17,50 @@ namespace eclipse::mcts {
 // PUCT runtime knobs. Tunable via UCI Cpuct / FpuOffset.
 float g_cpuct      = 1.41f;
 float g_fpu_offset = 0.25f;
+
+// Tree reuse cache: survives across MCTS instances so the next search can pick
+// up where the last one left off. Saved by save_to_cache(), consumed by
+// try_find_subtree(). Guarded by single-threaded UCI dispatch.
+static std::unique_ptr<Node>     s_cached_root;
+static std::unique_ptr<Position> s_cached_pos;
+
+// Walk the cached tree up to 2 plies to find the subtree rooted at `target`.
+// Returns the matching node (with parent nulled) or nullptr.
+static std::unique_ptr<Node> try_find_subtree(const Position& target_pos) {
+    if (!s_cached_root || !s_cached_pos) return nullptr;
+    const std::uint64_t target = target_pos.key();
+
+    Position work = *s_cached_pos;  // mutable copy to replay moves
+
+    for (auto& c1 : s_cached_root->children) {
+        if (!c1) continue;
+        StateInfo st1;
+        work.do_move(c1->move, st1);
+
+        if (work.key() == target) {
+            // 1-ply match: opponent played our predicted best move.
+            c1->parent = nullptr;
+            return std::move(c1);
+        }
+
+        // 2-ply: we played c1, opponent played c2.
+        if (c1->is_expanded.load(std::memory_order_acquire)) {
+            for (auto& c2 : c1->children) {
+                if (!c2) continue;
+                StateInfo st2;
+                work.do_move(c2->move, st2);
+                if (work.key() == target) {
+                    c2->parent = nullptr;
+                    return std::move(c2);
+                }
+                work.undo_move(c2->move, st2);
+            }
+        }
+
+        work.undo_move(c1->move, st1);
+    }
+    return nullptr;
+}
 
 namespace {
 
@@ -64,14 +107,54 @@ Move MCTS::search() {
 }
 
 void MCTS::run() {
-    root = std::make_unique<Node>(MoveNone, nullptr, 1.0f);
+    // Try to reuse the subtree from the previous search. If the opponent
+    // played the move we predicted (or we're pondering the same position),
+    // we inherit all accumulated visits instead of rebuilding from scratch.
+    std::unique_ptr<Node> reused = try_find_subtree(root_pos);
+    if (reused) {
+        root = std::move(reused);
+        const auto cached_n = root->N.load(std::memory_order_relaxed);
+        std::cout << "info string tree-reuse: " << cached_n
+                  << " cached visits inherited" << std::endl;
+    } else {
+        root = std::make_unique<Node>(MoveNone, nullptr, 1.0f);
+        // Root expansion is single-threaded so workers see a populated child
+        // list before they start traversing. Done under the (uncontested) root
+        // mutex for symmetry with deeper expansion.
+        {
+            std::lock_guard<std::mutex> lock(root->expand_mutex);
+            expand_under_lock(root.get(), root_pos);
+        }
+    }
 
-    // Root expansion is single-threaded so workers see a populated child list
-    // before they start traversing. Done under the (uncontested) root mutex
-    // for symmetry with deeper expansion.
-    {
-        std::lock_guard<std::mutex> lock(root->expand_mutex);
-        expand_under_lock(root.get(), root_pos);
+    // Root policy refinement: evaluate all root children via NNUE and replace
+    // the heuristic priors with softmax(score / temperature). Runs even on
+    // reused trees to keep priors fresh (root position hasn't changed, so this
+    // is idempotent). ~2ms one-time cost at root depth only.
+    if (!root->is_terminal && !root->children.empty()) {
+        static constexpr float kPolicyTemp = 150.0f;  // cp temperature for softmax
+        const std::size_t n = root->children.size();
+        float scores[256];
+        float max_s = -1e30f;
+        Position policy_pos = root_pos;  // work on a copy so root_pos is never mutated
+        for (std::size_t i = 0; i < n && i < 256; ++i) {
+            StateInfo st;
+            policy_pos.do_move(root->children[i]->move, st);
+            scores[i] = -static_cast<float>(evaluate(policy_pos));
+            policy_pos.undo_move(root->children[i]->move, st);
+            if (scores[i] > max_s) max_s = scores[i];
+        }
+        // Stable softmax: subtract max before exp to prevent overflow.
+        float sum = 0.0f;
+        for (std::size_t i = 0; i < n && i < 256; ++i) {
+            scores[i] = std::exp((scores[i] - max_s) / kPolicyTemp);
+            sum += scores[i];
+        }
+        if (sum > 1e-6f) {
+            for (std::size_t i = 0; i < n && i < 256; ++i) {
+                root->children[i]->P = scores[i] / sum;
+            }
+        }
     }
 
     const int threads = std::clamp(search_info.threads, 1, 128);
@@ -127,6 +210,14 @@ void MCTS::run() {
                 return;
             }
         }
+    }
+}
+
+void MCTS::save_to_cache() {
+    if (root) {
+        s_cached_pos  = std::make_unique<Position>(root_pos);
+        s_cached_root = std::move(root);
+        // root is now null — MCTS must not be used after this call.
     }
 }
 
@@ -254,9 +345,10 @@ void MCTS::iterate() {
     // Selection: walk the tree, apply virtual loss on each non-root node
     // visited so other workers see the path as already in flight. Record the
     // traversal so backprop can find its way home.
-    std::vector<Node*> path;
-    path.reserve(64);
-    path.push_back(root.get());
+    // Stack-allocated to avoid heap allocation per iteration (hot path).
+    Node* path[256];
+    int   path_len = 0;
+    path[path_len++] = root.get();
 
     Node* node = root.get();
     while (node->is_expanded.load(std::memory_order_acquire) && !node->is_terminal) {
@@ -278,7 +370,7 @@ void MCTS::iterate() {
 
         best_child->apply_virtual_loss();
         pos.do_move(best_child->move, st);
-        path.push_back(best_child);
+        if (path_len < 256) path[path_len++] = best_child;
         node = best_child;
     }
 
@@ -310,8 +402,8 @@ void MCTS::iterate() {
     // ply since the network reports score from the side-to-move's POV.
     const std::int64_t value_fx = static_cast<std::int64_t>(value * kWScale);
     std::int64_t v_fx = value_fx;
-    for (auto it = path.rbegin(); it != path.rend(); ++it) {
-        Node* n = *it;
+    for (int i = path_len - 1; i >= 0; --i) {
+        Node* n = path[i];
         if (n != root.get()) {
             n->remove_virtual_loss();
         }
@@ -340,46 +432,50 @@ void MCTS::expand_under_lock(Node* node, const Position& pos) {
         return;
     }
 
-    auto priors = policy::get_policy(pos);
+    // Fast heuristic priors — no NNUE batch call on every expansion.
+    // Captures and promotions get higher priors via MVV-LVA; losing moves
+    // (negative SEE) are suppressed. This lets MCTS search ~50x more nodes
+    // per second vs the old get_policy_nnue batch path (~4ms/expansion).
+    // Q-values from evaluate_node (single NNUE call per leaf) still guide
+    // the tree correctly via PUCT even without precise policy priors.
+    static constexpr int kPV[8] = {0, 100, 325, 335, 500, 900, 20000, 0};
 
-    // Sanity-check the policy distribution. Only meaningful when there are
-    // at least 2 legal moves - a single-move position trivially has prob=1.0
-    // which would match "uniform = 1/N for N=1" and fire a spurious warning
-    // (e.g. when the only legal move is recapturing a piece out of check).
-    if (moves.size > 1) {
-        bool uniform = true;
-        const float expected = 1.0f / static_cast<float>(moves.size);
-        for (const auto& [m, prob] : priors) {
-            if (std::abs(prob - expected) > 1e-4f) { uniform = false; break; }
-        }
-        if (uniform) {
-            std::cout << "info string Warning: Uniform policy returned for "
-                      << (pos.side_to_move() == White ? "White" : "Black")
-                      << std::endl;
-        }
-    }
-
+    // Stack-allocated priors array — avoids heap allocation on the hot path.
+    // Max legal moves in a chess position is 218 (theoretical), 256 is safe.
+    float priors_buf[256];
     float sum_p = 0.0f;
-    std::vector<float> filtered_priors;
-    filtered_priors.reserve(moves.size);
+    const int n_moves = moves.size;
 
-    for (const Move m : moves) {
-        float p = priors.count(m) ? priors.at(m) : 0.0f;
-        
-        // Tactical filtering: if move loses material according to SEE, reduce prior.
-        // We only do this for captures or if the side to move is not in check.
-        if (!pos.in_check() && !see_ge(pos, m, 0)) {
-            p *= 0.1f;
+    for (int i = 0; i < n_moves; ++i) {
+        const Move m = moves[static_cast<std::size_t>(i)];
+        float p;
+
+        if (m.type() == Move::Promotion) {
+            p = (m.promotion_piece() == Queen) ? 18.0f : 4.0f;
+        } else {
+            const Piece victim = pos.piece_on(m.to());
+            if (victim != NoPiece || m.type() == Move::EnPassant) {
+                const int vval = (m.type() == Move::EnPassant)
+                    ? kPV[Pawn] : kPV[type_of(victim)];
+                const int aval = kPV[type_of(pos.piece_on(m.from()))];
+                p = 2.0f + std::max(0, vval - aval / 2) * 0.005f;
+            } else {
+                p = 1.0f;
+            }
+            if (!pos.in_check() && !see_ge(pos, m, 0)) {
+                p *= 0.1f;
+            }
         }
-        
-        filtered_priors.push_back(p);
+
+        priors_buf[i] = p;
         sum_p += p;
     }
 
-    // Re-normalize and create children.  Guard against near-zero sum (all
-    // moves heavily SEE-penalised) to avoid division producing extreme values.
-    for (int i = 0; i < moves.size; ++i) {
-        const float p = (sum_p > 1e-6f) ? (filtered_priors[static_cast<std::size_t>(i)] / sum_p) : (1.0f / static_cast<float>(moves.size));
+    node->children.reserve(static_cast<std::size_t>(n_moves));
+    for (int i = 0; i < n_moves; ++i) {
+        const float p = (sum_p > 1e-6f)
+            ? priors_buf[i] / sum_p
+            : 1.0f / static_cast<float>(n_moves);
         node->children.push_back(std::make_unique<Node>(moves[static_cast<std::size_t>(i)], node, p));
     }
 
