@@ -295,7 +295,7 @@ void MCTS::worker_loop() {
             break;
         }
         if (search_info.limits.nodes > 0 &&
-            seen >= search_info.limits.nodes) {
+            static_cast<std::uint64_t>(seen) >= search_info.limits.nodes) {
             search_info.stop.store(true, std::memory_order_relaxed);
             break;
         }
@@ -346,11 +346,15 @@ void MCTS::iterate() {
     // visited so other workers see the path as already in flight. Record the
     // traversal so backprop can find its way home.
     // Stack-allocated to avoid heap allocation per iteration (hot path).
-    Node* path[256];
-    int   path_len = 0;
-    path[path_len++] = root.get();
+    Node*    path[256];
+    uint64_t keys[256];  // Zobrist keys at each path step for repetition detection
+    int      path_len = 0;
+    path[path_len] = root.get();
+    keys[path_len] = root_pos.key();
+    path_len++;
 
     Node* node = root.get();
+    bool  is_repetition = false;
     while (node->is_expanded.load(std::memory_order_acquire) && !node->is_terminal) {
         // Snapshot parent N for the PUCT denominator. Workers update it
         // concurrently, so we read once and use that throughout the loop.
@@ -370,8 +374,23 @@ void MCTS::iterate() {
 
         best_child->apply_virtual_loss();
         pos.do_move(best_child->move, st);
-        if (path_len < 256) path[path_len++] = best_child;
+        const uint64_t new_key = pos.key();
+
+        // 2-fold repetition: check every 2 steps back (same side to move).
+        for (int j = path_len - 2; j >= 0; j -= 2) {
+            if (keys[static_cast<std::size_t>(j)] == new_key) {
+                is_repetition = true;
+                break;
+            }
+        }
+
+        if (path_len < 256) {
+            path[path_len] = best_child;
+            keys[path_len] = new_key;
+            path_len++;
+        }
         node = best_child;
+        if (is_repetition) break;
     }
 
     // Expansion + evaluation. Only one thread expands a given node; others
@@ -379,22 +398,21 @@ void MCTS::iterate() {
     // evaluation runs after the lock is released so we don't serialize ONNX
     // calls on the same node's mutex when many threads land here.
     float value;
-    {
-        std::unique_lock<std::mutex> lock(node->expand_mutex);
-        if (!node->is_expanded.load(std::memory_order_acquire) && !node->is_terminal) {
-            expand_under_lock(node, pos);
-        }
-        // is_terminal is set inside expand_under_lock when there are no legal
-        // moves. Snapshot it before unlocking - safe because expand happens
-        // exactly once per node.
-    }
-
-    if (node->is_terminal) {
-        // Terminal Q was written by expand_under_lock (-1 for in-check loss,
-        // 0 for stalemate). Read after the lock release - it's frozen now.
-        value = node->Q();
+    if (is_repetition) {
+        // Return draw value immediately — no expansion needed.
+        value = 0.0f;
     } else {
-        value = evaluate_node(pos);
+        {
+            std::unique_lock<std::mutex> lock(node->expand_mutex);
+            if (!node->is_expanded.load(std::memory_order_acquire) && !node->is_terminal) {
+                expand_under_lock(node, pos);
+            }
+        }
+        if (node->is_terminal) {
+            value = node->Q();
+        } else {
+            value = evaluate_node(pos);
+        }
     }
 
     // Backprop: undo virtual loss on each node we touched (except root, which
