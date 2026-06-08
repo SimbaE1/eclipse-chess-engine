@@ -430,11 +430,15 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
                 const int i_idx = std::min(i, 255);
                 reduction = static_cast<int>(g_lmr_table[d_idx][i_idx]);
 
-                // Reduce less if it's a killer or has good history.
+                // Reduce less for killers and high-history moves; more for
+                // low-history moves. Keeps reduction bounded to [0, depth-1].
                 if (m == ctx.killers[static_cast<std::size_t>(ply)][0] ||
                     m == ctx.killers[static_cast<std::size_t>(ply)][1]) {
                     reduction -= 1;
                 }
+                const Color us_lmr = pos.side_to_move();
+                const int hist_val = ctx.history[us_lmr][m.from()][m.to()];
+                reduction -= hist_val / (kHistMax / 2);  // ±1 at ±½·kHistMax
 
                 reduction = std::clamp(reduction, 0, depth - 1);
             }
