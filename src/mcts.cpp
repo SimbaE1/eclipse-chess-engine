@@ -438,10 +438,20 @@ void MCTS::expand_under_lock(Node* node, const Position& pos) {
     Position temp_pos = pos;
     generate_legal_moves(temp_pos, moves);
 
+    // 50-move rule: if halfmove clock reached 100, it's a draw regardless
+    // of whether there are legal moves (unless the position is checkmate,
+    // which takes precedence — but checkmate resets the clock anyway).
+    if (pos.halfmove_clock() >= 100) {
+        node->is_terminal = true;
+        node->N.store(1, std::memory_order_relaxed);
+        node->W_fx.store(0, std::memory_order_relaxed);  // draw
+        node->is_expanded.store(true, std::memory_order_release);
+        return;
+    }
+
     if (moves.size == 0) {
         node->is_terminal = true;
-        // Loss if in check (got mated), draw if stalemated. Stored in W so
-        // Q() returns the right value to peers; N=1 means "evaluated".
+        // Loss if in check (got mated), draw if stalemated.
         const float terminal_v = pos.in_check() ? -1.0f : 0.0f;
         node->N.store(1, std::memory_order_relaxed);
         node->W_fx.store(static_cast<std::int64_t>(terminal_v * kWScale),
