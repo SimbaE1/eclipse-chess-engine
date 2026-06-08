@@ -263,9 +263,8 @@ void cmd_go(const std::vector<std::string>& tok) {
     }
 
     g_search_info.limits = limits;
-    g_search_info.stop.store(false, std::memory_order_relaxed);
-    
     join_search_thread();
+    g_search_info.stop.store(false, std::memory_order_relaxed);
     g_search_thread = std::thread([]() {
         search(g_pos, g_search_info);
     });
