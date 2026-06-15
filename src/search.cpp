@@ -122,6 +122,7 @@ Move search(Position& pos, SearchInfo& info) {
         std::int64_t ab_budget = total_time_ms * kAbSeqBudgetPctNum / kAbSeqBudgetPctDen;
         ab_budget = std::clamp(ab_budget, kAbSeqBudgetMinMs, kAbSeqBudgetMaxMs);
         if (ab_budget > total_time_ms / 2) ab_budget = total_time_ms / 2;
+        if (ab_budget < 1) ab_budget = 1;
         info.limits.time_ms = main_phase_time - ab_budget;
         if (info.limits.time_ms < 1) info.limits.time_ms = 1;
     } else if (do_validation_phase) {
@@ -140,6 +141,7 @@ Move search(Position& pos, SearchInfo& info) {
         std::int64_t ab_budget = total_time_ms * kAbSeqBudgetPctNum / kAbSeqBudgetPctDen;
         ab_budget = std::clamp(ab_budget, kAbSeqBudgetMinMs, kAbSeqBudgetMaxMs);
         if (ab_budget > total_time_ms / 2) ab_budget = total_time_ms / 2;
+        if (ab_budget < 1) ab_budget = 1;
         ab_result = ab::find_best_move(pos, kAbMaxDepth, ab_budget);
     }
 

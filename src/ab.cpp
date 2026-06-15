@@ -52,6 +52,12 @@ struct SearchCtx {
     // Indexed [color][attacker_type][victim_type][to_square].
     std::int32_t capture_history[2][7][7][64]{};
 
+    // Continuation history: bonus for a quiet move that caused a beta cutoff
+    // right after a specific previous move. Indexed by destination squares
+    // [color][prev_move.to()][this_move.to()] -- same square-only granularity
+    // as the plain history table, just conditioned on what just happened.
+    std::int32_t cont_history[2][64][64]{};
+
     // Zobrist key path from the search root.  Populated by negamax push/pop
     // around each do_move so we can detect in-search repetitions.
     std::vector<std::uint64_t> key_history;
@@ -104,6 +110,9 @@ int order_score(const Position& pos, Move m, int ply, const SearchCtx& ctx,
                 return 800'000;
         }
         s = ctx.history[pos.side_to_move()][m.from()][m.to()];
+        if (prev_move != MoveNone) {
+            s += ctx.cont_history[pos.side_to_move()][prev_move.to()][m.to()];
+        }
     }
     return s;
 }
@@ -134,6 +143,7 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
               Move prev_move = MoveNone);
 
 Score qsearch(Position& pos, Score alpha, Score beta, int ply, SearchCtx& ctx) {
+    if (ctx.aborted) return 0;
     ++ctx.nodes;
     if (ctx.time_up()) { ctx.aborted = true; return 0; }
 
@@ -196,8 +206,9 @@ Score qsearch(Position& pos, Score alpha, Score beta, int ply, SearchCtx& ctx) {
 
 Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
               Move& out_best, SearchCtx& ctx, Move excluded, Move prev_move) {
-    ++ctx.nodes;
     out_best = MoveNone;
+    if (ctx.aborted) return 0;
+    ++ctx.nodes;
 
     if (ctx.time_up()) { ctx.aborted = true; return 0; }
     if (depth <= 0) return qsearch(pos, alpha, beta, ply, ctx);
@@ -325,10 +336,29 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
 
         Move dummy;
         const Score s = negamax(pos, depth / 2, tt_score - margin - 1, tt_score - margin, ply + 1, dummy, ctx, tt_move, prev_move);
+        if (ctx.aborted) return 0;
 
         if (s < tt_score - margin) {
             extension = 1;
         }
+    }
+
+    // Check extension: a node where we're in check is a forced reply, not a
+    // free choice, so give it an extra ply to avoid horizon effects in
+    // forcing sequences. Capped at the same 1-ply budget as singular
+    // extension so the two can't stack.
+    if (in_check) extension = std::max(extension, 1);
+
+    // Internal Iterative Deepening: nodes without a TT move (e.g. first visit,
+    // or the stored entry's move was pruned away) have nothing to sort first.
+    // A reduced-depth search fills in tt_move for ordering below. depth - 2
+    // keeps this geometrically bounded -- it can recurse, but depth drops by
+    // 2 each time until < 4, where IID no longer triggers.
+    if (tt_move == MoveNone && excluded == MoveNone && depth >= 4) {
+        Move iid_move;
+        negamax(pos, depth - 2, alpha, beta, ply, iid_move, ctx, MoveNone, prev_move);
+        if (ctx.aborted) return 0;
+        if (iid_move != MoveNone) tt_move = iid_move;
     }
 
     MoveList moves;
@@ -412,6 +442,7 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
                 quiets_tried[static_cast<std::size_t>(quiets_tried_count++)] = m;
         }
 
+        const Color mover = pos.side_to_move();
         StateInfo st;
         const std::uint64_t parent_key = pos.key();
         pos.do_move(m, st);
@@ -432,13 +463,18 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
 
                 // Reduce less for killers and high-history moves; more for
                 // low-history moves. Keeps reduction bounded to [0, depth-1].
-                if (m == ctx.killers[static_cast<std::size_t>(ply)][0] ||
-                    m == ctx.killers[static_cast<std::size_t>(ply)][1]) {
+                if (ply < 64 &&
+                    (m == ctx.killers[static_cast<std::size_t>(ply)][0] ||
+                     m == ctx.killers[static_cast<std::size_t>(ply)][1])) {
                     reduction -= 1;
                 }
-                const Color us_lmr = pos.side_to_move();
-                const int hist_val = ctx.history[us_lmr][m.from()][m.to()];
+                const int hist_val = ctx.history[mover][m.from()][m.to()];
                 reduction -= hist_val / (kHistMax / 2);  // ±1 at ±½·kHistMax
+
+                if (prev_move != MoveNone) {
+                    const int cont_val = ctx.cont_history[mover][prev_move.to()][m.to()];
+                    reduction -= cont_val / (kHistMax / 2);
+                }
 
                 reduction = std::clamp(reduction, 0, depth - 1);
             }
@@ -472,12 +508,18 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
                     }
                 }
                 update_history(ctx.history[us][m.from()][m.to()], bonus);
+                if (prev_move != MoveNone) {
+                    update_history(ctx.cont_history[us][prev_move.to()][m.to()], bonus);
+                }
 
                 // History malus: penalize all quiets searched before the cutoff move.
                 const int malus = -(depth * depth / 2);
                 for (int j = 0; j < quiets_tried_count - 1; ++j) {
                     const Move qm = quiets_tried[static_cast<std::size_t>(j)];
                     update_history(ctx.history[us][qm.from()][qm.to()], malus);
+                    if (prev_move != MoveNone) {
+                        update_history(ctx.cont_history[us][prev_move.to()][qm.to()], malus);
+                    }
                 }
 
                 // Countermove: record that m refutes prev_move.

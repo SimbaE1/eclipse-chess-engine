@@ -23,8 +23,8 @@ int main() {
 
     const char* path = std::getenv("ECLIPSE_NNUE_PATH");
     if (path == nullptr) {
-        std::printf("Error: ECLIPSE_NNUE_PATH not set\n");
-        return 1;
+        std::printf("SKIP  eval_comparison (ECLIPSE_NNUE_PATH not set)\n");
+        return 0;
     }
 
     std::vector<EvalCase> cases = {
