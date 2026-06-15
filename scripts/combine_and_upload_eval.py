@@ -24,7 +24,7 @@ from pathlib import Path
 
 REPO    = Path(__file__).parent.parent
 DATA    = REPO / "data"
-TOKEN   = "KGAT_eda6abf5bb3456fbfdb4dd55810c2d08"
+TOKEN   = os.environ["KAGGLE_API_TOKEN"]
 DATASET = "simbae11/eclipse-partial"
 
 COMBINED = DATA / "eval_combined.txt"
@@ -53,16 +53,14 @@ def main():
         total_lines += n
     print(f"\nTotal: {total_lines:,} positions\n")
 
-    print(f"Concatenating -> {COMBINED.name} ...")
-    with open(COMBINED, "wb") as out:
+    print(f"Compressing all sources -> {GZ_OUT.name} (streaming, no intermediate file) ...")
+    written = 0
+    with gzip.open(GZ_OUT, "wb", compresslevel=6) as dst:
         for src in sources:
             with open(src, "rb") as f:
-                shutil.copyfileobj(f, out, length=1 << 24)
-    print(f"  combined: {COMBINED.stat().st_size / 1e6:.1f} MB")
-
-    print(f"Compressing -> {GZ_OUT.name} ...")
-    with open(COMBINED, "rb") as src, gzip.open(GZ_OUT, "wb", compresslevel=6) as dst:
-        shutil.copyfileobj(src, dst, length=1 << 24)
+                shutil.copyfileobj(f, dst, length=1 << 24)
+            written += src.stat().st_size
+            print(f"  {src.name} done  ({written / 1e9:.1f} GB raw processed)", flush=True)
     gz_mb = GZ_OUT.stat().st_size / 1e6
     print(f"  compressed: {gz_mb:.1f} MB")
 

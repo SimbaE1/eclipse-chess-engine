@@ -25,7 +25,7 @@ from pathlib import Path
 
 REPO     = Path(__file__).parent.parent
 DATA     = REPO / "data"
-TOKEN    = "KGAT_eda6abf5bb3456fbfdb4dd55810c2d08"
+TOKEN    = os.environ["KAGGLE_API_TOKEN"]
 DATASET  = "simbae11/eclipse-partial"
 
 SOURCES = [
