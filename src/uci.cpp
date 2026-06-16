@@ -262,11 +262,23 @@ void cmd_go(const std::vector<std::string>& tok) {
         const int  divisor = std::clamp(mlh_our_moves, 5, 60);
 
         limits.time_ms = remain / divisor + inc * 4 / 5;
-        // Safety: never burn more than 1/3 of remaining time on one move, and
-        // subtract 50 ms for move overhead to avoid flagging on increment TCs.
+        // Safety: never burn more than 1/3 of remaining time on one move.
         const int safety_cap = remain / 3;
         if (limits.time_ms > safety_cap) limits.time_ms = safety_cap;
-        limits.time_ms -= 50;
+
+        // Move-overhead subtraction. KNOWN LIMITATION: Eclipse has a fixed
+        // per-move floor of ~120 ms even with a 1 ms budget — the cost of the
+        // root MLH/policy probe, the mandatory first MCTS batch across all
+        // threads, the mate-in-1 sweep, and move I/O. None of that is
+        // interruptible by the time budget. So at ultra-bullet (e.g. 1+0.1)
+        // where the increment (100 ms) is below this floor, the engine
+        // net-loses time every move and WILL eventually flag — it physically
+        // cannot move faster than the floor. We subtract kMoveOverheadMs to
+        // stay safe at any normal TC (blitz/rapid and 5+3 bullet are fine);
+        // ultra-bullet flagging is accepted, not a bug we can fix without
+        // gutting the search floor.
+        constexpr int kMoveOverheadMs = 120;
+        limits.time_ms -= kMoveOverheadMs;
         if (limits.time_ms < 1) limits.time_ms = 1;
     }
 
@@ -315,9 +327,13 @@ void loop() {
         }
         else if (cmd == "stop")       g_search_info.stop.store(true, std::memory_order_relaxed);
         else if (cmd == "ponderhit") {
-            g_search_info.limits.ponder = false;
-            // Update start time to now so time management is relative to the ponderhit
-            g_search_info.start_time = std::chrono::steady_clock::now();
+            // Signal the search thread via the atomic only — limits.ponder and
+            // start_time are read concurrently by time_up()/worker_loop() on
+            // the search thread, so writing them here from the main thread is
+            // a data race (see SearchInfo::ponderhit_at_ms in search.hpp).
+            const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            g_search_info.ponderhit_at_ms.store(now_ms, std::memory_order_release);
         }
         else if (cmd == "quit")       { join_search_thread(); break; }
         // Unknown commands are silently ignored per the UCI spec.

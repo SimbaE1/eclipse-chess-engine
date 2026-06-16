@@ -56,7 +56,15 @@ void log_ab_outcome(const ab::Result& ab, Move mcts_move, Score mcts_cp, const c
 bool SearchInfo::time_up() const noexcept {
     if (limits.nodes > 0 && static_cast<std::uint64_t>(nodes_searched.load(std::memory_order_relaxed)) >= limits.nodes) return true;
     if (limits.depth > 0 && nodes_searched.load(std::memory_order_relaxed) >= limits.depth) return true;
-    if (limits.ponder) return false;
+    if (limits.ponder) {
+        // ponderhit_at_ms is the only cross-thread ponder signal (see
+        // search.hpp) — never touch start_time or limits.ponder here.
+        const auto ph = ponderhit_at_ms.load(std::memory_order_acquire);
+        if (ph < 0) return false;  // still pondering, no ponderhit yet
+        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        return (now_ms - ph) >= limits.time_ms;
+    }
     if (limits.infinite || limits.time_ms <= 0) return false;
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start_time).count();
@@ -66,6 +74,7 @@ bool SearchInfo::time_up() const noexcept {
 Move search(Position& pos, SearchInfo& info) {
     info.nodes_searched.store(0, std::memory_order_relaxed);
     info.start_time     = std::chrono::steady_clock::now();
+    info.ponderhit_at_ms.store(-1, std::memory_order_relaxed);
     info.best_move      = MoveNone;
     info.best_score     = -kInfinite;
 
@@ -282,7 +291,13 @@ Move search(Position& pos, SearchInfo& info) {
         : (info.best_move == ab_result.move ? ab_ponder : MoveNone);
 
     if (info.best_move == MoveNone) {
-        std::cout << "bestmove 0000" << std::endl;
+        // Should only happen if the root has no legal moves (game already
+        // over). Fall back to the first legal move rather than emitting
+        // `bestmove 0000`, which GUIs/cutechess treat as an illegal move.
+        if (moves.size > 0) info.best_move = moves[0];
+        std::cout << "bestmove "
+                   << (info.best_move != MoveNone ? info.best_move.to_uci() : "0000")
+                   << std::endl;
     } else if (ponder_move != MoveNone) {
         std::cout << "bestmove " << info.best_move.to_uci()
                   << " ponder " << ponder_move.to_uci() << std::endl;

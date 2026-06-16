@@ -43,6 +43,17 @@ struct SearchInfo {
     std::atomic<std::int64_t>               nodes_searched{0};
     std::chrono::steady_clock::time_point   start_time{};
 
+    // Wall-clock ms (steady_clock epoch) at which `ponderhit` arrived, or -1
+    // if not yet received. The UCI main thread writes this and the search
+    // thread reads it from time_up() — both non-atomic `start_time` and
+    // `limits.ponder` were previously mutated from the main thread on
+    // ponderhit while the search thread read them concurrently, a data race
+    // that could make time_up() see a stale start_time and report time-up
+    // immediately, starving MCTS of any iterations and yielding `bestmove
+    // 0000`. This atomic is the only ponderhit signal the search thread
+    // reads.
+    std::atomic<std::int64_t> ponderhit_at_ms{-1};
+
     Move  best_move  = MoveNone;
     Score best_score = -kInfinite;
 
