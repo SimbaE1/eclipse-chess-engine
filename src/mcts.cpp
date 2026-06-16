@@ -276,7 +276,7 @@ void MCTS::adjust_root_q(Move m, Score s) {
             // Convert centipawns back to Q-value [-1, 1].
             // Score s is from our perspective. Child Q is from opponent's.
             // So we want child Q to be -s / 400.
-            const float target_q = -static_cast<float>(s) / 400.0f;
+            const float target_q = -static_cast<float>(s) / nnue::output_cp_per_unit();
             const auto n = child->N.load(std::memory_order_relaxed);
             if (n > 0) {
                 // Adjust W such that W/N = target_q
@@ -306,7 +306,7 @@ Move MCTS::get_best_move() {
         }
     }
     if (best_child) {
-        search_info.best_score = static_cast<Score>(-best_child->Q() * 400.0f);
+        search_info.best_score = static_cast<Score>(-best_child->Q() * nnue::output_cp_per_unit());
         log_search_summary(*best_child, best_child->N.load(std::memory_order_relaxed));
         return best_child->move;
     }
@@ -390,7 +390,7 @@ void MCTS::worker_loop() {
                     std::cout << "info nodes " << seen
                               << " nps "  << (seen * 1000 / elapsed_ms)
                               << " time " << elapsed_ms
-                              << " score cp " << static_cast<int>(-snap.slots[0].q * 400.0f)
+                              << " score cp " << static_cast<int>(-snap.slots[0].q * nnue::output_cp_per_unit())
                               << " pv "   << snap.slots[0].m.to_uci()
                               << std::endl;
                     // Diagnostic line: top-3 root children with N / Q / prior.
@@ -559,7 +559,7 @@ int MCTS::iterate_batch(int batch_size) {
         float value;
         if (leaf.needs_eval) {
             const Score s = batch_scores[static_cast<std::size_t>(leaf.eval_idx)];
-            value = std::tanh(static_cast<float>(s) / 400.0f);
+            value = std::tanh(static_cast<float>(s) / nnue::output_cp_per_unit());
         } else {
             value = leaf.value;
         }
@@ -693,7 +693,7 @@ void MCTS::expand_under_lock(Node* node, const Position& pos) {
 
 float MCTS::evaluate_node(const Position& pos) {
     const Score s = evaluate(pos);
-    return std::tanh(static_cast<float>(s) / 400.0f);
+    return std::tanh(static_cast<float>(s) / nnue::output_cp_per_unit());
 }
 
 }  // namespace eclipse::mcts

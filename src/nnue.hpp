@@ -111,6 +111,11 @@ bool load(const std::string& path);
 // True after a successful load. evaluate() must not be called otherwise.
 bool is_loaded() noexcept;
 
+// Centipawns per raw output unit, read from the .nnue file header.
+// MCTS uses this to convert cp scores to WDL via tanh(cp / output_cp_per_unit())
+// so the conversion is invariant to which cp_scale the net was trained with.
+float output_cp_per_unit() noexcept;
+
 // Recompute `acc` from scratch for the given position (full refresh). Both
 // perspectives are filled. Used on initial position setup, when crossing a
 // king move (HalfKP requires refresh on king moves), and any time the engine

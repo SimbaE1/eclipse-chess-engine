@@ -143,6 +143,7 @@ int feature_index(Square king_sq, Square piece_sq,
 // ---- Loader ---------------------------------------------------------------
 
 bool is_loaded() noexcept { return g_loaded; }
+float output_cp_per_unit() noexcept { return g_output_cp_per_unit; }
 
 bool load(const std::string& path) {
     reset_state();
