@@ -28,3 +28,4 @@ data/*
 # alongside the code rather than shipping it via Releases.
 !data/lc0_policy_map.txt
 .accuracy_cache.json
+data/books/
