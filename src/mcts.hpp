@@ -188,6 +188,7 @@ private:
     Position&   root_pos;
     SearchInfo& search_info;
     std::unique_ptr<Node> root;
+    std::atomic<int> max_depth_seen{0};
 };
 
 }  // namespace eclipse::mcts
