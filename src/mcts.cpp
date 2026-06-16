@@ -8,10 +8,12 @@
 #include <thread>
 #include <vector>
 
+#include "bitboard.hpp"
 #include "eval.hpp"
 #include "movegen.hpp"
 #include "nnue.hpp"
 #include "see.hpp"
+#include "syzygy.hpp"
 
 namespace eclipse::mcts {
 
@@ -311,6 +313,23 @@ Move MCTS::get_best_move() {
     return MoveNone;
 }
 
+Move MCTS::get_ponder_move_after(Move best_move) const {
+    if (!root) return MoveNone;
+    for (const auto& child : root->children) {
+        if (child->move != best_move) continue;
+        if (!child->is_expanded.load(std::memory_order_acquire)) return MoveNone;
+        Node* best_gc = nullptr;
+        for (const auto& gc : child->children) {
+            if (!best_gc ||
+                gc->N.load(std::memory_order_relaxed) > best_gc->N.load(std::memory_order_relaxed))
+                best_gc = gc.get();
+        }
+        if (!best_gc || best_gc->N.load(std::memory_order_relaxed) == 0) return MoveNone;
+        return best_gc->move;
+    }
+    return MoveNone;
+}
+
 void MCTS::log_search_summary(const Node& chosen, std::int32_t chosen_visits) const {
     // End-of-search diagnostic: top-5 root children sorted by visit count.
     // Lets the operator see whether the chosen move dominated by a wide
@@ -329,8 +348,14 @@ void MCTS::log_search_summary(const Node& chosen, std::int32_t chosen_visits) co
 }
 
 void MCTS::worker_loop() {
-    while (!search_info.time_up() &&
-           !search_info.stop.load(std::memory_order_relaxed)) {
+    // Always do at least one batch so go/quit piped back-to-back (or any case
+    // where stop is set before the thread starts) still produces real MCTS
+    // output instead of N=0 for every child.
+    bool first_iter = true;
+    while (first_iter ||
+           (!search_info.time_up() &&
+            !search_info.stop.load(std::memory_order_relaxed))) {
+        first_iter = false;
         const int processed = iterate_batch(kLeafBatch);
         if (processed <= 0) break;  // root terminal / nothing to do
         const auto seen = search_info.nodes_searched.fetch_add(
@@ -584,6 +609,23 @@ void MCTS::expand_under_lock(Node* node, const Position& pos) {
         node->W_fx.store(0, std::memory_order_relaxed);  // draw
         node->is_expanded.store(true, std::memory_order_release);
         return;
+    }
+
+    // Syzygy tablebase: mark TB positions as terminal leaves so MCTS
+    // propagates accurate WDL values instead of falling back to NNUE.
+    if (syzygy::is_enabled() && pos.castling_rights() == NoCastling &&
+        static_cast<unsigned>(popcount(pos.occupied())) <= syzygy::max_pieces()) {
+        const unsigned wdl = syzygy::probe_wdl(pos);
+        if (wdl != syzygy::kTbFailed) {
+            const float tb_val = (wdl == syzygy::kTbWin)  ?  1.0f
+                               : (wdl == syzygy::kTbLoss) ? -1.0f : 0.0f;
+            node->is_terminal = true;
+            node->N.store(1, std::memory_order_relaxed);
+            node->W_fx.store(static_cast<std::int64_t>(tb_val * kWScale),
+                             std::memory_order_relaxed);
+            node->is_expanded.store(true, std::memory_order_release);
+            return;
+        }
     }
 
     if (moves.size == 0) {

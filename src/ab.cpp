@@ -5,7 +5,9 @@
 #include <array>
 #include <chrono>
 
+#include "bitboard.hpp"
 #include "movegen.hpp"
+#include "syzygy.hpp"
 #include "tt.hpp"
 #include "types.hpp"
 
@@ -242,6 +244,25 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
             if (tt_entry.flag == TT_LOWERBOUND) alpha = std::max(alpha, s);
             if (tt_entry.flag == TT_UPPERBOUND) beta  = std::min(beta, s);
             if (alpha >= beta) return s;
+        }
+    }
+
+    // Syzygy tablebase probe: short-circuit interior nodes once all pieces fit.
+    if (syzygy::is_enabled() && excluded == MoveNone &&
+        pos.castling_rights() == NoCastling &&
+        static_cast<unsigned>(popcount(pos.occupied())) <= syzygy::max_pieces()) {
+        const unsigned wdl = syzygy::probe_wdl(pos);
+        if (wdl != syzygy::kTbFailed) {
+            Score tb_score;
+            if      (wdl == syzygy::kTbWin)          tb_score =  kMateScore - 1 - ply;
+            else if (wdl == syzygy::kTbCursedWin)    tb_score =  2;
+            else if (wdl == syzygy::kTbBlessedLoss)  tb_score = -2;
+            else if (wdl == syzygy::kTbLoss)         tb_score = -(kMateScore - 1 - ply);
+            else                                       tb_score =  kDraw;
+            const TTFlag tf = (tb_score >= beta) ? TT_LOWERBOUND
+                            : (tb_score <= alpha) ? TT_UPPERBOUND : TT_EXACT;
+            g_tt.store(pos.key(), MoveNone, tb_score, depth, tf, ply);
+            return std::clamp(tb_score, alpha, beta);
         }
     }
 

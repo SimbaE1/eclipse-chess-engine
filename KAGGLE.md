@@ -163,24 +163,43 @@ your notebook can pin to a specific version or always pull `latest`.
 
 1. `notebooks/eclipse_wdl_train.ipynb` → upload to Kaggle as a new notebook
    (Code → New Notebook → File → Upload).
-2. **Add data**: attach the `eclipse-wdl-training` dataset.
-3. **Settings → Accelerator**: GPU T4 ×1 (or P100 — same VRAM,
-   T4 is usually queued faster).
-4. **Settings → Internet**: Off (we don't need network; keeps the run
-   reproducible).
-5. Run all.
+2. **Add data**: attach the `eclipse-partial` dataset (contains `eval_training.txt.gz`).
+3. **Settings → Accelerator**: GPU T4 ×2 (DataParallel across both).
+4. **Settings → Internet**: On — required for the checkpoint sync below.
+5. **Add-ons → Secrets**: add a secret named `KAGGLE_API_TOKEN` with your
+   Kaggle API bearer token (same one used by `combine_and_upload_*.py`
+   locally, via `KAGGLE_API_TOKEN` env var).
+6. **Save Version → Save & Run All** (repeat for each ~9h session).
+
+### Cross-run checkpoint sync
+
+`/kaggle/working` starts empty on every "Save & Run All", so cell 6 syncs
+both the model weights (`halfkav2.pt`) and the training position
+(`resume_state.pt` — epoch, chunk index, optimizer state, LR-scheduler
+state, global step) through a private dataset, `simbae11/eclipse-checkpoint`,
+via the Kaggle API:
+
+- **Start of run**: `ckpt_download()` pulls the latest checkpoint version
+  (no-op, prints "starting fresh", on the very first run before the
+  dataset exists).
+- **After every ~100M-position chunk**: `ckpt_upload()` pushes a new
+  dataset version with the updated `halfkav2.pt` + `resume_state.pt`.
+
+This makes "Save & Run All" fully resumable — no manual re-attaching of
+the previous version's output between runs. If `KAGGLE_API_TOKEN` isn't
+set as a Secret, sync is silently skipped and each run trains from scratch.
 
 ### What the notebook does
 
 | Cell | Purpose |
 |------|---------|
 | 1 | Print env (Python / torch / CUDA / GPU name) |
-| 2 | Locate the dataset on `/kaggle/input/eclipse-wdl-training/` and decompress if `.gz` |
+| 2 | Locate `eval_training.txt(.gz)` under `/kaggle/input/` |
 | 3 | FEN → HalfKAv2 feature indices (1:1 mirror of `src/nnue.cpp::feature_index`) |
-| 4 | `HalfKAv2Dataset` — flat numpy arrays, autodetects WDL vs legacy cp lines |
-| 5 | `HalfKAv2Net` — float mirror of the C++ inference path |
-| 6 | Automated chunked training loop (50M pos at a time, disk-safe) |
-| 7 | Save `/kaggle/working/halfkav2.pt` |
+| 4 | Dataset helpers (`HalfKAv2Dataset`, `HalfKAv2BinaryDataset`, streaming/memmap) |
+| 5 | `HalfKAv2Net` — float mirror of the C++ inference path, with QAT |
+| 6 | Checkpoint sync + automated chunked training loop (100M pos/chunk) |
+| 7 | Output notes — download `halfkav2.pt` from the Output tab |
 
 ### Network architecture (current)
 

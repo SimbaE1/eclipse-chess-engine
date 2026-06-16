@@ -7,7 +7,7 @@
   "is_private": true,
   "enable_gpu": true,
   "enable_tpu": false,
-  "enable_internet": false,
+  "enable_internet": true,
   "dataset_sources": [
     "simbae11/eclipse-partial",
     "simbae11/eclipse-trainer"

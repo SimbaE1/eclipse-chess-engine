@@ -8,8 +8,10 @@
 #include <utility>
 
 #include "ab.hpp"
+#include "bitboard.hpp"
 #include "mcts.hpp"
 #include "movegen.hpp"
+#include "syzygy.hpp"
 
 namespace eclipse {
 
@@ -79,6 +81,48 @@ Move search(Position& pos, SearchInfo& info) {
         info.best_move = moves[0];
         std::cout << "bestmove " << info.best_move.to_uci() << std::endl;
         return moves[0];
+    }
+
+    // Root Syzygy probe: if all pieces fit in the tablebase, skip MCTS/AB
+    // entirely and return the DTZ-optimal move immediately.
+    if (syzygy::is_enabled() && !info.limits.ponder && !info.limits.infinite &&
+        pos.castling_rights() == NoCastling &&
+        static_cast<unsigned>(popcount(pos.occupied())) <= syzygy::max_pieces()) {
+        const syzygy::RootBest rb = syzygy::probe_root_best(pos);
+        if (rb.wdl != syzygy::kTbFailed) {
+            // TB_PROMOTES_* → Eclipse PieceType
+            static constexpr PieceType kPromoMap[5] = {
+                NoPieceType, Queen, Rook, Bishop, Knight
+            };
+            const auto from_sq = static_cast<Square>(rb.from);
+            const auto to_sq   = static_cast<Square>(rb.to);
+            const PieceType promo = kPromoMap[std::min(rb.promotes, 4u)];
+            Move tb_move = MoveNone;
+            for (int i = 0; i < moves.size; ++i) {
+                const Move m = moves[i];
+                if (m.from() != from_sq || m.to() != to_sq) continue;
+                if (m.type() == Move::Promotion) {
+                    if (m.promotion_piece() != promo) continue;
+                } else if (promo != NoPieceType) {
+                    continue;
+                }
+                tb_move = m;
+                break;
+            }
+            if (tb_move != MoveNone) {
+                const char* wdl_str =
+                    rb.wdl == syzygy::kTbWin         ? "win"
+                  : rb.wdl == syzygy::kTbCursedWin   ? "cursed-win"
+                  : rb.wdl == syzygy::kTbDraw         ? "draw"
+                  : rb.wdl == syzygy::kTbBlessedLoss  ? "blessed-loss"
+                  :                                      "loss";
+                std::cout << "info string TB root: wdl=" << wdl_str
+                          << " dtz=" << rb.dtz << std::endl;
+                info.best_move = tb_move;
+                std::cout << "bestmove " << tb_move.to_uci() << std::endl;
+                return tb_move;
+            }
+        }
     }
 
     // Parallel AB+MCTS when (a) we have enough threads to dedicate to AB AND
@@ -155,6 +199,14 @@ Move search(Position& pos, SearchInfo& info) {
     }
 
     info.best_move = mcts_search.get_best_move();
+
+    // Collect potential ponder moves before save_to_cache() nulls the root.
+    const Move pre_reconcile_best = info.best_move;
+    const Move mcts_ponder = mcts_search.get_ponder_move_after(pre_reconcile_best);
+    const Move ab_ponder   = (ab_result.move != MoveNone && ab_result.move != pre_reconcile_best)
+        ? mcts_search.get_ponder_move_after(ab_result.move)
+        : MoveNone;
+
     mcts_search.save_to_cache();  // preserve subtree for tree reuse next move
 
     // ----- AB-vs-MCTS reconciliation -----
@@ -223,8 +275,16 @@ Move search(Position& pos, SearchInfo& info) {
         log_ab_outcome(ab_result, info.best_move, info.best_score, "verify");
     }
 
+    // Pick ponder move based on which move survived reconciliation.
+    const Move ponder_move = (info.best_move == pre_reconcile_best)
+        ? mcts_ponder
+        : (info.best_move == ab_result.move ? ab_ponder : MoveNone);
+
     if (info.best_move == MoveNone) {
         std::cout << "bestmove 0000" << std::endl;
+    } else if (ponder_move != MoveNone) {
+        std::cout << "bestmove " << info.best_move.to_uci()
+                  << " ponder " << ponder_move.to_uci() << std::endl;
     } else {
         std::cout << "bestmove " << info.best_move.to_uci() << std::endl;
     }

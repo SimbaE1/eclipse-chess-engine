@@ -16,6 +16,7 @@
 #include "perft.hpp"
 #include "position.hpp"
 #include "search.hpp"
+#include "syzygy.hpp"
 #include "tt.hpp"
 #include "zobrist.hpp"
 
@@ -94,12 +95,14 @@ void cmd_uci() {
     std::cout << "option name EvalFile type string default <empty>\n"
               << "option name PolicyFile type string default <empty>\n"
               << "option name Threads type spin default 1 min 1 max 128\n"
-              << "option name Hash type spin default 16 min 1 max 16384\n"
-              << "option name MctsHash type spin default 8 min 1 max 4096\n"
+              << "option name Hash type spin default 256 min 1 max 65536\n"
+              << "option name MctsHash type spin default 64 min 1 max 65536\n"
               << "option name OverrideMargin type spin default 50 min 0 max 1000\n"
               << "option name AbThreads type spin default 1 min 0 max 128\n"
               << "option name Cpuct type string default 1.41\n"
               << "option name FpuOffset type string default 0.25\n"
+              << "option name UCI_Ponder type check default true\n"
+              << "option name SyzygyPath type string default <empty>\n"
               << "uciok" << std::endl;
 }
 
@@ -158,7 +161,10 @@ void cmd_setoption(const std::vector<std::string>& tok) {
         char* end = nullptr;
         const float f = std::strtof(value.c_str(), &end);
         if (end != value.c_str() && f > -1.0f && f < 2.0f) mcts::g_fpu_offset = f;
+    } else if (name == "SyzygyPath") {
+        syzygy::init(value);
     }
+    // UCI_Ponder is a capability advertisement; no runtime state to set.
     // Unknown options are silently ignored per UCI convention.
 }
 

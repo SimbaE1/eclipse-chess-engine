@@ -143,7 +143,11 @@ struct Node {
             const float w_eff = W() + static_cast<float>(vl);
             q = w_eff / static_cast<float>(n_eff);
         }
-        return -q + cpuct * P * std::sqrt(static_cast<float>(parent_n)) /
+        // Use parent_n+1 so sqrt never collapses to 0 when the parent hasn't
+        // been visited yet (e.g. first batch at root). Without this, all FPU
+        // children score identically and the engine visits moves in list order
+        // rather than by policy prior, producing nonsense on the first pass.
+        return -q + cpuct * P * std::sqrt(static_cast<float>(parent_n + 1)) /
                                (1.0f + static_cast<float>(n_eff));
     }
 
@@ -165,6 +169,9 @@ public:
     void save_to_cache();          // call after get_best_move() to enable tree reuse
     void adjust_root_q(Move m, Score s);
     Move get_best_move();
+    // Returns the most-visited reply to `best_move` in the current tree.
+    // Must be called before save_to_cache() (which nulls the root).
+    Move get_ponder_move_after(Move best_move) const;
 
 private:
     void   worker_loop();
