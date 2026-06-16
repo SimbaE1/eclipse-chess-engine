@@ -19,13 +19,56 @@ concurrently-running engine match.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import math
+import os
 import sys
+import tempfile
 
 import chess
 import chess.pgn
 
 from bench_vs_stockfish import UciEngine
+
+# Default on-disk cache of computed per-game accuracies. Keyed by
+# (abs PGN path, game identity, depth, cap), so re-running on the same file
+# (e.g. a match cutechess is still appending to) only evaluates new games.
+_DEFAULT_CACHE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), os.pardir, ".accuracy_cache.json")
+
+
+def _game_key(pgn_path: str, game: chess.pgn.Game, depth: int, cap: int) -> str:
+    """Stable identity for a game under a given analysis config.
+
+    The move sequence plus both player names uniquely identifies the game;
+    depth and cap are folded in because they change the computed numbers.
+    """
+    moves = ";".join(m.uci() for m in game.mainline_moves())
+    ident = "|".join((
+        game.headers.get("White", ""), game.headers.get("Black", ""), moves))
+    h = hashlib.sha1(ident.encode()).hexdigest()
+    return f"{os.path.abspath(pgn_path)}|d{depth}|c{cap}|{h}"
+
+
+def _load_cache(path: str) -> dict:
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_cache(path: str, cache: dict) -> None:
+    # Atomic write so an interrupted run can't corrupt the cache file.
+    d = os.path.dirname(path) or "."
+    try:
+        fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump(cache, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass  # caching is best-effort; never fail the analysis over it
 
 
 class Analyzer(UciEngine):
@@ -74,18 +117,93 @@ def main() -> int:
     ap.add_argument("--cap-cp", type=int, default=1000,
                     help="clamp |eval| to this before ACPL/win%% so a decided "
                          "game (and mate scores) don't dominate the averages")
+    ap.add_argument("--cache", default=_DEFAULT_CACHE,
+                    help="JSON cache of computed per-game accuracies "
+                         "(default: <repo>/.accuracy_cache.json)")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="ignore and do not update the cache")
     args = ap.parse_args()
     cap = args.cap_cp
 
     def clamp(cp: int) -> int:
         return max(-cap, min(cap, cp))
 
-    sf = Analyzer(args.stockfish, "sf-analyze")
-    sf.configure({"Threads": args.threads, "Hash": args.hash})
+    cache = {} if args.no_cache else _load_cache(args.cache)
 
-    # name -> running lists across all games
-    tot_acpl: dict[str, list[float]] = {}
-    tot_acc: dict[str, list[float]] = {}
+    # name -> [sum_acc, sum_acpl, n_moves] aggregated across all games
+    agg: dict[str, list[float]] = {}
+
+    def record(name: str, side_stats: dict) -> None:
+        a = agg.setdefault(name, [0.0, 0.0, 0])
+        a[0] += side_stats["sum_acc"]
+        a[1] += side_stats["sum_acpl"]
+        a[2] += side_stats["n"]
+
+    def render(game_idx: int, entry: dict, cached: bool) -> None:
+        tag = "  (cached)" if cached else ""
+        print(f"\n=== Game {game_idx}: {entry['white']} (White) vs "
+              f"{entry['black']} (Black) [{entry['result']}] ==={tag}", flush=True)
+        for key, label, name in (("W", "White", entry["white"]),
+                                  ("B", "Black", entry["black"])):
+            s = entry["sides"].get(key)
+            if s and s["n"]:
+                print(f"  {name:>12} ({label}): "
+                      f"accuracy={s['sum_acc']/s['n']:5.1f}%  "
+                      f"ACPL={s['sum_acpl']/s['n']:4.0f}cp  ({s['n']} moves)",
+                      flush=True)
+                record(name, s)
+
+    sf = None  # lazily started only if there's an uncached game to evaluate
+
+    def analyze_game(game: chess.pgn.Game) -> dict:
+        nonlocal sf
+        if sf is None:
+            sf = Analyzer(args.stockfish, "sf-analyze")
+            sf.configure({"Threads": args.threads, "Hash": args.hash})
+
+        evals: dict[str, int] = {}  # White-POV cp, cached by FEN within the game
+
+        def white_cp(board: chess.Board) -> int:
+            fen = board.fen()
+            if fen not in evals:
+                cp = sf.eval_cp(fen, args.depth)               # side-to-move POV
+                evals[fen] = cp if board.turn == chess.WHITE else -cp
+            return evals[fen]
+
+        board = game.board()
+        cp_before = clamp(white_cp(board))
+        win_before = win_percent(cp_before)
+        acpl = {chess.WHITE: [], chess.BLACK: []}
+        acc = {chess.WHITE: [], chess.BLACK: []}
+
+        for move in game.mainline_moves():
+            mover = board.turn
+            board.push(move)
+            cp_after = clamp(white_cp(board))
+            win_after = win_percent(cp_after)
+            if mover == chess.WHITE:
+                loss_cp = max(0, cp_before - cp_after)
+                loss_win = max(0.0, win_before - win_after)
+            else:
+                loss_cp = max(0, cp_after - cp_before)
+                loss_win = max(0.0, win_after - win_before)
+            acpl[mover].append(loss_cp)
+            acc[mover].append(move_accuracy(loss_win))
+            cp_before, win_before = cp_after, win_after
+
+        sides = {}
+        for key, side in (("W", chess.WHITE), ("B", chess.BLACK)):
+            sides[key] = {
+                "n": len(acc[side]),
+                "sum_acc": sum(acc[side]),
+                "sum_acpl": sum(acpl[side]),
+            }
+        return {
+            "white": game.headers.get("White", "White"),
+            "black": game.headers.get("Black", "Black"),
+            "result": game.headers.get("Result", "?"),
+            "sides": sides,
+        }
 
     with open(args.pgn) as f:
         game_idx = 0
@@ -96,63 +214,24 @@ def main() -> int:
             if not list(game.mainline_moves()):
                 continue  # unfinished / empty game
             game_idx += 1
-            white = game.headers.get("White", "White")
-            black = game.headers.get("Black", "Black")
+            key = _game_key(args.pgn, game, args.depth, cap)
+            if not args.no_cache and key in cache:
+                render(game_idx, cache[key], cached=True)
+                continue
+            entry = analyze_game(game)
+            if not args.no_cache:
+                cache[key] = entry
+                _save_cache(args.cache, cache)  # persist after each game
+            render(game_idx, entry, cached=False)
 
-            # Evaluate every distinct position once (White-POV cp), cached by FEN.
-            evals: dict[str, int] = {}
-
-            def white_cp(board: chess.Board) -> int:
-                fen = board.fen()
-                if fen not in evals:
-                    cp = sf.eval_cp(fen, args.depth)            # side-to-move POV
-                    evals[fen] = cp if board.turn == chess.WHITE else -cp
-                return evals[fen]
-
-            board = game.board()
-            cp_before = clamp(white_cp(board))
-            win_before = win_percent(cp_before)
-
-            acpl = {chess.WHITE: [], chess.BLACK: []}
-            acc = {chess.WHITE: [], chess.BLACK: []}
-
-            for move in game.mainline_moves():
-                mover = board.turn
-                board.push(move)
-                cp_after = clamp(white_cp(board))
-                win_after = win_percent(cp_after)
-
-                if mover == chess.WHITE:
-                    loss_cp = max(0, cp_before - cp_after)
-                    loss_win = max(0.0, win_before - win_after)
-                else:
-                    loss_cp = max(0, cp_after - cp_before)
-                    loss_win = max(0.0, win_after - win_before)
-
-                acpl[mover].append(loss_cp)
-                acc[mover].append(move_accuracy(loss_win))
-                cp_before, win_before = cp_after, win_after
-
-            print(f"\n=== Game {game_idx}: {white} (White) vs {black} (Black) "
-                  f"[{game.headers.get('Result', '?')}] ===", flush=True)
-            for side, name in ((chess.WHITE, white), (chess.BLACK, black)):
-                if acc[side]:
-                    avg_acc = sum(acc[side]) / len(acc[side])
-                    avg_acpl = sum(acpl[side]) / len(acpl[side])
-                    print(f"  {name:>12} ({'White' if side == chess.WHITE else 'Black'}): "
-                          f"accuracy={avg_acc:5.1f}%  ACPL={avg_acpl:4.0f}cp  "
-                          f"({len(acc[side])} moves)", flush=True)
-                    tot_acpl.setdefault(name, []).extend(acpl[side])
-                    tot_acc.setdefault(name, []).extend(acc[side])
-
-    sf.quit()
+    if sf is not None:
+        sf.quit()
 
     print(f"\n=== Aggregate over {game_idx} game(s), Stockfish depth {args.depth} ===")
-    for name in sorted(tot_acpl):
-        avg_acc = sum(tot_acc[name]) / len(tot_acc[name])
-        avg_acpl = sum(tot_acpl[name]) / len(tot_acpl[name])
-        print(f"  {name:>12}: accuracy={avg_acc:5.1f}%  ACPL={avg_acpl:4.0f}cp  "
-              f"({len(tot_acpl[name])} moves)")
+    for name in sorted(agg):
+        sum_acc, sum_acpl, n = agg[name]
+        print(f"  {name:>12}: accuracy={sum_acc/n:5.1f}%  ACPL={sum_acpl/n:4.0f}cp  "
+              f"({int(n)} moves)")
     return 0
 
 
