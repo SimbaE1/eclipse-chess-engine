@@ -91,7 +91,14 @@ struct Node {
             // without being reckless. Tunable via UCI `FpuOffset`.
             q = parent_q - g_fpu_offset;
         } else {
-            const float w_eff = W() - static_cast<float>(vl);
+            // Virtual loss makes an in-flight node look maximally good for its
+            // OWN side-to-move (W pushed toward +n_eff), hence maximally bad for
+            // the parent picking it (-q pushed toward -1). That repels other
+            // selectors — threads in flight, and successive paths within one
+            // batch where the real backprop (and parent_n bump) is deferred
+            // until the whole batch is evaluated. Adding (not subtracting) vl is
+            // what makes that repulsion point the right way.
+            const float w_eff = W() + static_cast<float>(vl);
             q = w_eff / static_cast<float>(n_eff);
         }
         return -q + cpuct * P * std::sqrt(static_cast<float>(parent_n)) /
@@ -119,7 +126,12 @@ public:
 
 private:
     void   worker_loop();
-    void   iterate();
+    // Collect up to `batch_size` leaves (selection + expansion, with virtual
+    // loss separating them), evaluate them in one batched NNUE call, then
+    // backprop all of them. Returns the number of leaves processed (== visits
+    // added). Batching amortizes the L1 weight-matrix memory traffic — the
+    // dominant NNUE cost — across several leaves per pass.
+    int    iterate_batch(int batch_size);
     void   expand_under_lock(Node* node, const Position& pos);
     float  evaluate_node(const Position& pos);
     void   log_search_summary(const Node& chosen, std::int32_t chosen_visits) const;

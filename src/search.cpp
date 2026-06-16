@@ -76,6 +76,8 @@ Move search(Position& pos, SearchInfo& info) {
     generate_legal_moves(pos, moves);
     if (moves.size == 1 && !info.limits.nodes && !info.limits.depth) {
         std::cout << "info string forced move pruning: only " << moves[0].to_uci() << " is legal" << std::endl;
+        info.best_move = moves[0];
+        std::cout << "bestmove " << info.best_move.to_uci() << std::endl;
         return moves[0];
     }
 

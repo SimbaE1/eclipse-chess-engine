@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 """
-Engine-vs-engine benchmark using python-chess. Stands in for cutechess-cli on
-machines where cutechess is not installed.
+Engine-vs-engine benchmark using a minimal synchronous UCI driver. Stands in
+for cutechess-cli on machines where cutechess is not installed.
 
 Usage (from the eclipse/ repo root):
 
@@ -13,18 +13,27 @@ Usage (from the eclipse/ repo root):
 Plays an even number of games, alternating colours each pair. Sets Stockfish's
 UCI_LimitStrength + UCI_Elo to the requested rating. Prints per-game results
 and a final Elo estimate with a 95% Wilson CI.
+
+Drives engines via raw subprocess pipes rather than python-chess's asyncio
+transport: on macOS, chess.engine's kqueue-based pipe transport has been
+observed to silently drop a queued stdin write mid-game, hanging the bench
+forever with both engines idle in their UCI read loop. A blocking
+readline()/write() loop has no such failure mode.
 """
 
 from __future__ import annotations
 
 import argparse
 import math
+import os
+import select
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 import chess
-import chess.engine
 import chess.pgn
 
 
@@ -57,6 +66,110 @@ def elo_from_score(score: float, n: int) -> tuple[float, float]:
     return elo, (elo_hi - elo_lo) / 2.0
 
 
+class UciEngine:
+    """Minimal blocking UCI driver over subprocess pipes."""
+
+    def __init__(self, cmd: str, name: str, transcript=None):
+        self.name = name
+        self.transcript = transcript
+        self.proc = subprocess.Popen(
+            [cmd], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, bufsize=0,
+        )
+        self._out_fd = self.proc.stdout.fileno()
+        self._out_buf = b""
+        # Drain stderr continuously so a chatty engine can't fill the pipe
+        # buffer and block.
+        threading.Thread(target=self._drain_stderr, daemon=True).start()
+        self._send("uci")
+        self._read_until("uciok")
+
+    def _drain_stderr(self) -> None:
+        for line in self.proc.stderr:
+            if self.transcript:
+                self.transcript.write(
+                    f"{time.time():.3f} {self.name} !!! "
+                    f"{line.decode(errors='replace').rstrip()}\n")
+                self.transcript.flush()
+
+    def _send(self, line: str) -> None:
+        if self.transcript:
+            self.transcript.write(f"{time.time():.3f} {self.name} >>> {line}\n")
+            self.transcript.flush()
+        self.proc.stdin.write((line + "\n").encode())
+        self.proc.stdin.flush()
+
+    def _readline(self, timeout: float = 180.0) -> str:
+        # Read raw bytes ourselves and maintain our own line buffer: select()
+        # only reflects the raw fd, so if a prior read already pulled
+        # multiple lines into a TextIOWrapper's internal buffer, a later
+        # select() can falsely report "not ready" while a buffered readline()
+        # would return instantly. Engines like to flush several lines (id
+        # name/id author/options/uciok) in one write, so this isn't rare.
+        while b"\n" not in self._out_buf:
+            ready, _, _ = select.select([self._out_fd], [], [], timeout)
+            if not ready:
+                if self.transcript:
+                    self.transcript.write(
+                        f"{time.time():.3f} {self.name} *** TIMEOUT after "
+                        f"{timeout:.0f}s waiting for output\n")
+                    self.transcript.flush()
+                raise TimeoutError(
+                    f"{self.name} produced no output for {timeout:.0f}s "
+                    f"(cmd={self.proc.args})")
+            chunk = os.read(self._out_fd, 65536)
+            if not chunk:
+                raise EOFError(f"engine exited unexpectedly (cmd={self.proc.args})")
+            self._out_buf += chunk
+        line, self._out_buf = self._out_buf.split(b"\n", 1)
+        line = line.decode(errors="replace").rstrip("\r")
+        if self.transcript:
+            self.transcript.write(f"{time.time():.3f} {self.name} <<< {line}\n")
+            self.transcript.flush()
+        return line
+
+    def _read_until(self, token: str) -> None:
+        while not self._readline().startswith(token):
+            pass
+
+    def configure(self, options: dict) -> None:
+        for name, value in options.items():
+            if isinstance(value, bool):
+                value = "true" if value else "false"
+            self._send(f"setoption name {name} value {value}")
+        self._send("isready")
+        self._read_until("readyok")
+
+    def newgame(self) -> None:
+        self._send("ucinewgame")
+        self._send("isready")
+        self._read_until("readyok")
+
+    def go(self, moves: list[str], wtime: float, btime: float,
+            winc: float, binc: float) -> str | None:
+        pos = "position startpos"
+        if moves:
+            pos += " moves " + " ".join(moves)
+        self._send(pos)
+        self._send(
+            f"go wtime {int(wtime * 1000)} btime {int(btime * 1000)} "
+            f"winc {int(winc * 1000)} binc {int(binc * 1000)}"
+        )
+        while True:
+            line = self._readline()
+            if line.startswith("bestmove"):
+                parts = line.split()
+                move = parts[1] if len(parts) > 1 else None
+                return None if move == "(none)" else move
+
+    def quit(self) -> None:
+        try:
+            self._send("quit")
+            self.proc.wait(timeout=5)
+        except Exception:
+            self.proc.kill()
+
+
 def main() -> int:
     repo = Path(__file__).resolve().parent.parent
     ap = argparse.ArgumentParser()
@@ -68,15 +181,27 @@ def main() -> int:
     ap.add_argument("--nnue", default=str(repo / "data/eclipse.nnue"))
     ap.add_argument("--policy", default=str(repo / "data/policy.onnx"))
     ap.add_argument("--pgn", default=str(repo / "data/eclipse_vs_sf.pgn"))
+    ap.add_argument("--transcript", default="",
+                    help="optional path to write a timestamped UCI transcript")
+    ap.add_argument("--threads", type=int, default=1,
+                    help="total Eclipse search threads (includes AB threads)")
+    ap.add_argument("--ab-threads", type=int, default=1,
+                    help="Eclipse threads dedicated to the AB verifier")
+    ap.add_argument("--sf-threads", type=int, default=1,
+                    help="Stockfish search threads")
     args = ap.parse_args()
 
     base, inc = parse_tc(args.tc)
 
-    eclipse = chess.engine.SimpleEngine.popen_uci(args.eclipse)
-    eclipse.configure({"EvalFile": args.nnue, "PolicyFile": args.policy})
+    transcript = open(args.transcript, "w") if args.transcript else None
 
-    sf = chess.engine.SimpleEngine.popen_uci(args.stockfish)
-    sf.configure({"UCI_LimitStrength": True, "UCI_Elo": args.opponent_elo})
+    eclipse = UciEngine(args.eclipse, "eclipse", transcript)
+    eclipse.configure({"EvalFile": args.nnue, "PolicyFile": args.policy,
+                        "Threads": args.threads, "AbThreads": args.ab_threads})
+
+    sf = UciEngine(args.stockfish, "stockfish", transcript)
+    sf.configure({"UCI_LimitStrength": True, "UCI_Elo": args.opponent_elo,
+                   "Threads": args.sf_threads})
 
     wins = draws = losses = 0  # from Eclipse's perspective
     pgn_path = Path(args.pgn)
@@ -92,17 +217,17 @@ def main() -> int:
             white_name = "Eclipse" if eclipse_is_white else f"SF-{args.opponent_elo}"
             black_name = f"SF-{args.opponent_elo}" if eclipse_is_white else "Eclipse"
 
+            eclipse.newgame()
+            sf.newgame()
+
             board = chess.Board()
+            moves: list[str] = []
             wclock, bclock = base, base
             outcome: str | None = None
             while not board.is_game_over(claim_draw=True):
                 engine = white if board.turn == chess.WHITE else black
-                limit = chess.engine.Limit(
-                    white_clock=wclock, black_clock=bclock,
-                    white_inc=inc, black_inc=inc,
-                )
                 t0 = time.time()
-                result = engine.play(board, limit)
+                move = engine.go(moves, wclock, bclock, inc, inc)
                 elapsed = time.time() - t0
                 white_to_move = (board.turn == chess.WHITE)
                 if white_to_move:
@@ -112,14 +237,16 @@ def main() -> int:
                 if wclock <= 0.0 or bclock <= 0.0:
                     # Whoever just moved blew their clock.
                     outcome = "0-1" if white_to_move else "1-0"
-                    if result.move is not None:
-                        board.push(result.move)
+                    if move is not None:
+                        board.push_uci(move)
+                        moves.append(move)
                     break
-                if result.move is None:
+                if move is None:
                     # Engine resigned or has no legal move - let board.result
                     # decide (it will handle checkmate/stalemate correctly).
                     break
-                board.push(result.move)
+                board.push_uci(move)
+                moves.append(move)
             if outcome is None:
                 outcome = board.result(claim_draw=True)
 
@@ -154,6 +281,8 @@ def main() -> int:
         pgn_fh.close()
         eclipse.quit()
         sf.quit()
+        if transcript:
+            transcript.close()
 
     n = wins + draws + losses
     if n == 0:

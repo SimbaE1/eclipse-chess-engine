@@ -10,6 +10,7 @@
 
 #include "eval.hpp"
 #include "movegen.hpp"
+#include "nnue.hpp"
 #include "see.hpp"
 
 namespace eclipse::mcts {
@@ -17,6 +18,15 @@ namespace eclipse::mcts {
 // PUCT runtime knobs. Tunable via UCI Cpuct / FpuOffset.
 float g_cpuct      = 1.41f;
 float g_fpu_offset = 0.25f;
+
+// MCTS leaf-batch size. Each worker collects this many leaves (kept apart by
+// virtual loss), evaluates them in a single nnue::evaluate_batch call, and
+// backprops them together. The batched L1 kernel reuses each weight row across
+// 4 inputs, so a multiple of 4 fully amortizes the (memory-bound) weight
+// traffic; 8 also amortizes the per-call FT/L2/L3 fixed costs while keeping
+// in-flight staleness negligible against a multi-hundred-thousand-visit search.
+inline constexpr int kLeafBatch    = 8;
+inline constexpr int kMaxPathLen   = 256;
 
 // Tree reuse cache: survives across MCTS instances so the next search can pick
 // up where the last one left off. Saved by save_to_cache(), consumed by
@@ -133,11 +143,11 @@ void MCTS::run() {
     // is idempotent). ~2ms one-time cost at root depth only.
     if (!root->is_terminal && !root->children.empty()) {
         static constexpr float kPolicyTemp = 150.0f;  // cp temperature for softmax
-        const std::size_t n = root->children.size();
+        const std::size_t n = std::min(root->children.size(), std::size_t{256});
         float scores[256];
         float max_s = -1e30f;
         Position policy_pos = root_pos;  // work on a copy so root_pos is never mutated
-        for (std::size_t i = 0; i < n && i < 256; ++i) {
+        for (std::size_t i = 0; i < n; ++i) {
             StateInfo st;
             policy_pos.do_move(root->children[i]->move, st);
             scores[i] = -static_cast<float>(evaluate(policy_pos));
@@ -146,12 +156,12 @@ void MCTS::run() {
         }
         // Stable softmax: subtract max before exp to prevent overflow.
         float sum = 0.0f;
-        for (std::size_t i = 0; i < n && i < 256; ++i) {
+        for (std::size_t i = 0; i < n; ++i) {
             scores[i] = std::exp((scores[i] - max_s) / kPolicyTemp);
             sum += scores[i];
         }
         if (sum > 1e-6f) {
-            for (std::size_t i = 0; i < n && i < 256; ++i) {
+            for (std::size_t i = 0; i < n; ++i) {
                 root->children[i]->P = scores[i] / sum;
             }
         }
@@ -285,9 +295,10 @@ void MCTS::log_search_summary(const Node& chosen, std::int32_t chosen_visits) co
 void MCTS::worker_loop() {
     while (!search_info.time_up() &&
            !search_info.stop.load(std::memory_order_relaxed)) {
-        iterate();
+        const int processed = iterate_batch(kLeafBatch);
+        if (processed <= 0) break;  // root terminal / nothing to do
         const auto seen = search_info.nodes_searched.fetch_add(
-            1, std::memory_order_relaxed) + 1;
+            processed, std::memory_order_relaxed) + processed;
 
         if (search_info.limits.depth > 0 &&
             seen >= search_info.limits.depth) {
@@ -338,97 +349,162 @@ void MCTS::worker_loop() {
     }
 }
 
-void MCTS::iterate() {
-    Position pos = root_pos;
+int MCTS::iterate_batch(int batch_size) {
+    if (batch_size < 1) batch_size = 1;
+    if (batch_size > kLeafBatch) batch_size = kLeafBatch;
+
+    // Per-collected-leaf bookkeeping. One entry per selected path.
+    struct Leaf {
+        Node*    path[kMaxPathLen];
+        int      path_len   = 0;
+        bool     needs_eval = false;  // true => value comes from the batch eval
+        float    value      = 0.0f;   // terminal/repetition value when !needs_eval
+        int      eval_idx   = -1;     // slot into the batch-eval input arrays
+    };
+
+    // Thread-local scratch so nothing large lands on the (512 KB on macOS)
+    // worker stack — the previous batch attempt SIGABRT'd from a 1 MB
+    // Accumulator[256] stack array. Sized once; reused every call.
+    static thread_local std::vector<Leaf>              leaves;
+    static thread_local std::vector<nnue::Accumulator> batch_accs;  // eval inputs
+    static thread_local std::vector<Color>             batch_stms;
+    static thread_local std::vector<Score>             batch_scores;
+    static thread_local std::vector<std::uint64_t>     keys;        // per-path rep keys
+
+    if (static_cast<int>(leaves.size()) < batch_size) {
+        leaves.resize(static_cast<std::size_t>(batch_size));
+        batch_accs.resize(static_cast<std::size_t>(batch_size));
+        batch_stms.resize(static_cast<std::size_t>(batch_size));
+        batch_scores.resize(static_cast<std::size_t>(batch_size));
+    }
+    if (keys.size() < static_cast<std::size_t>(kMaxPathLen)) {
+        keys.resize(static_cast<std::size_t>(kMaxPathLen));
+    }
+
+    Position  pos;        // reused per path (reset from root_pos each time)
     StateInfo st;
+    int       n_leaves = 0;  // paths actually collected this batch
+    int       n_eval   = 0;  // subset that need a network eval
 
-    // Selection: walk the tree, apply virtual loss on each non-root node
-    // visited so other workers see the path as already in flight. Record the
-    // traversal so backprop can find its way home.
-    // Stack-allocated to avoid heap allocation per iteration (hot path).
-    Node*    path[256];
-    uint64_t keys[256];  // Zobrist keys at each path step for repetition detection
-    int      path_len = 0;
-    path[path_len] = root.get();
-    keys[path_len] = root_pos.key();
-    path_len++;
+    // ---- Selection + expansion: collect `batch_size` leaves --------------
+    // Virtual loss is applied along each path as we descend and is NOT removed
+    // until backprop, so successive paths in this batch (and other workers) are
+    // steered away from leaves already in flight.
+    for (int b = 0; b < batch_size; ++b) {
+        Leaf& leaf = leaves[static_cast<std::size_t>(b)];
+        leaf.needs_eval = false;
+        leaf.eval_idx   = -1;
 
-    Node* node = root.get();
-    bool  is_repetition = false;
-    while (node->is_expanded.load(std::memory_order_acquire) && !node->is_terminal) {
-        // Snapshot parent N for the PUCT denominator. Workers update it
-        // concurrently, so we read once and use that throughout the loop.
-        const auto parent_n = node->N.load(std::memory_order_relaxed);
-        const float parent_q = node->Q();
+        pos = root_pos;
+        int  path_len = 0;
+        leaf.path[path_len] = root.get();
+        keys[static_cast<std::size_t>(path_len)] = root_pos.key();
+        path_len++;
 
-        Node* best_child = nullptr;
-        float best_score = -1e30f;
-        for (const auto& child : node->children) {
-            const float s = child->puct_score(parent_n, g_cpuct, parent_q);
-            if (s > best_score) {
-                best_score = s;
-                best_child = child.get();
+        Node* node = root.get();
+        bool  is_repetition = false;
+        while (node->is_expanded.load(std::memory_order_acquire) && !node->is_terminal) {
+            const auto  parent_n = node->N.load(std::memory_order_relaxed);
+            const float parent_q = node->Q();
+
+            Node* best_child = nullptr;
+            float best_score = -1e30f;
+            for (const auto& child : node->children) {
+                const float s = child->puct_score(parent_n, g_cpuct, parent_q);
+                if (s > best_score) {
+                    best_score = s;
+                    best_child = child.get();
+                }
             }
-        }
-        if (!best_child) break;
+            if (!best_child) break;
 
-        best_child->apply_virtual_loss();
-        pos.do_move(best_child->move, st);
-        const uint64_t new_key = pos.key();
+            best_child->apply_virtual_loss();
+            pos.do_move(best_child->move, st);
+            const std::uint64_t new_key = pos.key();
 
-        // 2-fold repetition: check every 2 steps back (same side to move).
-        for (int j = path_len - 2; j >= 0; j -= 2) {
-            if (keys[static_cast<std::size_t>(j)] == new_key) {
-                is_repetition = true;
-                break;
+            // 2-fold repetition: check every 2 steps back (same side to move).
+            for (int j = path_len - 2; j >= 0; j -= 2) {
+                if (keys[static_cast<std::size_t>(j)] == new_key) {
+                    is_repetition = true;
+                    break;
+                }
             }
-        }
 
-        if (path_len < 256) {
-            path[path_len] = best_child;
-            keys[path_len] = new_key;
-            path_len++;
-        }
-        node = best_child;
-        if (is_repetition) break;
-    }
-
-    // Expansion + evaluation. Only one thread expands a given node; others
-    // wait on the mutex, then notice is_expanded is true and skip. The leaf's
-    // evaluation runs after the lock is released so we don't serialize ONNX
-    // calls on the same node's mutex when many threads land here.
-    float value;
-    if (is_repetition) {
-        // Return draw value immediately — no expansion needed.
-        value = 0.0f;
-    } else {
-        {
-            std::unique_lock<std::mutex> lock(node->expand_mutex);
-            if (!node->is_expanded.load(std::memory_order_acquire) && !node->is_terminal) {
-                expand_under_lock(node, pos);
+            if (path_len < kMaxPathLen) {
+                leaf.path[path_len] = best_child;
+                keys[static_cast<std::size_t>(path_len)] = new_key;
+                path_len++;
             }
+            node = best_child;
+            if (is_repetition) break;
         }
-        if (node->is_terminal) {
-            value = node->Q();
+        leaf.path_len = path_len;
+
+        if (is_repetition) {
+            leaf.value = 0.0f;  // draw
         } else {
-            value = evaluate_node(pos);
+            {
+                std::unique_lock<std::mutex> lock(node->expand_mutex);
+                if (!node->is_expanded.load(std::memory_order_acquire) && !node->is_terminal) {
+                    expand_under_lock(node, pos);
+                }
+            }
+            if (node->is_terminal) {
+                leaf.value = node->Q();
+            } else {
+                // Queue for the batched NNUE eval. The accumulator is kept in
+                // sync incrementally by do_move, so the leaf position already
+                // carries a valid one — copy it out (pos is reused next path).
+                // Cold path (not yet computed, e.g. net loaded mid-game): fall
+                // back to the single-eval path which refreshes on demand.
+                nnue::Accumulator& acc = pos.accumulator();
+                if (acc.computed) {
+                    leaf.needs_eval = true;
+                    leaf.eval_idx   = n_eval;
+                    batch_accs[static_cast<std::size_t>(n_eval)] = acc;
+                    batch_stms[static_cast<std::size_t>(n_eval)] = pos.side_to_move();
+                    ++n_eval;
+                } else {
+                    leaf.value = evaluate_node(pos);
+                }
+            }
+        }
+        ++n_leaves;
+    }
+
+    // ---- One batched NNUE forward pass for all queued leaves --------------
+    if (n_eval > 0) {
+        nnue::evaluate_batch(batch_accs.data(), batch_stms.data(),
+                             batch_scores.data(), n_eval);
+    }
+
+    // ---- Backprop every collected path -----------------------------------
+    for (int b = 0; b < n_leaves; ++b) {
+        Leaf& leaf = leaves[static_cast<std::size_t>(b)];
+        float value;
+        if (leaf.needs_eval) {
+            const Score s = batch_scores[static_cast<std::size_t>(leaf.eval_idx)];
+            value = std::tanh(static_cast<float>(s) / 400.0f);
+        } else {
+            value = leaf.value;
+        }
+
+        // Undo virtual loss on each touched node (root never had one), then
+        // bake in the real value. Sign flips each ply: the network reports
+        // from the side-to-move's POV.
+        std::int64_t v_fx = static_cast<std::int64_t>(value * kWScale);
+        for (int i = leaf.path_len - 1; i >= 0; --i) {
+            Node* n = leaf.path[i];
+            if (n != root.get()) {
+                n->remove_virtual_loss();
+            }
+            n->N.fetch_add(1, std::memory_order_relaxed);
+            n->W_fx.fetch_add(v_fx, std::memory_order_relaxed);
+            v_fx = -v_fx;
         }
     }
 
-    // Backprop: undo virtual loss on each node we touched (except root, which
-    // never had one applied), then bake in the real value. Sign flips at each
-    // ply since the network reports score from the side-to-move's POV.
-    const std::int64_t value_fx = static_cast<std::int64_t>(value * kWScale);
-    std::int64_t v_fx = value_fx;
-    for (int i = path_len - 1; i >= 0; --i) {
-        Node* n = path[i];
-        if (n != root.get()) {
-            n->remove_virtual_loss();
-        }
-        n->N.fetch_add(1, std::memory_order_relaxed);
-        n->W_fx.fetch_add(v_fx, std::memory_order_relaxed);
-        v_fx = -v_fx;
-    }
+    return n_leaves;
 }
 
 void MCTS::expand_under_lock(Node* node, const Position& pos) {
