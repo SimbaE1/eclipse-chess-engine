@@ -323,6 +323,9 @@ void loop() {
         else if (cmd == "quit")       { join_search_thread(); break; }
         // Unknown commands are silently ignored per the UCI spec.
     }
+    // EOF path: don't force-stop an in-progress search — let it finish
+    // naturally (it will print bestmove on its own), then just join.
+    if (g_search_thread.joinable()) g_search_thread.join();
 }
 
 }  // namespace eclipse::uci

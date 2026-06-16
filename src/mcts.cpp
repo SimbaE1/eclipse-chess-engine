@@ -387,7 +387,10 @@ void MCTS::worker_loop() {
                     // Main info line: nodes/nps/time/pv of best (most-visited).
                     // Negate the child Q: it is stored from the child's STM
                     // (our opponent's) perspective; UCI score is from us.
-                    std::cout << "info nodes " << seen
+                    const int seldepth = max_depth_seen.load(std::memory_order_relaxed);
+                    std::cout << "info depth " << seldepth
+                              << " seldepth " << seldepth
+                              << " nodes " << seen
                               << " nps "  << (seen * 1000 / elapsed_ms)
                               << " time " << elapsed_ms
                               << " score cp " << static_cast<int>(-snap.slots[0].q * nnue::output_cp_per_unit())
@@ -503,6 +506,14 @@ int MCTS::iterate_batch(int batch_size) {
         }
         leaf.path_len = path_len;
         leaf.leaf_key = keys[static_cast<std::size_t>(path_len - 1)];
+
+        // Track deepest leaf reached (path_len counts root as 1, so depth = path_len - 1).
+        const int leaf_depth = path_len - 1;
+        int prev = max_depth_seen.load(std::memory_order_relaxed);
+        while (leaf_depth > prev &&
+               !max_depth_seen.compare_exchange_weak(prev, leaf_depth,
+                   std::memory_order_relaxed, std::memory_order_relaxed)) {}
+
 
         if (is_repetition) {
             leaf.value  = 0.0f;  // draw
