@@ -1,0 +1,3 @@
+r2q1b1r/pp1kpBpp/2n1Nn2/8/3P3P/2N5/PPb2PP1/R1B1K2R w KQ - c0 "G10 m12 W: old net +0.62/d38; White king stuck on e1, Black swarming -> lost";
+r4b1r/pp1kpBpp/1qn1Nn2/3P4/7P/2N5/PPb2PP1/R1B1K2R w KQ - c0 "G10 m13 W (prime blind spot): old net +0.79/d39, plays a3; after ...Ne5 it is lost, mated by m19 Qc5#";
+r4b1r/pp1kpBpp/1q2Nn2/3Pn3/7P/P1N5/1Pb2PP1/R1B1K2R w KQ - c0 "G10 m14 W: eval has flipped (-2.4); Black: Ne5->Nd3+ king hunt incoming";
