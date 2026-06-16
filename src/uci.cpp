@@ -82,17 +82,8 @@ Move parse_move(const std::string& s, Position& pos) {
 
 void cmd_uci() {
     std::cout << "id name " << kEngineName << ' ' << kEngineVersion << '\n'
-              << "id author " << kEngineAuthor << '\n';
-
-#if defined(__AVX2__)
-    std::cout << "info string SIMD: AVX2\n";
-#elif defined(__ARM_NEON)
-    std::cout << "info string SIMD: NEON\n";
-#else
-    std::cout << "info string SIMD: None (Scalar)\n";
-#endif
-
-    std::cout << "option name EvalFile type string default <empty>\n"
+              << "id author " << kEngineAuthor << '\n'
+              << "option name EvalFile type string default <empty>\n"
               << "option name PolicyFile type string default <empty>\n"
               << "option name Threads type spin default 1 min 1 max 128\n"
               << "option name Hash type spin default 256 min 1 max 65536\n"
@@ -101,6 +92,7 @@ void cmd_uci() {
               << "option name AbThreads type spin default 1 min 0 max 128\n"
               << "option name Cpuct type string default 1.41\n"
               << "option name FpuOffset type string default 0.25\n"
+              << "option name Ponder type check default true\n"
               << "option name UCI_Ponder type check default true\n"
               << "option name SyzygyPath type string default <empty>\n"
               << "uciok" << std::endl;
@@ -171,6 +163,13 @@ void cmd_setoption(const std::vector<std::string>& tok) {
 void cmd_isready() {
     zobrist::init();
     init_attacks();
+#if defined(__AVX2__)
+    std::cout << "info string SIMD: AVX2\n";
+#elif defined(__ARM_NEON)
+    std::cout << "info string SIMD: NEON\n";
+#else
+    std::cout << "info string SIMD: None (Scalar)\n";
+#endif
     std::cout << "readyok" << std::endl;
 }
 
