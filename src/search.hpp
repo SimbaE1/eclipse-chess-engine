@@ -46,6 +46,11 @@ struct SearchInfo {
     Move  best_move  = MoveNone;
     Score best_score = -kInfinite;
 
+    // When true, worker_loop suppresses UCI info lines. Used for internal
+    // searches (validation MCTS) that run from a different position than the
+    // GUI's current root — their PV moves would be flagged as illegal otherwise.
+    bool silent = false;
+
     bool time_up() const noexcept;
 };
 

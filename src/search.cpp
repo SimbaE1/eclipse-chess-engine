@@ -245,6 +245,7 @@ Move search(Position& pos, SearchInfo& info) {
             validation_info.ab_threads     = 0;              // pure MCTS verdict
             validation_info.limits.time_ms = validation_budget;
             validation_info.start_time     = std::chrono::steady_clock::now();
+            validation_info.silent         = true;           // don't emit info lines from opponent's POV
 
             mcts::MCTS validator(validation_pos, validation_info);
             validator.run();

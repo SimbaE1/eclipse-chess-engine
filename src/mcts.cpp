@@ -383,7 +383,7 @@ void MCTS::worker_loop() {
                 g_last_info_ms.compare_exchange_strong(
                     prev_ms, elapsed_ms, std::memory_order_relaxed)) {
                 const auto snap = snapshot_root_topk<3>(*root);
-                if (snap.filled > 0 && elapsed_ms > 0) {
+                if (snap.filled > 0 && elapsed_ms > 0 && !search_info.silent) {
                     // Main info line: nodes/nps/time/pv of best (most-visited).
                     // Negate the child Q: it is stored from the child's STM
                     // (our opponent's) perspective; UCI score is from us.
