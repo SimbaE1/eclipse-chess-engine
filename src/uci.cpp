@@ -95,6 +95,7 @@ void cmd_uci() {
               << "option name PolicyFile type string default <empty>\n"
               << "option name Threads type spin default 1 min 1 max 128\n"
               << "option name Hash type spin default 16 min 1 max 16384\n"
+              << "option name MctsHash type spin default 8 min 1 max 4096\n"
               << "option name OverrideMargin type spin default 50 min 0 max 1000\n"
               << "option name AbThreads type spin default 1 min 0 max 128\n"
               << "option name Cpuct type string default 1.41\n"
@@ -142,6 +143,8 @@ void cmd_setoption(const std::vector<std::string>& tok) {
         g_search_info.threads = std::clamp(n, 1, 128);
     } else if (name == "Hash") {
         g_tt.resize(std::atoi(value.c_str()));
+    } else if (name == "MctsHash") {
+        mcts::g_mcts_tt.resize(static_cast<std::size_t>(std::atoi(value.c_str())));
     } else if (name == "OverrideMargin") {
         g_search_info.override_margin = std::atoi(value.c_str());
     } else if (name == "AbThreads") {
@@ -285,7 +288,7 @@ void loop() {
 
         if      (cmd == "uci")        cmd_uci();
         else if (cmd == "isready")    cmd_isready();
-        else if (cmd == "ucinewgame") { join_search_thread(); g_pos = Position::startpos(); }
+        else if (cmd == "ucinewgame") { join_search_thread(); g_pos = Position::startpos(); g_tt.clear(); mcts::g_mcts_tt.clear(); }
         else if (cmd == "setoption")  { join_search_thread(); cmd_setoption(tok); }
         else if (cmd == "position")   { join_search_thread(); cmd_position(tok); }
         else if (cmd == "go")         cmd_go(tok);

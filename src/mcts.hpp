@@ -15,6 +15,48 @@
 
 namespace eclipse::mcts {
 
+// ---------------------------------------------------------------------------
+// MCTS transposition table — a flat position-value cache separate from the AB
+// TT.  Maps Zobrist key -> {N, Q} so that positions reached via different
+// paths within the same search (or revisited in subsequent moves) inherit
+// already-accumulated visit statistics rather than starting cold.
+//
+// Thread-safety: intentionally racy (plain struct reads/writes).  A torn
+// read/write occasionally produces a stale Q for one MCTS iteration, which
+// the tree corrects immediately through further visits.  Locking every probe
+// would cost more than the collision rate justifies.
+// ---------------------------------------------------------------------------
+
+struct MCTSEntry {
+    std::uint64_t key = 0;
+    std::int32_t  N   = 0;
+    float         Q   = 0.0f;
+};
+
+class MCTSTable {
+public:
+    MCTSTable() = default;
+    explicit MCTSTable(std::size_t mb_size) { resize(mb_size); }
+
+    void resize(std::size_t mb_size);
+    void clear();
+
+    // Returns true and fills `out` if `key` matches the stored entry.
+    bool probe(std::uint64_t key, MCTSEntry& out) const;
+
+    // Always writes; prefers higher-N entries when key matches.
+    void store(std::uint64_t key, std::int32_t N, float Q);
+
+private:
+    std::vector<MCTSEntry> table_;
+    std::size_t            mask_ = 0;
+};
+
+extern MCTSTable g_mcts_tt;
+
+// Minimum visit count in a TT entry before we trust it over a fresh NNUE eval.
+inline constexpr std::int32_t kMCTSTTMinN = 4;
+
 // W is stored as a fixed-point int64 (multiply real value by kWScale) so we
 // can fetch_add it atomically without relying on the still-uneven compiler
 // support for std::atomic<float>::fetch_add. 2^20 keeps us comfortably away

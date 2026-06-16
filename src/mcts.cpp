@@ -15,6 +15,42 @@
 
 namespace eclipse::mcts {
 
+// ---------------------------------------------------------------------------
+// MCTSTable implementation
+// ---------------------------------------------------------------------------
+
+MCTSTable g_mcts_tt(8);  // 8 MB default
+
+void MCTSTable::resize(std::size_t mb_size) {
+    std::size_t n = (mb_size * 1024 * 1024) / sizeof(MCTSEntry);
+    std::size_t p2 = 1;
+    while (p2 * 2 <= n) p2 *= 2;
+    table_.assign(p2, MCTSEntry{});
+    mask_ = p2 - 1;
+}
+
+void MCTSTable::clear() {
+    std::fill(table_.begin(), table_.end(), MCTSEntry{});
+}
+
+bool MCTSTable::probe(std::uint64_t key, MCTSEntry& out) const {
+    if (table_.empty()) return false;
+    const MCTSEntry& e = table_[key & mask_];
+    if (e.key != key || e.N <= 0) return false;
+    out = e;
+    return true;
+}
+
+void MCTSTable::store(std::uint64_t key, std::int32_t N, float Q) {
+    if (table_.empty()) return;
+    MCTSEntry& e = table_[key & mask_];
+    if (e.key != key || N > e.N) {
+        e.key = key;
+        e.N   = N;
+        e.Q   = Q;
+    }
+}
+
 // PUCT runtime knobs. Tunable via UCI Cpuct / FpuOffset.
 float g_cpuct      = 1.41f;
 float g_fpu_offset = 0.25f;
@@ -355,11 +391,13 @@ int MCTS::iterate_batch(int batch_size) {
 
     // Per-collected-leaf bookkeeping. One entry per selected path.
     struct Leaf {
-        Node*    path[kMaxPathLen];
-        int      path_len   = 0;
-        bool     needs_eval = false;  // true => value comes from the batch eval
-        float    value      = 0.0f;   // terminal/repetition value when !needs_eval
-        int      eval_idx   = -1;     // slot into the batch-eval input arrays
+        Node*         path[kMaxPathLen];
+        int           path_len   = 0;
+        bool          needs_eval = false;  // true => value comes from the batch eval
+        bool          is_rep     = false;  // true => draw by repetition; don't cache
+        float         value      = 0.0f;   // terminal/repetition value when !needs_eval
+        int           eval_idx   = -1;     // slot into the batch-eval input arrays
+        std::uint64_t leaf_key   = 0;      // Zobrist key of the leaf position
     };
 
     // Thread-local scratch so nothing large lands on the (512 KB on macOS)
@@ -439,9 +477,11 @@ int MCTS::iterate_batch(int batch_size) {
             if (is_repetition) break;
         }
         leaf.path_len = path_len;
+        leaf.leaf_key = keys[static_cast<std::size_t>(path_len - 1)];
 
         if (is_repetition) {
-            leaf.value = 0.0f;  // draw
+            leaf.value  = 0.0f;  // draw
+            leaf.is_rep = true;  // don't cache — value is history-dependent
         } else {
             {
                 std::unique_lock<std::mutex> lock(node->expand_mutex);
@@ -452,20 +492,30 @@ int MCTS::iterate_batch(int batch_size) {
             if (node->is_terminal) {
                 leaf.value = node->Q();
             } else {
-                // Queue for the batched NNUE eval. The accumulator is kept in
-                // sync incrementally by do_move, so the leaf position already
-                // carries a valid one — copy it out (pos is reused next path).
-                // Cold path (not yet computed, e.g. net loaded mid-game): fall
-                // back to the single-eval path which refreshes on demand.
-                nnue::Accumulator& acc = pos.accumulator();
-                if (acc.computed) {
-                    leaf.needs_eval = true;
-                    leaf.eval_idx   = n_eval;
-                    batch_accs[static_cast<std::size_t>(n_eval)] = acc;
-                    batch_stms[static_cast<std::size_t>(n_eval)] = pos.side_to_move();
-                    ++n_eval;
+                // Probe the MCTS TT first: if we've visited this position
+                // enough times before (same or different path), reuse the
+                // cached Q rather than spending an NNUE call.
+                MCTSEntry tt_hit;
+                if (g_mcts_tt.probe(leaf.leaf_key, tt_hit) &&
+                        tt_hit.N >= kMCTSTTMinN) {
+                    leaf.value = tt_hit.Q;
                 } else {
-                    leaf.value = evaluate_node(pos);
+                    // Queue for the batched NNUE eval. The accumulator is kept
+                    // in sync incrementally by do_move, so the leaf position
+                    // already carries a valid one — copy it out (pos is reused
+                    // next path). Cold path (not yet computed, e.g. net loaded
+                    // mid-game): fall back to the single-eval path which
+                    // refreshes on demand.
+                    nnue::Accumulator& acc = pos.accumulator();
+                    if (acc.computed) {
+                        leaf.needs_eval = true;
+                        leaf.eval_idx   = n_eval;
+                        batch_accs[static_cast<std::size_t>(n_eval)] = acc;
+                        batch_stms[static_cast<std::size_t>(n_eval)] = pos.side_to_move();
+                        ++n_eval;
+                    } else {
+                        leaf.value = evaluate_node(pos);
+                    }
                 }
             }
         }
@@ -501,6 +551,17 @@ int MCTS::iterate_batch(int batch_size) {
             n->N.fetch_add(1, std::memory_order_relaxed);
             n->W_fx.fetch_add(v_fx, std::memory_order_relaxed);
             v_fx = -v_fx;
+
+            // Write the leaf node into the MCTS TT so future paths to the
+            // same position inherit its accumulated stats.  Skip repetitions
+            // (value is history-dependent, not positional) and skip the root
+            // (key==0 bucket would be poisoned).  A higher-N existing entry
+            // is kept by MCTSTable::store.
+            if (i == leaf.path_len - 1 && !leaf.is_rep && leaf.leaf_key != 0) {
+                g_mcts_tt.store(leaf.leaf_key,
+                                n->N.load(std::memory_order_relaxed),
+                                n->Q());
+            }
         }
     }
 
