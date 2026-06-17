@@ -81,7 +81,7 @@ def _fen_to_features(fen: str):
     return (idx[0], idx[1]) if sc == 0 else (idx[1], idx[0])
 
 
-def _parse_line(line: str, cp_scale: float):
+def _parse_line(line: str, cp_scale: float, max_cp: float | None = None):
     line = line.strip()
     if not line or line.startswith('#'):
         return None
@@ -95,7 +95,10 @@ def _parse_line(line: str, cp_scale: float):
     elif len(parts) == 2:
         try:
             fen = parts[0].strip()
-            wp  = 1.0 / (1.0 + math.exp(-float(parts[1]) / cp_scale))
+            cp  = float(parts[1])
+            if max_cp is not None and abs(cp) > max_cp:
+                return None  # near-mate noise, ~0 gradient -- match notebook filter
+            wp  = 1.0 / (1.0 + math.exp(-cp / cp_scale))
         except ValueError:
             return None
     else:
@@ -124,10 +127,10 @@ _BATCH = 50_000   # lines per worker task
 
 def _process_batch(args: tuple) -> bytes:
     """Worker: parse a list of raw text lines, return packed binary bytes."""
-    lines, cp_scale = args
+    lines, cp_scale, max_cp = args
     recs = []
     for line in lines:
-        r = _parse_line(line, cp_scale)
+        r = _parse_line(line, cp_scale, max_cp)
         if r:
             recs.append(r)
     if not recs:
@@ -140,41 +143,69 @@ def _process_batch(args: tuple) -> bytes:
     return buf.tobytes()
 
 
-def _line_batches(path: Path, cp_scale: float):
-    """Yield (lines, cp_scale) batches, skipping blanks and comments."""
+def _line_batches(path: Path, cp_scale: float, skip_records: int = 0,
+                   max_cp: float | None = None, max_lines: int | None = None):
+    """Yield (lines, cp_scale, max_cp) batches.
+
+    Both `skip_records` and `max_lines` operate in INPUT-LINE space (data lines
+    after stripping blanks/comments), NOT in written-record space. This makes
+    chunks a clean, non-overlapping partition of the file even when the max_cp
+    filter drops lines: chunk i = data lines [i*max_lines, (i+1)*max_lines).
+    It also matches notebooks/eclipse_wdl_train.ipynb's _batches2 exactly, so a
+    premade chunk equals what the notebook would have produced live for that
+    chunk_idx. The cap is checked on full batches only, so max_lines should be a
+    multiple of _BATCH for an exact boundary (CHUNK_SIZE=100M is)."""
     opener = gzip.open if str(path).endswith('.gz') else open
     batch: list = []
+    skipped = 0
+    taken = 0
     with opener(path, 'rt', encoding='utf-8') as f:
         for line in f:
             s = line.strip()
-            if s and not s.startswith('#'):
-                batch.append(line)
-                if len(batch) == _BATCH:
-                    yield (batch, cp_scale)
-                    batch = []
+            if not s or s.startswith('#'):
+                continue
+            if skipped < skip_records:
+                skipped += 1
+                continue
+            batch.append(line)
+            if len(batch) == _BATCH:
+                yield (batch, cp_scale, max_cp)
+                taken += len(batch)
+                batch = []
+                if max_lines and taken >= max_lines:
+                    return
     if batch:
-        yield (batch, cp_scale)
+        yield (batch, cp_scale, max_cp)
 
 
 def preprocess(args) -> None:
     inp    = Path(args.data)
     out    = Path(args.out)
-    limit  = args.max_records
+    limit  = args.max_records          # cap in INPUT-LINE space (see _line_batches)
     cp     = args.cp_scale
 
     out.parent.mkdir(parents=True, exist_ok=True)
 
     size_gb_in = inp.stat().st_size / 1e9
-    est_out    = f'{limit * RECORD_SIZE / 1e9:.1f} GB' if limit else '?'
+    est_out    = f'≤ {limit * RECORD_SIZE / 1e9:.1f} GB' if limit else '?'
     print(f'input  : {inp}  ({size_gb_in:.2f} GB)')
-    print(f'output : {out}  (≤ {est_out})')
-    print(f'workers: {args.workers}   cp_scale: {cp}')
+    print(f'output : {out}  ({est_out})')
+    print(f'workers: {args.workers}   cp_scale: {cp}   max_cp: {args.max_cp}')
+    if args.skip_records:
+        print(f'skip   : {args.skip_records:,} lines')
     if limit:
-        print(f'max    : {limit:,} records')
+        print(f'max    : {limit:,} lines')
     print()
 
-    total = 0
+    total = 0          # records written (after max_cp filtering)
+    lines_consumed = 0  # data lines read post-skip (for EOF detection)
     t0    = time.time()
+
+    def _counting(gen):
+        nonlocal lines_consumed
+        for batch_tuple in gen:
+            lines_consumed += len(batch_tuple[0])
+            yield batch_tuple
 
     with open(out, 'wb') as fout:
         fout.write(MAGIC)
@@ -182,23 +213,18 @@ def preprocess(args) -> None:
 
         with mp.Pool(args.workers) as pool:
             for data in pool.imap(_process_batch,
-                                  _line_batches(inp, cp),
+                                  _counting(_line_batches(inp, cp, args.skip_records,
+                                                           args.max_cp, limit)),
                                   chunksize=args.workers):
                 if not data:
                     continue
                 n_rec = len(data) // RECORD_SIZE
-                if limit and total + n_rec > limit:
-                    keep  = limit - total
-                    data  = data[:keep * RECORD_SIZE]
-                    n_rec = keep
                 fout.write(data)
                 total += n_rec
                 elapsed = time.time() - t0
                 rate    = total / elapsed / 1_000 if elapsed else 0
                 gb_out  = total * RECORD_SIZE / 1e9
                 print(f'  {total:>12,}  {gb_out:.2f} GB  {rate:.0f}k pos/s', end='\r')
-                if limit and total >= limit:
-                    break
 
     # Write actual N to header
     with open(out, 'r+b') as f:
@@ -210,6 +236,10 @@ def preprocess(args) -> None:
     print(f'\ndone : {total:,} positions in {elapsed:.0f}s  '
           f'({total / elapsed / 1_000:.0f}k pos/s)')
     print(f'file : {out}  ({gb_out:.2f} GB)')
+    # Machine-readable summary for orchestrators: lines_consumed < requested
+    # max-records means EOF was reached (this is the final partial chunk).
+    print(f'SUMMARY records={total} lines_consumed={lines_consumed} '
+          f'requested_lines={limit if limit else 0}')
     print(f'\nnow run:  python scripts/train_halfkav2.py --data {out} ...')
 
 
@@ -224,8 +254,17 @@ def main() -> None:
                    help='output binary file (.bin)')
     p.add_argument('--max-records', type=int,  default=None,
                    help='cap on positions written (e.g. 140_000_000 ≈ 18 GB)')
+    p.add_argument('--skip-records', type=int, default=0,
+                   help='skip this many data lines before writing -- use to '
+                        'produce sequential chunks across multiple runs, e.g. '
+                        '--skip-records 100_000_000 --max-records 100_000_000 '
+                        'for chunk 1.')
     p.add_argument('--workers',     type=int,  default=4)
     p.add_argument('--cp-scale',    type=float, default=410.0)
+    p.add_argument('--max-cp',      type=float, default=None,
+                   help='drop positions with |cp| above this (near-mate noise '
+                        'filter). Match whatever the consuming trainer uses, '
+                        'e.g. 4000 for notebooks/eclipse_wdl_train.ipynb.')
     preprocess(p.parse_args())
 
 

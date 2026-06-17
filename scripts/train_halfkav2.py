@@ -489,6 +489,18 @@ class HalfKAv2Net(nn.Module):
         sd["l3.bias"]   = self.l3.bias.detach()
         return sd
 
+    def load_exported_state_dict(self, sd: dict) -> None:
+        """Inverse of export_state_dict_for_quantization: restores a checkpoint
+        saved in the exported (Linear-style, padding row dropped) layout into
+        this module's native nn.Embedding layout, for resuming training."""
+        with torch.no_grad():
+            self.ft.weight[:FT_IN_FEATURES].copy_(sd["ft.weight"].T)
+            self.ft.weight[FT_IN_FEATURES].zero_()
+            self.ft_bias.copy_(sd["ft.bias"])
+            self.l1.weight.copy_(sd["l1.weight"]); self.l1.bias.copy_(sd["l1.bias"])
+            self.l2.weight.copy_(sd["l2.weight"]); self.l2.bias.copy_(sd["l2.bias"])
+            self.l3.weight.copy_(sd["l3.weight"]); self.l3.bias.copy_(sd["l3.bias"])
+
 
 # ---------------------------------------------------------------------------
 # Training loop
@@ -527,6 +539,9 @@ def _is_binary(path: Path) -> bool:
 def train(args):
     device = pick_device(args.device)
     print(f"training on {device}")
+    if device.type == "cpu" and args.threads:
+        torch.set_num_threads(args.threads)
+        print(f"cpu intra-op threads: {args.threads}")
 
     out_pt = Path(args.out)
     out_pt.parent.mkdir(parents=True, exist_ok=True)
@@ -545,43 +560,68 @@ def train(args):
         val_ds = HalfKAv2Dataset(args.data, max_lines=args.val_size, cp_scale=args.cp_scale)
         n_val  = len(val_ds)
 
-        # Train: stream all remaining positions with a reservoir shuffle buffer.
-        train_ds = HalfKAv2StreamDataset(
-            args.data,
-            skip_lines=n_val,
-            max_lines=args.max_lines,
-            cp_scale=args.cp_scale,
-            shuffle_buffer=args.shuffle_buffer,
-        )
+        # Train: stream remaining positions with a reservoir shuffle buffer.
+        # Per-epoch dataset is (re)built in make_epoch_train_loader below so
+        # each epoch advances to a new slice of the file when --max-lines is set.
         suffix = f" (max {args.max_lines:,}/epoch)" if args.max_lines else ""
         print(f"val: {n_val:,} positions (in memory)  train: streaming{suffix}")
         shuffle_train = False
 
     nw = args.num_workers
-    loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=shuffle_train,
-        num_workers=nw,
-        collate_fn=collate,
-        drop_last=True,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=(nw > 0),
-        prefetch_factor=(4 if nw > 0 else None),
-    )
+
+    def make_loader(ds, shuffle):
+        return DataLoader(
+            ds,
+            batch_size=args.batch_size,
+            shuffle=shuffle,
+            num_workers=nw,
+            collate_fn=collate,
+            drop_last=True,
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=(nw > 0),
+            prefetch_factor=(4 if nw > 0 else None),
+        )
+
+    # For the streaming path with --max-lines set, each epoch must read a
+    # NEW slice of the file, not the same skip_lines..skip_lines+max_lines
+    # window every time (StreamDataset.__iter__ re-opens the file from
+    # scratch on every DataLoader iteration, so without advancing skip_lines
+    # per epoch, every "epoch" would silently retrain on the same chunk).
+    def make_epoch_train_loader(epoch: int):
+        if use_binary:
+            return make_loader(train_ds, shuffle_train)
+        chunk = args.max_lines or 0
+        ds = HalfKAv2StreamDataset(
+            args.data,
+            skip_lines=n_val + epoch * chunk,
+            max_lines=args.max_lines,
+            cp_scale=args.cp_scale,
+            shuffle_buffer=args.shuffle_buffer,
+        )
+        return make_loader(ds, shuffle_train)
+
+    loader = make_epoch_train_loader(0)
+    val_nw = nw // 2 if nw > 0 else 0
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=max(1, nw // 2),
+        num_workers=val_nw,
         collate_fn=collate,
         drop_last=False,
         pin_memory=(device.type == "cuda"),
-        persistent_workers=True,
-        prefetch_factor=4,
+        persistent_workers=(val_nw > 0),
+        prefetch_factor=(4 if val_nw > 0 else None),
     )
 
     net = HalfKAv2Net().to(device)
+    if args.resume:
+        print(f"resuming weights from {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device)
+        if "ft_bias" in ckpt:
+            net.load_state_dict(ckpt)
+        else:
+            net.load_exported_state_dict(ckpt)
     # Weight decay (L2 regularization) helps prevent overfitting in the larger network.
     opt = torch.optim.Adam(net.parameters(), lr=args.lr, weight_decay=1e-4)
     # Cosine annealing schedule with a linear warmup. Warmup helps when
@@ -596,6 +636,8 @@ def train(args):
 
     step = 0
     for epoch in range(args.epochs):
+        if epoch > 0:
+            loader = make_epoch_train_loader(epoch)
         net.train()
         epoch_loss = 0.0
         nbatch = 0
@@ -687,6 +729,14 @@ def main():
     p.add_argument("--cp-scale", type=float, default=410.0,
                    help="sigmoid scale; also written as output_cp_per_unit "
                         "in the .nnue header. Keep the two consistent.")
+    p.add_argument("--resume", type=Path, default=None,
+                   help="path to a raw float32 state_dict (.pt) to load weights from "
+                        "before training (e.g. a checkpoint saved by a previous run). "
+                        "Optimizer/scheduler state is not restored — Adam moments "
+                        "restart fresh.")
+    p.add_argument("--threads", type=int, default=None,
+                   help="CPU intra-op thread count (torch.set_num_threads); ignored "
+                        "on mps/cuda. Leave unset to use torch's default.")
     p.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto",
                    help="compute device. auto = prefer cuda > mps > cpu. "
                         "On Apple Silicon, 'mps' uses Metal; if you see NaNs "
