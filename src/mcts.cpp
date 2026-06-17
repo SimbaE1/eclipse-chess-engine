@@ -8,6 +8,8 @@
 #include <thread>
 #include <vector>
 
+#include <new>
+
 #include "bitboard.hpp"
 #include "eval.hpp"
 #include "movegen.hpp"
@@ -16,6 +18,140 @@
 #include "syzygy.hpp"
 
 namespace eclipse::mcts {
+
+// ---------------------------------------------------------------------------
+// Node pool
+//
+// Every MCTS expansion allocates one Node per legal move (~35). With the system
+// allocator this was, at 4 threads, contending in nanov2 as heavily as the
+// whole NNUE forward pass — the per-Node malloc/free lock was the dominant
+// limiter on multi-thread scaling.
+//
+// Key invariant that makes a simple pool correct here: during the parallel
+// search the tree only GROWS (workers only allocate); Nodes are freed only at
+// teardown between moves, which runs single-threaded on the UCI dispatch thread
+// (root reassignment, save_to_cache, cached-tree replacement). So:
+//   * allocation (hot, multi-threaded) is served from a per-thread magazine and
+//     only touches the global lock once per kMagBatch allocations, and
+//   * deallocation (cold, single-threaded) pushes straight to the global free
+//     list under an uncontended lock.
+// Freed slots are recycled across searches, so steady-state memory is bounded
+// by the peak live node count, not the cumulative allocation count.
+//
+// The free list is intrusive: a free slot's storage holds the `next` pointer
+// (safe because the Node has been destroyed and sizeof(Node) >> sizeof(void*)).
+// ---------------------------------------------------------------------------
+namespace {
+
+class NodePool {
+public:
+    Node* alloc() {
+        Mag& mag = magazine();
+        if (mag.count == 0) refill(mag);
+        return mag.slots[--mag.count];
+    }
+
+    void free(Node* n) noexcept {
+        std::lock_guard<std::mutex> lk(mutex_);
+        push_locked(n);
+    }
+
+    // Return a thread's leftover magazine slots to the global free list. Called
+    // from the magazine's destructor when a worker thread exits, so the slots a
+    // worker pre-fetched but never used are not lost when its thread joins.
+    void drain(Node** slots, int count) noexcept {
+        if (count <= 0) return;
+        std::lock_guard<std::mutex> lk(mutex_);
+        for (int i = 0; i < count; ++i) push_locked(slots[i]);
+    }
+
+private:
+    static constexpr int         kMagBatch = 256;    // slots fetched per refill
+    static constexpr std::size_t kSlab     = 8192;   // Nodes per slab grow
+
+    struct Mag {
+        Node*    slots[kMagBatch];
+        int      count = 0;
+        NodePool* pool = nullptr;
+        ~Mag() { if (pool) pool->drain(slots, count); }
+    };
+
+    static Mag& magazine() {
+        static thread_local Mag mag;
+        mag.pool = &instance();
+        return mag;
+    }
+
+    // free_head_ is guarded by mutex_; intrusive next stored in the slot.
+    static Node*& next_of(Node* n) noexcept {
+        return *reinterpret_cast<Node**>(n);
+    }
+    void push_locked(Node* n) noexcept {
+        next_of(n) = free_head_;
+        free_head_ = n;
+    }
+
+    // Fill `mag` with up to kMagBatch slots. Recycled nodes (freed at a previous
+    // teardown) are drained from the intrusive free list first; the rest are
+    // bump-allocated as a contiguous run from the current slab. Both paths are
+    // O(slots) with no per-node pointer chasing through cold memory while the
+    // lock is held — the slab grow itself is O(1) (one allocation + a pointer
+    // reset), which is what keeps the critical section short under 4 threads.
+    void refill(Mag& mag) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        int got = 0;
+        while (got < kMagBatch && free_head_) {
+            Node* n = free_head_;
+            free_head_ = next_of(n);
+            mag.slots[got++] = n;
+        }
+        while (got < kMagBatch) {
+            if (slab_used_ == kSlab) new_slab_locked();
+            mag.slots[got++] = reinterpret_cast<Node*>(
+                slab_base_ + (slab_used_++) * sizeof(Node));
+        }
+        mag.count = got;
+    }
+
+    void new_slab_locked() {
+        void* raw = ::operator new(kSlab * sizeof(Node),
+                                   std::align_val_t{alignof(Node)});
+        slabs_.push_back(raw);
+        slab_base_ = static_cast<std::byte*>(raw);
+        slab_used_ = 0;
+    }
+
+public:
+    static NodePool& instance() {
+        // Deliberately leaked: thread_local magazine destructors can run during
+        // process-exit static teardown and call drain() on the pool. A normal
+        // function-local static could be destroyed first (unspecified order),
+        // leaving them to lock a dead mutex. Leaking sidesteps the fiasco; the
+        // OS reclaims the slabs at exit anyway.
+        static NodePool* pool = new NodePool();
+        return *pool;
+    }
+
+private:
+    std::mutex          mutex_;
+    Node*               free_head_ = nullptr;     // recycled nodes (intrusive list)
+    std::byte*          slab_base_ = nullptr;     // current bump slab
+    std::size_t         slab_used_ = kSlab;       // forces a slab alloc on first use
+    std::vector<void*>  slabs_;  // owned raw storage; freed at process exit
+};
+
+}  // namespace
+
+NodePtr make_node(Move m, Node* parent, float prior) noexcept {
+    Node* raw = NodePool::instance().alloc();
+    return NodePtr(::new (raw) Node(m, parent, prior));
+}
+
+void NodeDeleter::operator()(Node* n) const noexcept {
+    if (!n) return;
+    n->~Node();
+    NodePool::instance().free(n);
+}
 
 // ---------------------------------------------------------------------------
 // MCTSTable implementation
@@ -69,12 +205,12 @@ inline constexpr int kMaxPathLen   = 256;
 // Tree reuse cache: survives across MCTS instances so the next search can pick
 // up where the last one left off. Saved by save_to_cache(), consumed by
 // try_find_subtree(). Guarded by single-threaded UCI dispatch.
-static std::unique_ptr<Node>     s_cached_root;
+static NodePtr                   s_cached_root;
 static std::unique_ptr<Position> s_cached_pos;
 
 // Walk the cached tree up to 2 plies to find the subtree rooted at `target`.
 // Returns the matching node (with parent nulled) or nullptr.
-static std::unique_ptr<Node> try_find_subtree(const Position& target_pos) {
+static NodePtr try_find_subtree(const Position& target_pos) {
     if (!s_cached_root || !s_cached_pos) return nullptr;
     const std::uint64_t target = target_pos.key();
 
@@ -158,14 +294,14 @@ void MCTS::run() {
     // Try to reuse the subtree from the previous search. If the opponent
     // played the move we predicted (or we're pondering the same position),
     // we inherit all accumulated visits instead of rebuilding from scratch.
-    std::unique_ptr<Node> reused = try_find_subtree(root_pos);
+    NodePtr reused = try_find_subtree(root_pos);
     if (reused) {
         root = std::move(reused);
         const auto cached_n = root->N.load(std::memory_order_relaxed);
         std::cout << "info string tree-reuse: " << cached_n
                   << " cached visits inherited" << std::endl;
     } else {
-        root = std::make_unique<Node>(MoveNone, nullptr, 1.0f);
+        root = make_node(MoveNone, nullptr, 1.0f);
         // Root expansion is single-threaded so workers see a populated child
         // list before they start traversing. Done under the (uncontested) root
         // mutex for symmetry with deeper expansion.
@@ -610,12 +746,17 @@ int MCTS::iterate_batch(int batch_size) {
     return n_leaves;
 }
 
-void MCTS::expand_under_lock(Node* node, const Position& pos) {
+void MCTS::expand_under_lock(Node* node, Position& pos) {
     if (node->is_expanded.load(std::memory_order_acquire)) return;  // double-checked
 
+    // generate_legal_moves do/undo-moves in place and restores `pos` exactly
+    // (board, key, AND accumulator — legality testing runs with update_acc off),
+    // so we can run it directly on the caller's position instead of copying it.
+    // `pos` is always the worker's thread-local descent position, so this
+    // in-place mutate-then-restore is race-free. Saves a ~4.5 KB Position copy
+    // (dominated by the NNUE accumulator) on every expansion.
     MoveList moves;
-    Position temp_pos = pos;
-    generate_legal_moves(temp_pos, moves);
+    generate_legal_moves(pos, moves);
 
     // 50-move rule: if halfmove clock reached 100, it's a draw regardless
     // of whether there are legal moves (unless the position is checkmate,
@@ -700,7 +841,7 @@ void MCTS::expand_under_lock(Node* node, const Position& pos) {
         const float p = (sum_p > 1e-6f)
             ? priors_buf[i] / sum_p
             : 1.0f / static_cast<float>(n_moves);
-        node->children.push_back(std::make_unique<Node>(moves[static_cast<std::size_t>(i)], node, p));
+        node->children.push_back(make_node(moves[static_cast<std::size_t>(i)], node, p));
     }
 
     // Release ordering ensures other threads that acquire-load is_expanded

@@ -71,10 +71,26 @@ inline constexpr int64_t kWScale = 1LL << kWShift;
 extern float g_cpuct;        // exploration coefficient
 extern float g_fpu_offset;   // First-Play Urgency discount on parent_q for unvisited children
 
+struct Node;
+
+// Nodes are allocated from a pool (see mcts.cpp) rather than the general heap.
+// At 4 threads, per-node malloc/free was contending in the system allocator as
+// heavily as the NNUE inference itself (every expansion allocates one Node per
+// legal move). NodePtr is a unique_ptr with a deleter that returns the slot to
+// the pool, so all existing ownership/move semantics (tree reuse, std::move of
+// subtrees) keep working unchanged.
+struct NodeDeleter {
+    void operator()(Node* n) const noexcept;
+};
+using NodePtr = std::unique_ptr<Node, NodeDeleter>;
+
+// Construct a pooled Node. Drop-in replacement for std::make_unique<Node>.
+NodePtr make_node(Move m, Node* parent, float prior) noexcept;
+
 struct Node {
     Move  move   = MoveNone;
     Node* parent = nullptr;
-    std::vector<std::unique_ptr<Node>> children;
+    std::vector<NodePtr> children;
 
     // -- Lockless state ------------------------------------------------------
     // N, W, virtual_loss are mutated by backpropagate() and read by select()
@@ -190,13 +206,13 @@ private:
     // added). Batching amortizes the L1 weight-matrix memory traffic — the
     // dominant NNUE cost — across several leaves per pass.
     int    iterate_batch(int batch_size);
-    void   expand_under_lock(Node* node, const Position& pos);
+    void   expand_under_lock(Node* node, Position& pos);
     float  evaluate_node(const Position& pos);
     void   log_search_summary(const Node& chosen, std::int32_t chosen_visits) const;
 
     Position&   root_pos;
     SearchInfo& search_info;
-    std::unique_ptr<Node> root;
+    NodePtr root;
     std::atomic<int> max_depth_seen{0};
 };
 
