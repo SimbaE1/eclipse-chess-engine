@@ -90,8 +90,11 @@ void cmd_uci() {
               << "option name MctsHash type spin default 64 min 1 max 65536\n"
               << "option name OverrideMargin type spin default 50 min 0 max 1000\n"
               << "option name AbThreads type spin default 1 min 0 max 128\n"
-              << "option name Cpuct type string default 1.41\n"
-              << "option name FpuOffset type string default 0.25\n"
+              << "option name Cpuct type string default 1.70\n"
+              << "option name FpuOffset type string default 0.20\n"
+              << "option name PolicyDepth type spin default 2 min -1 max 64\n"
+              << "option name SelectVisitFrac type string default 0.60\n"
+              << "option name SelectQMargin type string default 0.02\n"
               << "option name Ponder type check default true\n"
               << "option name UCI_Ponder type check default true\n"
               << "option name SyzygyPath type string default <empty>\n"
@@ -153,6 +156,18 @@ void cmd_setoption(const std::vector<std::string>& tok) {
         char* end = nullptr;
         const float f = std::strtof(value.c_str(), &end);
         if (end != value.c_str() && f > -1.0f && f < 2.0f) mcts::g_fpu_offset = f;
+    } else if (name == "PolicyDepth") {
+        // Plies from the root that get NNUE-scored policy priors (-1 disables).
+        const int n = std::atoi(value.c_str());
+        if (n >= -1 && n <= 64) mcts::g_policy_depth = n;
+    } else if (name == "SelectVisitFrac") {
+        char* end = nullptr;
+        const float f = std::strtof(value.c_str(), &end);
+        if (end != value.c_str() && f >= 0.0f && f <= 1.0f) mcts::g_select_visit_frac = f;
+    } else if (name == "SelectQMargin") {
+        char* end = nullptr;
+        const float f = std::strtof(value.c_str(), &end);
+        if (end != value.c_str() && f >= 0.0f && f < 2.0f) mcts::g_select_q_margin = f;
     } else if (name == "SyzygyPath") {
         syzygy::init(value);
     }

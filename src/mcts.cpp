@@ -189,9 +189,35 @@ void MCTSTable::store(std::uint64_t key, std::int32_t N, float Q) {
     }
 }
 
-// PUCT runtime knobs. Tunable via UCI Cpuct / FpuOffset.
-float g_cpuct      = 1.41f;
-float g_fpu_offset = 0.25f;
+// PUCT runtime knobs. Tunable via UCI Cpuct / FpuOffset. Cpuct is bumped above
+// the old 1.41 to widen exploration: the engine had been pouring ~98% of root
+// visits into one early-favored move and missing the refutation of it. FpuOffset
+// is the First-Play-Urgency discount on a parent's Q for its unvisited children;
+// a smaller value makes untried moves look less pessimistic, so more of them get
+// at least one look.
+float g_cpuct      = 1.70f;
+float g_fpu_offset = 0.20f;
+
+// Final root-move selection (UCI SelectVisitFrac / SelectQMargin). Among root
+// children with at least g_select_visit_frac * max_visits visits, pick the one
+// with the best value for us (lowest child Q) instead of blindly the most
+// visited. The visit filter keeps Q trustworthy; this only overrides raw visit
+// count when a well-explored sibling is genuinely better, so it is a safety net
+// against a move whose value collapsed late while it still led on visits.
+// frac >= 1.0 reduces to pure most-visited selection.
+float g_select_visit_frac = 0.60f;
+float g_select_q_margin   = 0.02f;  // Q units (~6 cp); near-ties go to more visits
+
+// NNUE-informed policy priors (UCI PolicyDepth). At expansions within this many
+// plies of the root, score every child with the value net (one batched forward
+// pass) and softmax the results into priors, instead of the cheap-but-tactically
+// blind MVV-LVA/SEE heuristic. This is where the engine decides which moves are
+// worth investigating, so accuracy near the top matters most; it is depth-gated
+// because doing it at every node would cut NPS hard. -1 disables (heuristic
+// everywhere); 0 = root only. Default 2 covers the root, its replies, and their
+// replies — enough to surface tactical refutations of root moves — at only ~2%
+// NPS cost; the cost explodes past depth 2 as the node count grows ~35x/ply.
+int   g_policy_depth = 2;
 
 // MCTS leaf-batch size. Each worker collects this many leaves (kept apart by
 // virtual loss), evaluates them in a single nnue::evaluate_batch call, and
@@ -307,7 +333,7 @@ void MCTS::run() {
         // mutex for symmetry with deeper expansion.
         {
             std::lock_guard<std::mutex> lock(root->expand_mutex);
-            expand_under_lock(root.get(), root_pos);
+            expand_under_lock(root.get(), root_pos, 0);
         }
     }
 
@@ -431,13 +457,26 @@ void MCTS::adjust_root_q(Move m, Score s) {
 Move MCTS::get_best_move() {
     if (search_info.best_move != MoveNone) return search_info.best_move;
 
+    std::int32_t max_n = 0;
+    for (const auto& child : root->children)
+        max_n = std::max(max_n, child->N.load(std::memory_order_relaxed));
+    const std::int32_t thresh = static_cast<std::int32_t>(
+        g_select_visit_frac * static_cast<float>(max_n));
+
     Node* best_child = nullptr;
     for (const auto& child : root->children) {
-        if (!best_child) { best_child = child.get(); continue; }
         const auto cn = child->N.load(std::memory_order_relaxed);
-        const auto bn = best_child->N.load(std::memory_order_relaxed);
-        // Best move = most-visited root child. Tie-broken by Q.
-        if (cn > bn || (cn == bn && child->Q() < best_child->Q())) {
+        // Only "seriously explored" children compete on value; this keeps Q
+        // trustworthy and reduces to most-visited when frac is high.
+        if (cn == 0 || cn < thresh) continue;
+        if (!best_child) { best_child = child.get(); continue; }
+        // Lower child Q == better for us (child Q is from the opponent's POV).
+        // Prefer clearly-better value; on a near-tie prefer the more-visited.
+        const float cq = child->Q();
+        const float bq = best_child->Q();
+        const auto  bn = best_child->N.load(std::memory_order_relaxed);
+        if (cq < bq - g_select_q_margin ||
+            (cq <= bq + g_select_q_margin && cn > bn)) {
             best_child = child.get();
         }
     }
@@ -664,7 +703,8 @@ int MCTS::iterate_batch(int batch_size) {
             {
                 std::unique_lock<std::mutex> lock(node->expand_mutex);
                 if (!node->is_expanded.load(std::memory_order_acquire) && !node->is_terminal) {
-                    expand_under_lock(node, pos);
+                    // depth of the leaf being expanded: root is path index 0.
+                    expand_under_lock(node, pos, path_len - 1);
                 }
             }
             if (node->is_terminal) {
@@ -746,7 +786,7 @@ int MCTS::iterate_batch(int batch_size) {
     return n_leaves;
 }
 
-void MCTS::expand_under_lock(Node* node, Position& pos) {
+void MCTS::expand_under_lock(Node* node, Position& pos, int depth) {
     if (node->is_expanded.load(std::memory_order_acquire)) return;  // double-checked
 
     // generate_legal_moves do/undo-moves in place and restores `pos` exactly
@@ -834,6 +874,49 @@ void MCTS::expand_under_lock(Node* node, Position& pos) {
 
         priors_buf[i] = p;
         sum_p += p;
+    }
+
+    // NNUE-informed priors near the top of the tree. The heuristic priors above
+    // are cheap but tactically blind: they can't tell that a sortie gets trapped
+    // (which lost us a piece vs stash17 — 9.Nb5 ... 12.Na3 allowing ...Nxc3).
+    // For the high-stakes decisions close to the root, replace them by scoring
+    // every child with the value net in one batched forward pass and softmaxing
+    // the results, so PUCT spends its visits on the moves the net actually likes.
+    // Depth-gated via g_policy_depth because doing this at every node tanks NPS.
+    // Requires a live, computed accumulator on `pos` (true on the descent path);
+    // do_move maintains it incrementally and undo_move restores it.
+    if (g_policy_depth >= 0 && depth <= g_policy_depth && n_moves <= 256 &&
+        nnue::is_loaded() && pos.accumulator().computed) {
+        static thread_local std::vector<nnue::Accumulator> p_accs;
+        static thread_local std::vector<Color>             p_stms;
+        static thread_local std::vector<Score>             p_scores;
+        if (static_cast<int>(p_accs.size()) < n_moves) {
+            p_accs.resize(static_cast<std::size_t>(n_moves));
+            p_stms.resize(static_cast<std::size_t>(n_moves));
+            p_scores.resize(static_cast<std::size_t>(n_moves));
+        }
+        StateInfo pst;
+        for (int i = 0; i < n_moves; ++i) {
+            pos.do_move(moves[static_cast<std::size_t>(i)], pst);  // updates+snapshots acc
+            p_accs[static_cast<std::size_t>(i)] = pos.accumulator();
+            p_stms[static_cast<std::size_t>(i)] = pos.side_to_move();
+            pos.undo_move(moves[static_cast<std::size_t>(i)], pst);
+        }
+        nnue::evaluate_batch(p_accs.data(), p_stms.data(), p_scores.data(), n_moves);
+        // p_scores[i] is cp from the child's side to move (our opponent); our
+        // value is its negation. Stable softmax with a cp temperature.
+        static constexpr float kPolicyTemp = 150.0f;
+        float max_v = -1e30f;
+        for (int i = 0; i < n_moves; ++i) {
+            const float v = -static_cast<float>(p_scores[static_cast<std::size_t>(i)]);
+            priors_buf[i] = v;
+            if (v > max_v) max_v = v;
+        }
+        sum_p = 0.0f;
+        for (int i = 0; i < n_moves; ++i) {
+            priors_buf[i] = std::exp((priors_buf[i] - max_v) / kPolicyTemp);
+            sum_p += priors_buf[i];
+        }
     }
 
     node->children.reserve(static_cast<std::size_t>(n_moves));

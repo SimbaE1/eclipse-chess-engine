@@ -70,6 +70,9 @@ inline constexpr int64_t kWScale = 1LL << kWShift;
 // as float globals rather than going through a SearchInfo pointer.
 extern float g_cpuct;        // exploration coefficient
 extern float g_fpu_offset;   // First-Play Urgency discount on parent_q for unvisited children
+extern float g_select_visit_frac;  // visit-fraction gate for value-aware final move selection
+extern float g_select_q_margin;    // Q margin below which selection prefers more visits
+extern int   g_policy_depth;       // plies from root that get NNUE-scored policy priors
 
 struct Node;
 
@@ -206,7 +209,7 @@ private:
     // added). Batching amortizes the L1 weight-matrix memory traffic — the
     // dominant NNUE cost — across several leaves per pass.
     int    iterate_batch(int batch_size);
-    void   expand_under_lock(Node* node, Position& pos);
+    void   expand_under_lock(Node* node, Position& pos, int depth);
     float  evaluate_node(const Position& pos);
     void   log_search_summary(const Node& chosen, std::int32_t chosen_visits) const;
 
