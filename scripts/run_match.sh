@@ -36,7 +36,7 @@ CUTECHESS="${CUTECHESS:-/Users/ezra/cutechess/cutechess/build/cutechess-cli}"
 NET1=""; NET2=""; NAME1="net1"; NAME2="net2"
 TC="5+3"; NODES=""; GAMES=20; THREADS=4; ABTHREADS=1; HASH=256
 SYZYGY="${SYZYGY:-/Users/ezra/syzygy}"
-CONCURRENCY=1; PONDER=1; BOOK=""; PGN=""; DEBUG=0; DRY_RUN=0
+CONCURRENCY=1; PONDER=1; BOOK=""; PGN=""; DEBUG=0; DRY_RUN=0; TB_ADJUDICATE=0; TBPIECES=5
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -55,6 +55,8 @@ while [ $# -gt 0 ]; do
     --book)        BOOK=$2; shift 2;;
     --pgn)         PGN=$2; shift 2;;
     --no-ponder)   PONDER=0; shift;;
+    --tb)          TB_ADJUDICATE=1; shift;;
+    --tbpieces)    TBPIECES=$2; shift 2;;
     --debug)       DEBUG=1; shift;;
     --dry-run)     DRY_RUN=1; shift;;
     *) echo "unknown arg: $1" >&2; exit 2;;
@@ -97,6 +99,11 @@ if [ -n "$BOOK" ]; then
   echo "opening book : $BOOK (imbalanced; color-reversed via -repeat)"
 else
   echo "opening book : none (startpos) -- expect many draws between near-equal nets"
+fi
+if [ "$TB_ADJUDICATE" = 1 ]; then
+  [ -d "$SYZYGY" ] || { echo "syzygy path not found for -tb adjudication: $SYZYGY" >&2; exit 1; }
+  ARGS+=(-tb "$SYZYGY" -tbpieces "$TBPIECES")
+  echo "tb adjudicate: $SYZYGY (<= $TBPIECES pieces)"
 fi
 [ "$DEBUG" = 1 ] && ARGS+=(-debug)
 
