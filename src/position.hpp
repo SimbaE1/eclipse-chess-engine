@@ -83,8 +83,26 @@ public:
     }
 
     // ---- mutators -------------------------------------------------------------
-    void do_move  (Move m, StateInfo& st);
-    void undo_move(Move m, const StateInfo& st);
+    // `snapshot_acc` controls whether the 4 KB pre-move NNUE accumulator is
+    // copied into `st` for undo_move to restore later. Pass false ONLY when the
+    // caller will never undo this move (e.g. the MCTS descent, which replays
+    // from a fresh root copy each path). Skipping the snapshot avoids a 4 KB
+    // memcpy per ply — a measurable chunk of MCTS time. undo_move() MUST NOT be
+    // called for a move done with snapshot_acc=false (unless update_acc was also
+    // false; see below).
+    //
+    // `update_acc` controls whether the incremental NNUE accumulator is
+    // maintained at all. Pass false for make/unmake pairs that only inspect
+    // board geometry and never evaluate — above all legality testing in
+    // generate_legal_moves, which do_move/undo_moves every pseudo-legal move
+    // just to check king safety. With update_acc=false the accumulator is left
+    // completely untouched, so the matching undo_move must pass
+    // restore_acc=false (there is nothing to roll back). This removes the
+    // per-pseudo-move FT update (apply_piece / refresh_perspective) AND both the
+    // snapshot and restore memcpys — the dominant cost of expansion.
+    void do_move  (Move m, StateInfo& st, bool snapshot_acc = true,
+                   bool update_acc = true);
+    void undo_move(Move m, const StateInfo& st, bool restore_acc = true);
     void do_null_move  (StateInfo& st);
     void undo_null_move(const StateInfo& st);
 

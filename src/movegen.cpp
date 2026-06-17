@@ -198,14 +198,19 @@ void generate_legal_moves(Position& pos, MoveList& out) {
 
     StateInfo st;
     for (const Move m : pseudo) {
-        pos.do_move(m, st);
+        // Legality only inspects board geometry (king safety), so skip the NNUE
+        // accumulator entirely: no snapshot, no incremental FT update, no
+        // restore. Without this, every pseudo-legal move would do/undo three
+        // 4 KB accumulator memcpys plus a full feature-transformer update — the
+        // dominant cost of node expansion, all of it discarded.
+        pos.do_move(m, st, /*snapshot_acc=*/false, /*update_acc=*/false);
         // After do_move, side_to_move has flipped. Our king is the king of
         // the side that just moved; it must not be attacked by the side now
         // on the move.
         const Color   us       = ~pos.side_to_move();
         const Square  king_sq  = pos.king_square(us);
         const bool    legal    = !pos.is_square_attacked(king_sq, ~us);
-        pos.undo_move(m, st);
+        pos.undo_move(m, st, /*restore_acc=*/false);
         if (legal) out.push(m);
     }
 }

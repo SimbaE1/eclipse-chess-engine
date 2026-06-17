@@ -304,7 +304,7 @@ Bitboard Position::attackers_to(Square s, Bitboard occ) const noexcept {
          | (king_attacks(s)        & (pieces(White, King)   | pieces(Black, King)));
 }
 
-void Position::do_move(Move m, StateInfo& st) {
+void Position::do_move(Move m, StateInfo& st, bool snapshot_acc, bool update_acc) {
     using namespace zobrist;
 
     const Square     from = m.from();
@@ -324,10 +324,10 @@ void Position::do_move(Move m, StateInfo& st) {
                          ? make_piece(them, Pawn)
                          : board_[to];
     // Snapshot the pre-move accumulator so undo_move can restore it without
-    // a full refresh. Unconditional copy keeps the do/undo symmetry simple
-    // even when the network has not been loaded (acc_.computed=false carries
-    // through the snapshot too).
-    st.accumulator = acc_;
+    // a full refresh. Skipped when the caller guarantees it will never undo
+    // (snapshot_acc=false, e.g. the MCTS descent) — that 4 KB copy per ply is
+    // otherwise pure waste there.
+    if (snapshot_acc) st.accumulator = acc_;
 
     // The castling-rights hash key uses the full 4-bit mask, so we XOR out
     // the old value here and XOR in the new one at the bottom of this fn.
@@ -386,10 +386,38 @@ void Position::do_move(Move m, StateInfo& st) {
     // king has NOT moved in any branch other than the full-refresh ones.
     // We skip work entirely when acc_.computed is false - either the network
     // is not loaded or evaluate() will lazy-refresh on first call.
-    if (acc_.computed) {
+    if (update_acc && acc_.computed) {
         const bool king_moved = (moving_pt == King) || (mt == Move::Castling);
         if (king_moved) {
-            nnue::refresh(*this, acc_);
+            // Only the moving side's perspective is reindexed by the new king
+            // square, so it needs a full rebuild. The other perspective is
+            // indexed by the stationary opposite king — there, the only changed
+            // features are the moved king (and the rook on castling, plus any
+            // captured piece), which we patch in incrementally. Halves the
+            // king-move FT cost vs refreshing both sides.
+            const int moved = (us == White) ? 0 : 1;
+            const int other = moved ^ 1;
+            nnue::refresh_perspective(*this, acc_, moved);
+            if (mt == Move::Castling) {
+                const bool kingside = (to > from);
+                const Square rook_from = kingside
+                    ? make_square(FileH, rank_of(from))
+                    : make_square(FileA, rank_of(from));
+                const Square rook_to = kingside
+                    ? Square(static_cast<int>(to) - 1)
+                    : Square(static_cast<int>(to) + 1);
+                nnue::remove_piece_one(acc_, *this, other, us, King, from);
+                nnue::add_piece_one   (acc_, *this, other, us, King, to);
+                nnue::remove_piece_one(acc_, *this, other, us, Rook, rook_from);
+                nnue::add_piece_one   (acc_, *this, other, us, Rook, rook_to);
+            } else {
+                if (st.captured != NoPiece) {
+                    nnue::remove_piece_one(acc_, *this, other, color_of(st.captured),
+                                           type_of(st.captured), to);
+                }
+                nnue::remove_piece_one(acc_, *this, other, us, King, from);
+                nnue::add_piece_one   (acc_, *this, other, us, King, to);
+            }
         } else if (mt == Move::EnPassant) {
             const Square cap_sq = make_square(file_of(to), rank_of(from));
             nnue::remove_piece(acc_, *this, them, Pawn,      cap_sq);
@@ -426,7 +454,7 @@ void Position::do_move(Move m, StateInfo& st) {
     // a from-scratch refresh of the post-move position bit-for-bit. Catches
     // missed king-move refreshes, perspective desyncs, and feature-index
     // miscalculations immediately at the source of the error.
-    if (acc_.computed && nnue::is_loaded()) {
+    if (update_acc && acc_.computed && nnue::is_loaded()) {
         nnue::Accumulator scratch;
         nnue::refresh(*this, scratch);
         assert(scratch.computed);
@@ -439,7 +467,7 @@ void Position::do_move(Move m, StateInfo& st) {
 #endif
 }
 
-void Position::undo_move(Move m, const StateInfo& st) {
+void Position::undo_move(Move m, const StateInfo& st, bool restore_acc) {
     const Square     from = m.from();
     const Square     to   = m.to();
     const Move::Type mt   = m.type();
@@ -476,10 +504,13 @@ void Position::undo_move(Move m, const StateInfo& st) {
     key_              = st.prev_key;
     if (us == Black) --fullmove_number_;
 
-    // Restore the pre-do_move accumulator snapshot. Unconditional copy: if
-    // the network was not loaded the snapshot is just an uncomputed zero
-    // accumulator, which is the correct state to roll back to.
-    acc_ = st.accumulator;
+    // Restore the pre-do_move accumulator snapshot. Skipped when the matching
+    // do_move ran with update_acc=false (legality testing): the accumulator was
+    // never touched, so there is nothing to roll back and st.accumulator holds
+    // no valid snapshot. Otherwise unconditional: if the network was not loaded
+    // the snapshot is just an uncomputed zero accumulator, which is the correct
+    // state to roll back to.
+    if (restore_acc) acc_ = st.accumulator;
 }
 
 void Position::do_null_move(StateInfo& st) {

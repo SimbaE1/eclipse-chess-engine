@@ -257,68 +257,74 @@ bool load(const std::string& path) {
 
 namespace {
 
-// Add or subtract one piece's FT column on both perspective accumulators.
-// `Sign` is +1 for add, -1 for remove. Both perspectives must be touched in
-// lockstep - they share weights but are indexed differently, so updating only
-// one would silently desync the other.
-//
-// King squares are read from `pos`, so the caller must ensure the kings have
-// not moved relative to the accumulator state being updated (king moves
-// invalidate every feature index and require a full refresh instead).
+// Add (Sign=+1) or subtract (Sign=-1) one weight column into one perspective's
+// accumulator vector. This is the single SIMD ladder shared by the incremental
+// updates and the refresh inner loop, so the AVX-512 / AVX2 / NEON / scalar
+// variants live in exactly one place.
+template <int Sign>
+inline void apply_col(std::int16_t* accv, const std::int16_t* col) noexcept {
+    static_assert(Sign == 1 || Sign == -1, "Sign must be +1 or -1");
+#if defined(__AVX512BW__) && !defined(ECLIPSE_NO_AVX512)
+    for (std::size_t i = 0; i < kFtOutSize; i += 32) {
+        __m512i acc_vec = _mm512_load_si512(reinterpret_cast<const void*>(&accv[i]));
+        __m512i col_vec = _mm512_load_si512(reinterpret_cast<const void*>(&col[i]));
+        acc_vec = (Sign == 1) ? _mm512_add_epi16(acc_vec, col_vec)
+                              : _mm512_sub_epi16(acc_vec, col_vec);
+        _mm512_store_si512(reinterpret_cast<void*>(&accv[i]), acc_vec);
+    }
+#elif defined(__AVX2__)
+    for (std::size_t i = 0; i < kFtOutSize; i += 16) {
+        __m256i acc_vec = _mm256_load_si256(reinterpret_cast<const __m256i*>(&accv[i]));
+        __m256i col_vec = _mm256_load_si256(reinterpret_cast<const __m256i*>(&col[i]));
+        acc_vec = (Sign == 1) ? _mm256_add_epi16(acc_vec, col_vec)
+                              : _mm256_sub_epi16(acc_vec, col_vec);
+        _mm256_store_si256(reinterpret_cast<__m256i*>(&accv[i]), acc_vec);
+    }
+#elif defined(__ARM_NEON)
+    for (std::size_t i = 0; i < kFtOutSize; i += 8) {
+        int16x8_t acc_vec = vld1q_s16(&accv[i]);
+        int16x8_t col_vec = vld1q_s16(&col[i]);
+        acc_vec = (Sign == 1) ? vaddq_s16(acc_vec, col_vec)
+                              : vsubq_s16(acc_vec, col_vec);
+        vst1q_s16(&accv[i], acc_vec);
+    }
+#else
+    for (std::size_t i = 0; i < kFtOutSize; ++i) {
+        accv[i] = static_cast<std::int16_t>(accv[i] + Sign * col[i]);
+    }
+#endif
+}
+
+// Add/subtract one piece's FT column on a SINGLE perspective. `persp` is 0
+// (White) or 1 (Black). The own king is implicit at the indexing square so it
+// has no column; the opp king IS a feature. The indexing king square is read
+// from `pos`, so that king must not have moved relative to the accumulator
+// being updated.
+template <int Sign>
+inline void apply_piece_persp(Accumulator& acc, const Position& pos, std::size_t persp,
+                              Color c, PieceType pt, Square sq) noexcept {
+    const Color persp_color = (persp == 0) ? White : Black;
+    const bool  is_ours     = (c == persp_color);
+    if (is_ours && pt == King) return;  // own king implicit -> no column
+
+    Square king_sq  = pos.king_square(persp_color);
+    Square piece_sq = sq;
+    if (persp_color == Black) {  // mirror to own-side frame
+        king_sq  = flip_rank(king_sq);
+        piece_sq = flip_rank(piece_sq);
+    }
+    const int idx = feature_index(king_sq, piece_sq, pt, is_ours);
+    assert(idx >= 0 && idx < kFtNumFeatures && "feature_index out of range");
+    apply_col<Sign>(acc.v[persp].data(), &g_ft_w[static_cast<std::size_t>(idx) * kFtOutSize]);
+}
+
+// Both-perspectives update: the common case for moves that do not shift a king.
 template <int Sign>
 void apply_piece(Accumulator& acc, const Position& pos,
                  Color c, PieceType pt, Square sq) noexcept {
-    static_assert(Sign == 1 || Sign == -1, "Sign must be +1 or -1");
     if (!g_loaded) return;
-
-    for (std::size_t persp = 0; persp < 2; ++persp) {
-        const Color persp_color = (persp == 0) ? White : Black;
-        const bool  is_ours     = (c == persp_color);
-        // HalfKAv2 skip: own king is implicit at the indexing king square,
-        // so we don't have a column for it. The opp king IS a feature.
-        if (is_ours && pt == King) continue;
-
-        Square king_sq  = pos.king_square(persp_color);
-        Square piece_sq = sq;
-        // Mirror convention: Black perspective sees everything flipped so the
-        // network always reasons in own-side-of-board coordinates.
-        if (persp_color == Black) {
-            king_sq  = flip_rank(king_sq);
-            piece_sq = flip_rank(piece_sq);
-        }
-        const int  idx = feature_index(king_sq, piece_sq, pt, is_ours);
-        assert(idx >= 0 && idx < kFtNumFeatures && "feature_index out of range");
-        const std::int16_t* col = &g_ft_w[static_cast<std::size_t>(idx) * kFtOutSize];
-
-#if defined(__AVX2__)
-        for (std::size_t i = 0; i < kFtOutSize; i += 16) {
-            __m256i acc_vec = _mm256_load_si256(reinterpret_cast<const __m256i*>(&acc.v[persp][i]));
-            __m256i col_vec = _mm256_load_si256(reinterpret_cast<const __m256i*>(&col[i]));
-            if constexpr (Sign == 1) {
-                acc_vec = _mm256_add_epi16(acc_vec, col_vec);
-            } else {
-                acc_vec = _mm256_sub_epi16(acc_vec, col_vec);
-            }
-            _mm256_store_si256(reinterpret_cast<__m256i*>(&acc.v[persp][i]), acc_vec);
-        }
-#elif defined(__ARM_NEON)
-        for (std::size_t i = 0; i < kFtOutSize; i += 8) {
-            int16x8_t acc_vec = vld1q_s16(&acc.v[persp][i]);
-            int16x8_t col_vec = vld1q_s16(&col[i]);
-            if constexpr (Sign == 1) {
-                acc_vec = vaddq_s16(acc_vec, col_vec);
-            } else {
-                acc_vec = vsubq_s16(acc_vec, col_vec);
-            }
-            vst1q_s16(&acc.v[persp][i], acc_vec);
-        }
-#else
-        for (std::size_t i = 0; i < kFtOutSize; ++i) {
-            acc.v[persp][i] = static_cast<std::int16_t>(
-                acc.v[persp][i] + Sign * col[i]);
-        }
-#endif
-    }
+    apply_piece_persp<Sign>(acc, pos, 0, c, pt, sq);
+    apply_piece_persp<Sign>(acc, pos, 1, c, pt, sq);
 }
 
 }  // namespace
@@ -333,66 +339,56 @@ void remove_piece(Accumulator& acc, const Position& pos,
     apply_piece<-1>(acc, pos, c, pt, sq);
 }
 
+void add_piece_one(Accumulator& acc, const Position& pos, int persp,
+                   Color c, PieceType pt, Square sq) noexcept {
+    if (!g_loaded) return;
+    apply_piece_persp<+1>(acc, pos, static_cast<std::size_t>(persp), c, pt, sq);
+}
+
+void remove_piece_one(Accumulator& acc, const Position& pos, int persp,
+                      Color c, PieceType pt, Square sq) noexcept {
+    if (!g_loaded) return;
+    apply_piece_persp<-1>(acc, pos, static_cast<std::size_t>(persp), c, pt, sq);
+}
+
 // ---- Refresh --------------------------------------------------------------
+
+// Rebuild a single perspective from scratch: FT bias + every piece's column
+// except the perspective side's own (implicit) king.
+void refresh_perspective(const Position& pos, Accumulator& acc, int persp_in) noexcept {
+    if (!g_loaded) { acc.computed = false; return; }
+    const std::size_t persp = static_cast<std::size_t>(persp_in);
+    const Color persp_color = (persp == 0) ? White : Black;
+    Square king_sq = pos.king_square(persp_color);
+    if (persp_color == Black) king_sq = flip_rank(king_sq);
+
+    std::memcpy(acc.v[persp].data(), g_ft_b.data(), kFtOutSize * sizeof(std::int16_t));
+
+    Bitboard occ = pos.occupied();
+    while (occ) {
+        const Square    s       = pop_lsb(occ);
+        const Piece     p       = pos.piece_on(s);
+        const PieceType pt      = type_of(p);
+        const Color     pc      = color_of(p);
+        const bool      is_ours = (pc == persp_color);
+        if (is_ours && pt == King) continue;  // own king is implicit
+
+        Square piece_sq = s;
+        if (persp_color == Black) piece_sq = flip_rank(piece_sq);
+
+        const int idx = feature_index(king_sq, piece_sq, pt, is_ours);
+        apply_col<+1>(acc.v[persp].data(), &g_ft_w[static_cast<std::size_t>(idx) * kFtOutSize]);
+    }
+}
 
 void refresh(const Position& pos, Accumulator& acc) noexcept {
     if (!g_loaded) {
         acc.computed = false;
         return;
     }
-
-    // Fill both perspectives. Each one runs over the entire occupancy and
-    // accumulates the king-relative feature column for every piece EXCEPT
-    // the perspective side's own king (which is implicit). Opp king is a
-    // normal feature.
-    for (std::size_t persp = 0; persp < 2; ++persp) {
-        const Color persp_color = (persp == 0) ? White : Black;
-        Square king_sq = pos.king_square(persp_color);
-        // Mirror everything to the Black-side frame when the perspective is
-        // Black, so the network always sees pawns advancing up.
-        if (persp_color == Black) king_sq = flip_rank(king_sq);
-
-        // Start from the FT bias.
-        std::memcpy(acc.v[persp].data(), g_ft_b.data(),
-                    kFtOutSize * sizeof(std::int16_t));
-
-        Bitboard occ = pos.occupied();
-        while (occ) {
-            const Square    s        = pop_lsb(occ);
-            const Piece     p        = pos.piece_on(s);
-            const PieceType pt       = type_of(p);
-            const Color     pc       = color_of(p);
-            const bool      is_ours  = (pc == persp_color);
-            if (is_ours && pt == King) continue;  // own king is implicit
-
-            Square piece_sq = s;
-            if (persp_color == Black) piece_sq = flip_rank(piece_sq);
-
-            const int idx = feature_index(king_sq, piece_sq, pt, is_ours);
-            const std::int16_t* col = &g_ft_w[static_cast<std::size_t>(idx) * kFtOutSize];
-
-#if defined(__AVX2__)
-            for (std::size_t i = 0; i < kFtOutSize; i += 16) {
-                __m256i acc_vec = _mm256_load_si256(reinterpret_cast<const __m256i*>(&acc.v[persp][i]));
-                __m256i col_vec = _mm256_load_si256(reinterpret_cast<const __m256i*>(&col[i]));
-                acc_vec = _mm256_add_epi16(acc_vec, col_vec);
-                _mm256_store_si256(reinterpret_cast<__m256i*>(&acc.v[persp][i]), acc_vec);
-            }
-#elif defined(__ARM_NEON)
-            for (std::size_t i = 0; i < kFtOutSize; i += 8) {
-                int16x8_t acc_vec = vld1q_s16(&acc.v[persp][i]);
-                int16x8_t col_vec = vld1q_s16(&col[i]);
-                acc_vec = vaddq_s16(acc_vec, col_vec);
-                vst1q_s16(&acc.v[persp][i], acc_vec);
-            }
-#else
-            for (std::size_t i = 0; i < kFtOutSize; ++i) {
-                acc.v[persp][i] = static_cast<std::int16_t>(acc.v[persp][i] + col[i]);
-            }
-#endif
-        }
-    }
-
+    // Fill both perspectives, each indexed by its own king square.
+    refresh_perspective(pos, acc, 0);
+    refresh_perspective(pos, acc, 1);
     acc.computed = true;
 }
 
@@ -416,7 +412,25 @@ void affine_clipped_relu(const std::uint8_t* in,
                          const std::int8_t*  w,        // [kOut, kIn]
                          const std::int32_t* b,        // [kOut]
                          std::uint8_t*       out) noexcept {
-#if defined(__AVX2__)
+#if defined(__AVX512BW__) && !defined(ECLIPSE_NO_AVX512)
+    static_assert(kIn % 64 == 0, "AVX512 affine_clipped_relu: kIn must be a multiple of 64");
+    const __m512i ones16 = _mm512_set1_epi16(1);
+    for (int o = 0; o < kOut; ++o) {
+        const std::int8_t* wo = w + o * kIn;
+        __m512i acc = _mm512_setzero_si512();
+        for (int i = 0; i < kIn; i += 64) {
+            const __m512i x = _mm512_load_si512(reinterpret_cast<const void*>(in + i));
+            const __m512i y = _mm512_loadu_si512(reinterpret_cast<const void*>(wo + i));
+            const __m512i p = _mm512_maddubs_epi16(x, y);
+            acc = _mm512_add_epi32(acc, _mm512_madd_epi16(p, ones16));
+        }
+        std::int32_t sum = b[o] + _mm512_reduce_add_epi32(acc);
+        sum >>= kWeightShift;
+        if (sum < 0)         sum = 0;
+        if (sum > kFtQuant)  sum = kFtQuant;
+        out[o] = static_cast<std::uint8_t>(sum);
+    }
+#elif defined(__AVX2__)
     static_assert(kIn % 32 == 0, "AVX2 affine_clipped_relu: kIn must be a multiple of 32");
     const __m256i ones16 = _mm256_set1_epi16(1);
     for (int o = 0; o < kOut; ++o) {
@@ -490,17 +504,100 @@ void affine_clipped_relu_batch(const std::uint8_t* in,
                                std::uint8_t*       out,
                                int                 batch_size) noexcept {
     const __m256i ones16 = _mm256_set1_epi16(1);
+
+    auto hsum = [](const __m256i& acc) -> std::int32_t {
+        __m128i lo = _mm256_castsi256_si128(acc);
+        __m128i hi = _mm256_extracti128_si256(acc, 1);
+        __m128i s4 = _mm_add_epi32(lo, hi);
+        __m128i s2 = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, 0x4E));
+        __m128i s1 = _mm_add_epi32(s2, _mm_shuffle_epi32(s2, 0xB1));
+        return _mm_cvtsi128_si32(s1);
+    };
+
     for (int o = 0; o < kOut; ++o) {
         const std::int8_t* wo = w + o * kIn;
-        
-        // Process 4 inputs in the batch at a time to maximize weight vector reuse.
+
+        auto finalize = [&](int batch_offset, const __m256i& acc) {
+            std::int32_t sum = b[o] + hsum(acc);
+            sum >>= kWeightShift;
+            if (sum < 0)         sum = 0;
+            if (sum > kFtQuant)  sum = kFtQuant;
+            out[batch_offset * kOut + o] = static_cast<std::uint8_t>(sum);
+        };
+
+        // Process 8 inputs per loaded weight vector. Each weight row (kIn bytes,
+        // 2 KB for L1) is the bottleneck: it streams from L2/L3, while the uint8
+        // activations stay hot in L1d. Reusing each `wv` across all 8 batch
+        // elements (kLeafBatch) reads the weight matrix exactly once per batch
+        // instead of once per group-of-4 — halving L1's dominant memory traffic.
         int b_idx = 0;
+#if defined(__AVX512BW__) && !defined(ECLIPSE_NO_AVX512)
+        // Same reuse pattern, 512-bit: 64 bytes/iter, 8 zmm accumulators + wv +
+        // ones = 10 of AVX-512's 32 zmm registers.
+        {
+            const __m512i ones16_512 = _mm512_set1_epi16(1);
+            for (; b_idx <= batch_size - 8; b_idx += 8) {
+                __m512i a0 = _mm512_setzero_si512(), a1 = _mm512_setzero_si512();
+                __m512i a2 = _mm512_setzero_si512(), a3 = _mm512_setzero_si512();
+                __m512i a4 = _mm512_setzero_si512(), a5 = _mm512_setzero_si512();
+                __m512i a6 = _mm512_setzero_si512(), a7 = _mm512_setzero_si512();
+                const std::uint8_t* ib = in + b_idx * kIn;
+                for (int i = 0; i < kIn; i += 64) {
+                    const __m512i wv = _mm512_loadu_si512(reinterpret_cast<const void*>(wo + i));
+                    a0 = _mm512_add_epi32(a0, _mm512_madd_epi16(_mm512_maddubs_epi16(_mm512_load_si512(reinterpret_cast<const void*>(ib + 0 * kIn + i)), wv), ones16_512));
+                    a1 = _mm512_add_epi32(a1, _mm512_madd_epi16(_mm512_maddubs_epi16(_mm512_load_si512(reinterpret_cast<const void*>(ib + 1 * kIn + i)), wv), ones16_512));
+                    a2 = _mm512_add_epi32(a2, _mm512_madd_epi16(_mm512_maddubs_epi16(_mm512_load_si512(reinterpret_cast<const void*>(ib + 2 * kIn + i)), wv), ones16_512));
+                    a3 = _mm512_add_epi32(a3, _mm512_madd_epi16(_mm512_maddubs_epi16(_mm512_load_si512(reinterpret_cast<const void*>(ib + 3 * kIn + i)), wv), ones16_512));
+                    a4 = _mm512_add_epi32(a4, _mm512_madd_epi16(_mm512_maddubs_epi16(_mm512_load_si512(reinterpret_cast<const void*>(ib + 4 * kIn + i)), wv), ones16_512));
+                    a5 = _mm512_add_epi32(a5, _mm512_madd_epi16(_mm512_maddubs_epi16(_mm512_load_si512(reinterpret_cast<const void*>(ib + 5 * kIn + i)), wv), ones16_512));
+                    a6 = _mm512_add_epi32(a6, _mm512_madd_epi16(_mm512_maddubs_epi16(_mm512_load_si512(reinterpret_cast<const void*>(ib + 6 * kIn + i)), wv), ones16_512));
+                    a7 = _mm512_add_epi32(a7, _mm512_madd_epi16(_mm512_maddubs_epi16(_mm512_load_si512(reinterpret_cast<const void*>(ib + 7 * kIn + i)), wv), ones16_512));
+                }
+                auto fin512 = [&](int off, const __m512i& acc) {
+                    std::int32_t sum = b[o] + _mm512_reduce_add_epi32(acc);
+                    sum >>= kWeightShift;
+                    if (sum < 0)        sum = 0;
+                    if (sum > kFtQuant) sum = kFtQuant;
+                    out[off * kOut + o] = static_cast<std::uint8_t>(sum);
+                };
+                fin512(b_idx + 0, a0); fin512(b_idx + 1, a1);
+                fin512(b_idx + 2, a2); fin512(b_idx + 3, a3);
+                fin512(b_idx + 4, a4); fin512(b_idx + 5, a5);
+                fin512(b_idx + 6, a6); fin512(b_idx + 7, a7);
+            }
+        }
+#else
+        // 8 i32 accumulators + wv + ones16 + a scratch = 11 ymm, within AVX2's 16.
+        for (; b_idx <= batch_size - 8; b_idx += 8) {
+            __m256i a0 = _mm256_setzero_si256(), a1 = _mm256_setzero_si256();
+            __m256i a2 = _mm256_setzero_si256(), a3 = _mm256_setzero_si256();
+            __m256i a4 = _mm256_setzero_si256(), a5 = _mm256_setzero_si256();
+            __m256i a6 = _mm256_setzero_si256(), a7 = _mm256_setzero_si256();
+            const std::uint8_t* ib = in + b_idx * kIn;
+            for (int i = 0; i < kIn; i += 32) {
+                const __m256i wv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(wo + i));
+                a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(ib + 0 * kIn + i)), wv), ones16));
+                a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(ib + 1 * kIn + i)), wv), ones16));
+                a2 = _mm256_add_epi32(a2, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(ib + 2 * kIn + i)), wv), ones16));
+                a3 = _mm256_add_epi32(a3, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(ib + 3 * kIn + i)), wv), ones16));
+                a4 = _mm256_add_epi32(a4, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(ib + 4 * kIn + i)), wv), ones16));
+                a5 = _mm256_add_epi32(a5, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(ib + 5 * kIn + i)), wv), ones16));
+                a6 = _mm256_add_epi32(a6, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(ib + 6 * kIn + i)), wv), ones16));
+                a7 = _mm256_add_epi32(a7, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(ib + 7 * kIn + i)), wv), ones16));
+            }
+            finalize(b_idx + 0, a0); finalize(b_idx + 1, a1);
+            finalize(b_idx + 2, a2); finalize(b_idx + 3, a3);
+            finalize(b_idx + 4, a4); finalize(b_idx + 5, a5);
+            finalize(b_idx + 6, a6); finalize(b_idx + 7, a7);
+        }
+#endif
+
+        // 4-wide fallback for a batch tail of 4..7.
         for (; b_idx <= batch_size - 4; b_idx += 4) {
             __m256i acc0 = _mm256_setzero_si256();
             __m256i acc1 = _mm256_setzero_si256();
             __m256i acc2 = _mm256_setzero_si256();
             __m256i acc3 = _mm256_setzero_si256();
-
             for (int i = 0; i < kIn; i += 32) {
                 const __m256i wv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(wo + i));
                 acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(in + (b_idx + 0) * kIn + i)), wv), ones16));
@@ -508,31 +605,13 @@ void affine_clipped_relu_batch(const std::uint8_t* in,
                 acc2 = _mm256_add_epi32(acc2, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(in + (b_idx + 2) * kIn + i)), wv), ones16));
                 acc3 = _mm256_add_epi32(acc3, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(in + (b_idx + 3) * kIn + i)), wv), ones16));
             }
-
-            auto hsum = [](const __m256i& acc) -> std::int32_t {
-                __m128i lo = _mm256_castsi256_si128(acc);
-                __m128i hi = _mm256_extracti128_si256(acc, 1);
-                __m128i s4 = _mm_add_epi32(lo, hi);
-                __m128i s2 = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, 0x4E));
-                __m128i s1 = _mm_add_epi32(s2, _mm_shuffle_epi32(s2, 0xB1));
-                return _mm_cvtsi128_si32(s1);
-            };
-
-            auto finalize = [&](int batch_offset, const __m256i& acc) {
-                std::int32_t sum = b[o] + hsum(acc);
-                sum >>= kWeightShift;
-                if (sum < 0)         sum = 0;
-                if (sum > kFtQuant)  sum = kFtQuant;
-                out[batch_offset * kOut + o] = static_cast<std::uint8_t>(sum);
-            };
-
             finalize(b_idx + 0, acc0);
             finalize(b_idx + 1, acc1);
             finalize(b_idx + 2, acc2);
             finalize(b_idx + 3, acc3);
         }
 
-        // Remainder
+        // 1-wide remainder.
         for (; b_idx < batch_size; ++b_idx) {
             affine_clipped_relu<kIn, 1>(in + b_idx * kIn, wo, b + o, out + b_idx * kOut + o);
         }

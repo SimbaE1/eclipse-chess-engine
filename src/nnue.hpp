@@ -122,6 +122,15 @@ float output_cp_per_unit() noexcept;
 // loses track of the incremental state.
 void refresh(const Position& pos, Accumulator& acc) noexcept;
 
+// Rebuild only one perspective (persp = 0 White, 1 Black) from scratch. Used
+// for king moves: the moving side's perspective is reindexed by its new king
+// square (full rebuild), while the other perspective — indexed by the
+// stationary opposite king — only needs the moved king/rook columns patched in
+// incrementally via add_piece_one / remove_piece_one. Does NOT set
+// acc.computed (the caller manages that, since the other perspective is patched
+// separately). Halves the per-king-move FT cost vs a full both-sides refresh().
+void refresh_perspective(const Position& pos, Accumulator& acc, int persp) noexcept;
+
 // Add the FT column for one piece (color, pt, sq) to `acc` on both perspectives.
 // Caller must guarantee that the king squares in `pos` are the post-move ones
 // when (color/pt/sq) describes a post-move piece; equivalently, the kings did
@@ -133,6 +142,16 @@ void add_piece(Accumulator& acc, const Position& pos,
 // Same king-invariance constraint as add_piece.
 void remove_piece(Accumulator& acc, const Position& pos,
                   Color c, PieceType pt, Square sq) noexcept;
+
+// Single-perspective variants of add_piece / remove_piece (persp = 0 White,
+// 1 Black). Used by the king-move path to patch the non-moving perspective
+// while the moving one is rebuilt by refresh_perspective. Same king-invariance
+// constraint as add_piece: the indexing king (the perspective side's) must not
+// have moved relative to the accumulator state.
+void add_piece_one(Accumulator& acc, const Position& pos, int persp,
+                   Color c, PieceType pt, Square sq) noexcept;
+void remove_piece_one(Accumulator& acc, const Position& pos, int persp,
+                      Color c, PieceType pt, Square sq) noexcept;
 
 // Forward pass: returns the score in centipawns from the side-to-move's
 // perspective, matching eclipse::evaluate's contract.

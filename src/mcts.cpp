@@ -472,11 +472,15 @@ int MCTS::iterate_batch(int batch_size) {
         while (node->is_expanded.load(std::memory_order_acquire) && !node->is_terminal) {
             const auto  parent_n = node->N.load(std::memory_order_relaxed);
             const float parent_q = node->Q();
+            // sqrt(parent_n+1) is identical for every child; hoist it (and the
+            // cpuct multiply) out of the sibling loop so the sqrt runs once per
+            // parent instead of once per child.
+            const float explore_num = g_cpuct * std::sqrt(static_cast<float>(parent_n + 1));
 
             Node* best_child = nullptr;
             float best_score = -1e30f;
             for (const auto& child : node->children) {
-                const float s = child->puct_score(parent_n, g_cpuct, parent_q);
+                const float s = child->puct_score_fast(explore_num, parent_q);
                 if (s > best_score) {
                     best_score = s;
                     best_child = child.get();
@@ -485,7 +489,9 @@ int MCTS::iterate_batch(int batch_size) {
             if (!best_child) break;
 
             best_child->apply_virtual_loss();
-            pos.do_move(best_child->move, st);
+            // Descent never undoes (each path replays from a fresh root copy),
+            // so skip the 4 KB accumulator snapshot do_move would otherwise take.
+            pos.do_move(best_child->move, st, /*snapshot_acc=*/false);
             const std::uint64_t new_key = pos.key();
 
             // 2-fold repetition: check every 2 steps back (same side to move).
