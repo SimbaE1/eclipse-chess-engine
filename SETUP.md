@@ -1,6 +1,9 @@
 # Eclipse — setup on a fresh machine
 
-Steps to get from "fresh clone" to "engine playing chess" on a new Mac.
+Steps to get from "fresh clone" to "engine playing chess" on a new Mac. Once
+it's running, see [`README.md`](README.md) for how to play and configure it, and
+[`DEVELOPMENT.md`](DEVELOPMENT.md) for the engine internals and net-improvement
+pipeline.
 
 ## 1. Dependencies (Homebrew)
 
@@ -54,14 +57,15 @@ Both the trained NNUE and the converted Lc0 policy are bundled in the repo's
 GitHub Release. `gh` (already auth'd if you cloned via `gh repo clone`):
 
 ```bash
-gh release download v0.1.0 --pattern '*.nnue' --pattern 'policy.onnx' -D data/
-mv data/eclipse_v2_1.58M.nnue data/eclipse.nnue   # what UCI EvalFile expects
+gh release download v0.8.0 --pattern '*.nnue' --pattern 'policy.onnx' -D data/
+mv data/eclipse_*.nnue data/eclipse.nnue          # what UCI EvalFile expects
 ```
 
-Alternatively grab them via plain HTTPS (no auth needed for public releases;
-this repo is private, so use `gh` until/unless you make it public):
+(Use the latest release tag — `gh release list` shows them.) Alternatively grab
+them via the Releases page (this repo is private, so use `gh` until/unless you
+make it public):
 ```
-https://github.com/SimbaE1/eclipse-chess-engine/releases/tag/v0.1.0
+https://github.com/SimbaE1/eclipse-chess-engine/releases
 ```
 
 If you'd rather scp from another machine you've already built on:
@@ -150,13 +154,7 @@ the notebook itself.
 
 ## Architecture overview
 
-- **Search**: MCTS with PUCT, single-threaded
-- **Value**: HalfKAv2-1024x2-128-32 NNUE (45056 features -> 1024 per perspective ->
-  128 -> 32 -> 1, int16/int8 quantized) in `src/nnue.cpp`
-- **Policy**: Lc0 transformer (10 encoder layers, 8 heads) loaded via
-  ONNX Runtime in `src/policy.cpp`
-- **Time mgmt**: MLH head from the policy net divides remaining time across
-  estimated moves left (see `cmd_go` in `src/uci.cpp`)
-
-Phase 2/3 work (incremental NNUE accumulator, SIMD inference, parallel MCTS)
-is tracked in TODO comments throughout the source.
+Eclipse is multi-threaded MCTS + a HalfKAv2 NNUE value net (`45056 → 1024×2 →
+512 → 128 → 1`, incremental accumulator, AVX-512/AVX2/NEON SIMD) with an
+alpha-beta tactical verifier and Syzygy probing. Full details, the search
+tunables, and the source map are in [`DEVELOPMENT.md`](DEVELOPMENT.md).

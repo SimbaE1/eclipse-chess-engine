@@ -1,191 +1,169 @@
 # Eclipse
 
-A chess engine aiming for TCEC-competitive strength. Eclipse pairs an MCTS
-search with a HalfKAv2 NNUE value head and an Lc0-transformer policy net, plus
-an alpha-beta verifier that injects tactical findings back into the tree.
+A UCI chess engine aiming for TCEC-competitive strength. Eclipse pairs an
+**MCTS search** with a **HalfKAv2 NNUE** evaluation and an alpha-beta tactical
+verifier — so it plays positionally like a neural engine but doesn't fall for
+tactics. It runs in any standard chess GUI and on the command line.
 
-> **Status:** late proof-of-concept. The search, NNUE, policy, ponder, and
-> Syzygy paths all work; strength tuning and the training-data buildout are the
-> active fronts.
+> **Status:** late proof-of-concept — fully playable. It speaks UCI, supports
+> multi-threading, pondering, and Syzygy tablebases.
 
-## How it plays
-
-1. **Priors** — MVV-LVA heuristics (SEE-filtered captures/promotions) seed move
-   ordering at the root.
-2. **Search** — NNUE + MCTS (PUCT, multi-threaded) explores for the best move.
-3. **Tactics** — NNUE + alpha-beta runs alongside MCTS; when it finds a tactic
-   the MCTS missed, it raises that move's Q so the tree adopts it
-   (`adjust_root_q` / reconciliation in `src/search.cpp`).
-
-**Architecture**
-
-- **Value:** HalfKAv2 `45056 → 1024×2 → 512 → 128 → 1`, int16/int8 quantized
-  (`src/nnue.cpp`). The `.nnue` header carries `output_cp_per_unit`, the cp↔
-  win-prob scale the net was trained at — **currently 300** (see the pipeline
-  note below).
-- **Policy:** Lc0 transformer via ONNX Runtime (`src/policy.cpp`); also supplies
-  the MLH "moves-left" head used for time management.
-- **Search:** MCTS with an AB verifier (`src/mcts.cpp`, `src/ab.cpp`,
-  `src/search.cpp`); Syzygy tablebase probing at root and interior
-  (`src/syzygy.cpp`).
-- **Time mgmt:** MLH-divided budget in `cmd_go` (`src/uci.cpp`). Note the fixed
-  ~120 ms per-move floor documented there — ultra-bullet (increment < floor)
-  can flag; 5+3 and slower are safe.
-
-## Repo layout
-
-| Path | What |
-|---|---|
-| `src/` | Engine (C++20): search, NNUE, policy, UCI, movegen, Syzygy |
-| `tests/` | Unit + smoke tests (`ctest`) |
-| `scripts/` | Data, training, conversion, and **match/eval tooling** |
-| `notebooks/` | `eclipse_wdl_train.ipynb` — the Kaggle training notebook |
-| `data/` | Nets (`eclipse.nnue`, `policy.onnx`), books, benchmark PGNs |
-| `extern/` | Vendored deps (e.g. Fathom for Syzygy) |
-| [`SETUP.md`](SETUP.md) | Fresh-machine install → build → run |
-| [`KAGGLE.md`](KAGGLE.md) | End-to-end data + GPU training pipeline |
+This page is for **running and playing** Eclipse. If you want to hack on the
+engine itself, see [`DEVELOPMENT.md`](DEVELOPMENT.md).
 
 ---
 
-## Development loop
+## 1. Get it
 
-Build and test (see [`SETUP.md`](SETUP.md) for first-time dependencies):
-
-```bash
-cmake -S . -B build          # configure (Release by default, -march=native on)
-cmake --build build -j        # -> build/src/eclipse + build/tests/test_*
-ctest --test-dir build        # full unit + smoke suite (should be 100%)
-```
-
-Run a quick standalone search to eyeball nps / depth / score:
+Eclipse builds from source; the neural net ships separately as a release asset
+(it's ~90 MB, too big for the repo).
 
 ```bash
-scripts/engine_diag.sh data/eclipse.nnue 3000 4   # <net> [movetime_ms] [threads]
+# clone (private repo — use the GitHub CLI)
+gh repo clone SimbaE1/eclipse-chess-engine
+cd eclipse-chess-engine
+
+# install build + runtime dependencies (macOS / Homebrew)
+brew install cmake onnxruntime
+
+# build (Release, tuned for your CPU)
+cmake -S . -B build
+cmake --build build -j
+# -> build/src/eclipse
 ```
 
-Source map for the hot paths: `search()` orchestration in `src/search.cpp`,
-the MCTS worker loop in `src/mcts.cpp`, NNUE inference in `src/nnue.cpp`, UCI +
-time management in `src/uci.cpp`.
+Then grab the neural net into `data/`:
+
+```bash
+gh release download v0.8.0 --pattern '*.nnue' -D data/
+mv data/eclipse_*.nnue data/eclipse.nnue      # the name EvalFile defaults to
+```
+
+> First time on a fresh machine, or hitting build/dependency trouble? The
+> step-by-step bootstrap (including the optional policy net and a verify step)
+> is in [`SETUP.md`](SETUP.md).
+
+Optional but recommended for strong endgame play — point Eclipse at
+[Syzygy tablebases](https://syzygy-tables.info/) you've downloaded (3–4–5 man is
+plenty for casual play).
 
 ---
 
-## Improvement pipeline
+## 2. Play against it
 
-The loop for making the engine stronger, end to end:
+### In a chess GUI (recommended)
 
-```
-  data → train (Kaggle GPU) → fetch + pack → test → promote
-   │          │                    │           │        │
-extract   notebook            fetch_latest   run_match  copy winner
-lichess   eclipse_wdl_train   _net.sh        + analyze  to data/eclipse.nnue
-          .ipynb              (cp=300)        accuracy
-```
+Eclipse is a standard UCI engine, so it drops into any UCI GUI — **Cute Chess**,
+**Arena**, **BanksiaGUI**, **Scid vS. PC**, etc. Add a new engine and point it at:
 
-### 1. Data + training (Kaggle)
+- **Command:** `…/eclipse-chess-engine/build/src/eclipse`
+- Then set these engine options in the GUI:
+  - `EvalFile` → `…/eclipse-chess-engine/data/eclipse.nnue` *(required)*
+  - `Threads` → how many CPU cores to use (e.g. 4)
+  - `Hash` → transposition memory in MB (e.g. 256)
+  - `SyzygyPath` → your tablebase folder *(optional)*
 
-Data engineering runs locally (network-bound), training runs on Kaggle's free
-T4s (compute-bound). Full details in [`KAGGLE.md`](KAGGLE.md); the notebook is
-`notebooks/eclipse_wdl_train.ipynb`. Each chunk it trains is checkpointed to the
-Kaggle dataset `simbae11/eclipse-checkpoint` as `halfkav2.pt` +
-`resume_state.pt`.
+Now start a game against it like any other engine.
 
-| Stage | Script |
-|---|---|
-| Extract Lichess positions | `scripts/extract_lichess_wdl.py`, `scripts/sample_lichess.py` |
-| (Optional) Stockfish labels | `scripts/label_with_stockfish.py` |
-| Train HalfKAv2 | `scripts/train_halfkav2.py` (mirrored in the notebook) |
-| Pack to `.nnue` | `scripts/convert_halfkav2_nnue.py` |
+### In the terminal (quick game, no GUI)
 
-### 2. Fetch the latest checkpoint → `data/eclipse.nnue`
-
-One command downloads the newest checkpoint and packs it with the correct
-scale:
+A small Python helper lets you play right in the terminal (needs
+`pip install python-chess`):
 
 ```bash
-export KAGGLE_API_TOKEN=KGAT_xxxxxxxx        # Bearer token, not stored in repo
-scripts/fetch_latest_net.sh                  # -> data/eclipse.nnue (cp=300), verified
+python scripts/play_human.py --side w --tc 5+3 --threads 4
 ```
 
-It reports the checkpoint's epoch/chunk, converts `halfkav2.pt` with
-`--output-cp-per-unit 300`, and verifies the value landed in the file header.
+- `--side w|b` — which color **you** play (default white)
+- `--tc 5+3` — time control (5 min + 3 s); or `--tc fixed --engine-time-ms 3000`
+  for a flat think-time per move
+- `--threads`, `--hash`, `--syzygy` — passed through to the engine
 
-> **⚠ The cp_scale=300 gotcha.** The notebook trains at `cp_scale=300`, but
-> `convert_halfkav2_nnue.py` still **defaults to 410**. A bare conversion bakes
-> 410 into the `.nnue`, and the engine reads that field at load time for every
-> win-prob and MCTS-Q conversion — silently miscalibrating the net. Always pass
-> `--output-cp-per-unit 300` (which `fetch_latest_net.sh` does for you).
+Type your moves in UCI form (e.g. `e2e4`, `g1f3`, `e7e8q` to promote).
 
-### 3. Test the candidate vs the current net
-
-Play the candidate against the incumbent. Use the imbalanced opening book so
-two near-equal nets produce decisive games instead of a draw-fest (fair because
-each opening is played with both colors via `-repeat`):
+### Raw UCI (for the curious)
 
 ```bash
-# one-time: get the UHO book
-curl -sL -o /tmp/uho.zip \
-  https://github.com/official-stockfish/books/raw/master/UHO_4060_v2.epd.zip
-unzip -o /tmp/uho.zip -d data/books/
-
-scripts/run_match.sh \
-  --net1 data/eclipse_candidate.nnue --net2 data/eclipse.nnue \
-  --name1 cand --name2 cur \
-  --tc 5+3 --games 40 \
-  --book data/books/UHO_4060_v2.epd \
-  --pgn /tmp/cand_vs_cur.pgn
+./build/src/eclipse
 ```
-
-Watch and analyze (all read the live PGN safely — cutechess only appends a game
-once it finishes):
-
-```bash
-python3 scripts/match_score.py /tmp/cand_vs_cur.pgn          # results + running score
-python3 scripts/match_depth.py /tmp/cand_vs_cur.pgn          # depth + time/move per net
-python3 scripts/analyze_accuracy.py /tmp/cand_vs_cur.pgn \   # SF accuracy + ACPL (cached)
-    --stockfish "$(which stockfish)" --depth 15
 ```
-
-`analyze_accuracy.py` caches per game (keyed by PGN path + game + depth), so
-re-running on a growing match only evaluates new games. For ponderhits / nps,
-launch with `scripts/run_match.sh --debug ...` and read the log:
-
-```bash
-scripts/ponderhit_stats.sh /tmp/cand_vs_cur_debug.log
+uci
+setoption name EvalFile value data/eclipse.nnue
+setoption name Threads value 4
+setoption name Hash value 256
+setoption name SyzygyPath value /path/to/syzygy
+isready
+position startpos
+go movetime 5000
 ```
-
-> **Reading the numbers.** Accuracy% saturates near the top and is a poor
-> discriminator between two strong, similar nets — and it's inflated by a
-> shallow SF reference and drawish balanced games. Trust the **match score**
-> for the verdict and **ACPL** as the finer signal; small accuracy gaps are
-> noise. The opening book is what makes a small-N match conclusive.
-
-### 4. Promote the winner
-
-If the candidate is clearly stronger, make it the engine's net:
-
-```bash
-cp data/eclipse_candidate.nnue data/eclipse.nnue
-```
-
-(`data/eclipse.nnue` is what UCI `EvalFile` and the test suite default to.)
+It replies with `bestmove …`. `quit` to exit.
 
 ---
 
-## Testing & evaluation toolkit (reference)
+## 3. Configure it
 
-| Script | Purpose |
-|---|---|
-| `scripts/run_match.sh` | cutechess launcher; `--book` for imbalanced openings, `--debug`, `--dry-run` |
-| `scripts/match_score.py` | Per-game results + running W/D/L score from a PGN |
-| `scripts/match_depth.py` | Per-net avg/max depth and time-per-move from PGN comments |
-| `scripts/analyze_accuracy.py` | Stockfish accuracy% + ACPL per game (cached; `--no-cache`) |
-| `scripts/engine_diag.sh` | Live nps/depth/seldepth from one standalone search |
-| `scripts/ponderhit_stats.sh` | Ponderhit count + avg nps from a cutechess `-debug` log |
-| `scripts/fetch_latest_net.sh` | Download latest Kaggle checkpoint → `data/eclipse.nnue` (cp=300) |
-| `scripts/bench_vs_stockfish.py` | Calibrate strength vs Stockfish at a target Elo |
+The options you'll actually touch as a player:
 
-`watch` keeps any of the PGN readers live:
+| Option | Default | What it does |
+|---|---|---|
+| `EvalFile` | — | Path to the `.nnue` net **(required)** |
+| `Threads` | 1 | CPU cores for search — set this to your core count |
+| `Hash` | 256 | Search memory (MB) |
+| `SyzygyPath` | — | Folder of Syzygy tablebases for perfect endgames |
+| `Ponder` | on | Let it think on your time (the GUI manages this) |
+
+Eclipse also exposes search-strength knobs (`Cpuct`, `PolicyDepth`, …) for
+tinkerers — those and their trade-offs are documented in
+[`DEVELOPMENT.md`](DEVELOPMENT.md#search-tunables-uci-options).
+
+---
+
+## 4. Test it / measure its strength
+
+**Quick self-check** — a fixed-node benchmark prints nodes/sec:
 
 ```bash
-watch -n 30 'python3 scripts/match_score.py /tmp/cand_vs_cur.pgn'
+printf 'setoption name EvalFile value data/eclipse.nnue\nsetoption name Threads value 4\nisready\nbench\nquit\n' | ./build/src/eclipse
 ```
+
+**Play it against another engine** with [cutechess-cli](https://github.com/cutechess/cutechess).
+For example, a 10-game match at 5 min + 3 s vs. another UCI engine, giving
+Eclipse 4 cores and its tablebases (no result adjudication):
+
+```bash
+cutechess-cli \
+  -engine name=eclipse cmd=./build/src/eclipse \
+    option.EvalFile=$PWD/data/eclipse.nnue \
+    option.Threads=4 option.Hash=256 \
+    option.SyzygyPath=/path/to/syzygy \
+  -engine name=opponent cmd=/path/to/other-engine \
+    option.Hash=256 \
+  -each tc=5+3 proto=uci \
+  -games 10 -repeat -concurrency 1 \
+  -pgnout /tmp/eclipse_match.pgn
+```
+
+Then read off the result:
+
+```bash
+python3 scripts/match_score.py /tmp/eclipse_match.pgn     # running W/D/L score
+```
+
+For deeper analysis (per-net depth/time, Stockfish accuracy + ACPL, live
+watching) and the net-vs-net testing workflow, see
+[`DEVELOPMENT.md`](DEVELOPMENT.md#testing--evaluation-toolkit-reference).
+
+---
+
+## Documentation
+
+| Doc | For |
+|---|---|
+| **README.md** (this) | Download, play, configure, test |
+| [`SETUP.md`](SETUP.md) | Fresh-machine bootstrap, step by step |
+| [`DEVELOPMENT.md`](DEVELOPMENT.md) | Engine internals, build/test loop, net-improvement pipeline |
+| [`KAGGLE.md`](KAGGLE.md) | Training a new NNUE (data + GPU pipeline) |
+
+## License
+
+GPL-3.0-or-later. See [`LICENSE`](LICENSE).
