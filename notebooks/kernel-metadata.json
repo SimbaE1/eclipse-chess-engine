@@ -10,7 +10,9 @@
   "enable_internet": true,
   "dataset_sources": [
     "simbae11/eclipse-partial",
-    "simbae11/eclipse-trainer"
+    "simbae11/eclipse-trainer",
+    "simbae11/eclipse-chunks-a",
+    "simbae11/eclipse-chunks-b"
   ],
   "kernel_sources": [],
   "competition_sources": [],
