@@ -19,6 +19,11 @@
 #                        --tc 5+3 --games 20 --pgn /tmp/c5_vs_c3.pgn \
 #                        --book data/books/UHO_4060_v2.epd
 #
+#   # fixed-nodes (deterministic compute per move, immune to system load --
+#   # best for comparing nets; forces ponder off):
+#   scripts/run_match.sh --net1 a.nnue --net2 b.nnue --nodes 3000 --games 200 \
+#                        --book data/books/UHO_4060_v2.epd
+#
 #   # show the command without running it:
 #   scripts/run_match.sh --net1 a.nnue --net2 b.nnue --dry-run
 set -euo pipefail
@@ -29,7 +34,7 @@ CUTECHESS="${CUTECHESS:-/Users/ezra/cutechess/cutechess/build/cutechess-cli}"
 
 # Defaults (mirror the standard Eclipse self-play setup).
 NET1=""; NET2=""; NAME1="net1"; NAME2="net2"
-TC="5+3"; GAMES=20; THREADS=4; ABTHREADS=1; HASH=256
+TC="5+3"; NODES=""; GAMES=20; THREADS=4; ABTHREADS=1; HASH=256
 SYZYGY="${SYZYGY:-/Users/ezra/syzygy}"
 CONCURRENCY=1; PONDER=1; BOOK=""; PGN=""; DEBUG=0; DRY_RUN=0
 
@@ -40,6 +45,7 @@ while [ $# -gt 0 ]; do
     --name1)       NAME1=$2; shift 2;;
     --name2)       NAME2=$2; shift 2;;
     --tc)          TC=$2; shift 2;;
+    --nodes)       NODES=$2; shift 2;;
     --games)       GAMES=$2; shift 2;;
     --threads)     THREADS=$2; shift 2;;
     --ab-threads)  ABTHREADS=$2; shift 2;;
@@ -59,6 +65,14 @@ done
 [ -x "$ENGINE" ] || { echo "engine not built: $ENGINE" >&2; exit 1; }
 [ -n "$PGN" ] || PGN="/tmp/${NAME1}_vs_${NAME2}.pgn"
 
+# Fixed-nodes mode: deterministic compute per move (immune to system load),
+# the right tool for comparing nets. Pondering makes no sense under a node cap
+# and would break determinism, so force it off.
+if [ -n "$NODES" ]; then
+  PONDER=0
+  echo "mode         : fixed nodes=$NODES (tc=inf, ponder off)"
+fi
+
 PONDER_OPT=""; [ "$PONDER" = 1 ] && PONDER_OPT="ponder"
 
 # Per-engine option block, reused for both with a different EvalFile.
@@ -71,7 +85,11 @@ engine_block() {  # $1=name $2=net
 ARGS=()
 read -r -a E1 <<< "$(engine_block "$NAME1" "$NET1")"; ARGS+=("${E1[@]}")
 read -r -a E2 <<< "$(engine_block "$NAME2" "$NET2")"; ARGS+=("${E2[@]}")
-ARGS+=(-each "tc=$TC" proto=uci)
+if [ -n "$NODES" ]; then
+  ARGS+=(-each "tc=inf" "nodes=$NODES" proto=uci)
+else
+  ARGS+=(-each "tc=$TC" proto=uci)
+fi
 ARGS+=(-games "$GAMES" -repeat -concurrency "$CONCURRENCY" -pgnout "$PGN")
 if [ -n "$BOOK" ]; then
   [ -f "$BOOK" ] || { echo "book not found: $BOOK" >&2; exit 1; }
@@ -82,7 +100,8 @@ else
 fi
 [ "$DEBUG" = 1 ] && ARGS+=(-debug)
 
-echo "match        : $NAME1 vs $NAME2   tc=$TC games=$GAMES threads=$THREADS ponder=$PONDER"
+LIMIT_DESC=$([ -n "$NODES" ] && echo "nodes=$NODES" || echo "tc=$TC")
+echo "match        : $NAME1 vs $NAME2   $LIMIT_DESC games=$GAMES threads=$THREADS ponder=$PONDER"
 echo "pgn          : $PGN"
 
 if [ "$DRY_RUN" = 1 ]; then
