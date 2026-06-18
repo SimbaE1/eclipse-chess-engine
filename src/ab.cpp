@@ -81,6 +81,10 @@ struct SearchCtx {
     // the main worker finishing) sets it, and every worker bails at its next
     // stride check. nullptr in single-threaded search.
     std::atomic<bool>* stop = nullptr;
+    // Caller-owned abort flag (e.g. &SearchInfo::stop). Distinct from `stop`,
+    // which is the internal Lazy-SMP "main worker done, halt helpers" signal.
+    // Either being set aborts the search.
+    const std::atomic<bool>* ext_stop = nullptr;
 
     SearchCtx(Clock::time_point s, std::int64_t b)
         : start(s), budget_ms(b), nodes(0), aborted(false) {}
@@ -92,6 +96,7 @@ struct SearchCtx {
         // measured in milliseconds.
         if ((nodes & 0xFFFu) != 0) return false;
         if (stop && stop->load(std::memory_order_relaxed)) return true;
+        if (ext_stop && ext_stop->load(std::memory_order_relaxed)) return true;
         if (budget_ms <= 0) return false;
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             Clock::now() - start).count();
@@ -666,13 +671,14 @@ static Result id_search(Position& pos, int max_depth, SearchCtx& ctx, int start_
 }
 
 Result find_best_move(Position& pos, int max_depth, std::int64_t time_budget_ms,
-                      int num_threads) {
+                      int num_threads, const std::atomic<bool>* ext_stop) {
     init_search_tables();
     num_threads = std::max(1, num_threads);
     const auto start = Clock::now();
 
     if (num_threads == 1) {
         SearchCtx ctx{start, time_budget_ms};
+        ctx.ext_stop = ext_stop;
         return id_search(pos, max_depth, ctx, 1);
     }
 
@@ -691,6 +697,7 @@ Result find_best_move(Position& pos, int max_depth, std::int64_t time_budget_ms,
         Position  p = pos;                 // own accumulator/board state
         SearchCtx ctx{start, time_budget_ms};
         ctx.stop = &stop;
+        ctx.ext_stop = ext_stop;
         // Main (id 0) runs every depth so its depth_scores trajectory is the
         // clean per-depth sequence the caller's instability check relies on;
         // helpers start a ply ahead to desync.

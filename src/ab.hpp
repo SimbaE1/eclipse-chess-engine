@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <vector>
@@ -38,8 +39,15 @@ struct Result {
 // where those threads are actually free (e.g. the reconciliation extension,
 // where MCTS is idle) -- the steady-state parallel phase should pass its
 // reserved AB-thread count so it doesn't oversubscribe against MCTS.
+//
+// `stop`, when non-null, is polled during the search (same cheap node-stride as
+// the time check): once it goes true the search aborts and returns the deepest
+// result completed so far. The caller passes &SearchInfo::stop so that a `stop`
+// / ponder-miss / quit unblocks the AB thread promptly instead of running out
+// its time budget — otherwise the join that gates the next search stalls and
+// the wasted work is billed to the real move's clock.
 Result find_best_move(Position& pos, int max_depth, std::int64_t time_budget_ms,
-                      int num_threads = 1);
+                      int num_threads = 1, const std::atomic<bool>* stop = nullptr);
 
 // Scores one specific move with an iterative-deepening full-window search,
 // from `pos`'s side-to-move perspective (same convention as Result::score).

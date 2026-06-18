@@ -289,11 +289,16 @@ void cmd_go(const std::vector<std::string>& tok) {
         // keeps us from starving the next move in a long endgame.
         const auto root = policy::get_root_info(g_pos);
         const int  mlh_our_moves = static_cast<int>(root.mlh_plies / 2.0f);
-        // Floor of 8 (was 5): never plan to spend more than ~1/8 of the clock
-        // on a routine move. The old floor of 5 let a low MLH estimate budget
-        // ~20% of remaining time on a single calm position, which is how the
-        // engine bled its clock even when the eval was stable.
-        const int  divisor = std::clamp(mlh_our_moves, 8, 60);
+        // Floor of 20 (was 8, was 5): never plan to spend more than ~1/20 of the
+        // clock on a routine move. The floor matters when the MLH head
+        // UNDER-predicts how long the game will last: it then reports few moves
+        // remaining, the divisor collapses to the floor, and we budget that
+        // fraction of the clock EVERY move. A floor of 8 = 12.5%/move, which over
+        // a normal-length game bleeds the clock to zero and flags — exactly what
+        // happened on 2026-06-18 (flagged a +14 position vs SF lvl5 at 10+15).
+        // 20 = ~5%/move is sustainable with increment across an 80+ move game,
+        // while still letting an accurate (larger) MLH estimate spend more early.
+        const int  divisor = std::clamp(mlh_our_moves, 20, 60);
 
         limits.time_ms = remain / divisor + inc * 4 / 5;
         // Safety: never burn more than 1/3 of remaining time on one move.

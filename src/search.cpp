@@ -173,6 +173,17 @@ bool SearchInfo::time_up() const noexcept {
 std::int64_t SearchInfo::ms_until_hard_deadline() const noexcept {
     constexpr std::int64_t kUnbounded = std::numeric_limits<std::int64_t>::max() / 4;
 
+    // A pending stop (ponder miss, `stop`, or `quit`) means "abort now": report
+    // zero time left so every deadline-clamped phase below — the reconciliation
+    // loop, the AB cross-check/tactic probes, and try_extend — bails out instead
+    // of running expensive work whose result will be discarded. This is critical
+    // for the ponder path: a ponder search that never received a ponderhit
+    // otherwise reports kUnbounded (its ceiling is measured from the hit), so a
+    // stopped ponder would keep deepening; and because the next `go` joins this
+    // thread before starting, that wasted work is billed to the real move's
+    // clock. That is exactly how a won game flagged on 2026-06-18.
+    if (stop.load(std::memory_order_relaxed)) return 0;
+
     // Ponder searches carry the ceiling relative to the ponderhit instant
     // rather than as an absolute deadline (see time_up()): unbounded while
     // still pondering, then hard_limit_ms minus time since the hit.
@@ -303,8 +314,9 @@ Move search(Position& pos, SearchInfo& info) {
         info.threads        = total_threads - info.ab_threads;
         info.limits.time_ms = main_phase_time;
         const int ab_phase_threads = info.ab_threads;  // AB's reserved share
-        ab_thread = std::thread([&ab_result, &ab_pos, main_phase_time, ab_phase_threads]() {
-            ab_result = ab::find_best_move(ab_pos, kAbMaxDepth, main_phase_time, ab_phase_threads);
+        const std::atomic<bool>* ab_stop = &info.stop;
+        ab_thread = std::thread([&ab_result, &ab_pos, main_phase_time, ab_phase_threads, ab_stop]() {
+            ab_result = ab::find_best_move(ab_pos, kAbMaxDepth, main_phase_time, ab_phase_threads, ab_stop);
         });
     } else if (total_time_ms > 0 && info.ab_threads > 0) {
         // Sequential mode: reserve 1/4 of the move for the post-MCTS AB run
@@ -333,7 +345,7 @@ Move search(Position& pos, SearchInfo& info) {
         if (ab_budget < kAbSeqBudgetMinMs) ab_budget = kAbSeqBudgetMinMs;
         if (ab_budget > total_time_ms / 2) ab_budget = total_time_ms / 2;
         if (ab_budget < 1) ab_budget = 1;
-        ab_result = ab::find_best_move(pos, kAbMaxDepth, ab_budget, total_threads);
+        ab_result = ab::find_best_move(pos, kAbMaxDepth, ab_budget, total_threads, &info.stop);
     }
 
     info.limits.time_ms = orig_time_ms;  // restore for caller introspection
@@ -418,7 +430,7 @@ Move search(Position& pos, SearchInfo& info) {
         // exactly where the otherwise-idle cores buy depth, the whole point of
         // extending. Its global TT is already warm, so early depths resolve
         // almost instantly and it picks up roughly where it left off.
-        ab_result = ab::find_best_move(pos, kAbMaxDepth, chunk - chunk / 2, total_threads);
+        ab_result = ab::find_best_move(pos, kAbMaxDepth, chunk - chunk / 2, total_threads, &info.stop);
         return true;
     };
 
@@ -428,9 +440,15 @@ Move search(Position& pos, SearchInfo& info) {
 
         if (ab_result.move == MoveNone) break;  // AB not running at all (ab_threads==0)
 
+        // Aborting (ponder miss / stop / quit): commit to the current best move
+        // immediately. Reconciliation results would be discarded, and dawdling
+        // here delays the join that gates the next real search.
+        if (info.stop.load(std::memory_order_relaxed)) break;
+
         // Out of time for reconciliation: commit to MCTS's move rather than
         // start probes/validation we can't afford. The hard deadline already
         // reserves a latency margin, so stopping here keeps us from flagging.
+        // (ms_until_hard_deadline() also returns 0 once stop is set.)
         if (info.ms_until_hard_deadline() <= 0) break;
 
         // Before trusting AB's read at all -- whether to confirm MCTS's move or
