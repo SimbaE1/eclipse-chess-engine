@@ -9,10 +9,8 @@
   "enable_tpu": false,
   "enable_internet": true,
   "dataset_sources": [
-    "simbae11/eclipse-partial",
-    "simbae11/eclipse-trainer",
     "simbae11/eclipse-chunks-a",
-    "simbae11/eclipse-chunks-b"
+    "simbae11/eclipse-checkpoint"
   ],
   "kernel_sources": [],
   "competition_sources": [],
