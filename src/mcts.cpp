@@ -921,12 +921,48 @@ void MCTS::expand_under_lock(Node* node, Position& pos, int depth) {
         }
     }
 
+    // Bias toward a known-critical line (see set_bias_path()). Soft nudge:
+    // multiply that depth's matching child's prior instead of forcing it, so
+    // PUCT is much more likely to walk this line without losing the ability
+    // to explore siblings/refutations along the way.
+    if (depth < static_cast<int>(bias_path_.size())) {
+        const Move biased = bias_path_[static_cast<std::size_t>(depth)];
+        for (int i = 0; i < n_moves; ++i) {
+            if (moves[static_cast<std::size_t>(i)] == biased) {
+                constexpr float kBiasMultiplier = 8.0f;
+                sum_p += priors_buf[i] * (kBiasMultiplier - 1.0f);
+                priors_buf[i] *= kBiasMultiplier;
+                break;
+            }
+        }
+    }
+
     node->children.reserve(static_cast<std::size_t>(n_moves));
     for (int i = 0; i < n_moves; ++i) {
         const float p = (sum_p > 1e-6f)
             ? priors_buf[i] / sum_p
             : 1.0f / static_cast<float>(n_moves);
-        node->children.push_back(make_node(moves[static_cast<std::size_t>(i)], node, p));
+        NodePtr child = make_node(moves[static_cast<std::size_t>(i)], node, p);
+
+        // Tactic-node seed (see set_value_seed()): if this child's resulting
+        // position is the exact node AB's deep search flagged, start it with
+        // virtual_visits worth of AB's value already backed in instead of 0.
+        // Cheap key-only do/undo (no accumulator update) -- and skipped
+        // entirely unless a seed is actually armed.
+        if (value_seed_key_ != 0) {
+            StateInfo seed_st;
+            pos.do_move(moves[static_cast<std::size_t>(i)], seed_st,
+                       /*snapshot_acc=*/false, /*update_acc=*/false);
+            if (pos.key() == value_seed_key_) {
+                child->N.store(value_seed_visits_, std::memory_order_relaxed);
+                child->W_fx.store(
+                    static_cast<std::int64_t>(value_seed_q_ * static_cast<float>(value_seed_visits_) * kWScale),
+                    std::memory_order_relaxed);
+            }
+            pos.undo_move(moves[static_cast<std::size_t>(i)], seed_st, /*restore_acc=*/false);
+        }
+
+        node->children.push_back(std::move(child));
     }
 
     // Release ordering ensures other threads that acquire-load is_expanded

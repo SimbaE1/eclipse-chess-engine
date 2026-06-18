@@ -38,6 +38,29 @@ constexpr std::int64_t kValidationBudgetNum = 1;
 constexpr std::int64_t kValidationBudgetDen = 8;
 constexpr std::int64_t kValidationBudgetMinMs = 100;
 
+// Tactic-trace budget: a dedicated AB iterative-deepening pass at the
+// post-AB-move position, looking for the depth at which a refutation/tactic
+// is first discovered (see ab::find_tactic_node). Separate from the warm-TT
+// reuse the cross-check gets — this needs real depth, not just a quick read,
+// so it gets its own modest slice rather than piggybacking on cached work.
+constexpr std::int64_t kTacticTraceBudgetMs = 1500;
+// Cheaper budget for the detection-side trace (search.cpp's disagreement
+// check, run only when AB's own pick already differs from MCTS's but the
+// fast cross-check didn't flag a problem) — a quick second opinion, not a
+// thorough confirmation; the validation step's own trace gets the fuller
+// budget above.
+constexpr std::int64_t kDetectionTraceBudgetMs = 600;
+// The detection-side trace runs AFTER the normal search budget is already
+// spent -- it's extra wall-clock on top of whatever movetime was requested,
+// not carved out of it. Fine in rapid/classical; risky in blitz/bullet
+// where that overhead could itself cause time trouble. Skip it below this
+// per-move budget so it only ever fires when there's real room for it.
+constexpr std::int64_t kMinTimeForDeepDetectionMs = 3000;
+// Virtual visits backed into a seeded tactic node: large enough to bias
+// PUCT meaningfully on first encounter, small enough that a handful of real
+// visits can override it if deeper search there disagrees with AB's read.
+constexpr int kTacticSeedVisits = 8;
+
 // Mate scores always override regardless of margin. They are objective truth
 // (within AB's search depth) and validation cannot disprove them.
 bool is_mate_score(Score s) noexcept {
@@ -266,11 +289,42 @@ Move search(Position& pos, SearchInfo& info) {
         // confirmed loss, or a score well below what MCTS itself claims.
         // A winning mate on MCTS's own move is NOT a disagreement; there's
         // nothing to fix.
-        const bool ab_views_mcts_move_as_bad =
+        bool ab_views_mcts_move_as_bad =
             (is_mate_score(ab_view_of_mcts_move) && ab_view_of_mcts_move < 0) ||
             ab_view_of_mcts_move <= info.best_score - info.override_margin;
         const bool ab_has_better_alternative =
             ab_result.score >= info.best_score + info.override_margin;
+
+        // The cheap cross-check above (kCrossCheckBudgetMs, warm-TT reuse)
+        // can miss a refutation that's genuinely several plies deep -- it's
+        // built for speed, not depth. Before concluding "no disagreement",
+        // if AB already has SOME independent opinion here (its own pick
+        // differs) but the cheap check didn't catch why, give it a second,
+        // deeper look specifically for a stable "aha" a quick read would
+        // miss. Gated on ab_result.move != info.best_move so this never
+        // runs in the common case where AB and MCTS already agree.
+        if (!ab_views_mcts_move_as_bad && ab_result.move != info.best_move &&
+            orig_time_ms >= kMinTimeForDeepDetectionMs) {
+            Position deeper_pos = ab_pos_cc;
+            StateInfo deeper_st;
+            deeper_pos.do_move(info.best_move, deeper_st);
+            const ab::TacticNode deep_tactic =
+                ab::find_tactic_node(deeper_pos, kAbMaxDepth, kDetectionTraceBudgetMs);
+            // root_score_cp is from deeper_pos's own STM (the opponent,
+            // since we just played info.best_move) -- negate once to get it
+            // back to our/root perspective, matching info.best_score's
+            // convention, before comparing against the same margin the
+            // cheap check uses.
+            const Score our_perspective_cp = static_cast<Score>(-deep_tactic.root_score_cp);
+            if (deep_tactic.found && our_perspective_cp <= info.best_score - info.override_margin) {
+                ab_views_mcts_move_as_bad = true;
+                std::cout << "info string AB deep cross-check: mcts " << info.best_move.to_uci()
+                          << " hides a refutation at depth " << deep_tactic.aha_depth
+                          << " (" << our_perspective_cp << "cp vs claimed " << info.best_score << "cp), path=";
+                for (const Move m : deep_tactic.path) std::cout << m.to_uci() << " ";
+                std::cout << std::endl;
+            }
+        }
 
         const bool ab_disagrees =
             ab_result.move != info.best_move &&
@@ -311,6 +365,31 @@ Move search(Position& pos, SearchInfo& info) {
             validation_info.silent         = true;           // don't emit info lines from opponent's POV
 
             mcts::MCTS validator(validation_pos, validation_info);
+
+            // Look for AB's "aha moment": the specific node, several plies
+            // into validation_pos, where iterative deepening first found a
+            // stable refutation/tactic. If found, seed MCTS's evaluation
+            // there directly (instead of leaving it to NNUE judgment + visit
+            // allocation that may never reach it) and bias exploration along
+            // the path so MCTS is actually likely to walk down to it.
+            Position tactic_trace_pos = validation_pos;
+            const ab::TacticNode tactic = (orig_time_ms >= kMinTimeForDeepDetectionMs)
+                ? ab::find_tactic_node(tactic_trace_pos, kAbMaxDepth, kTacticTraceBudgetMs)
+                : ab::TacticNode{};
+            if (tactic.found) {
+                Position key_pos = validation_pos;
+                StateInfo key_st;
+                for (const Move m : tactic.path) key_pos.do_move(m, key_st);
+
+                std::cout << "info string AB tactic-trace: found at depth " << tactic.aha_depth
+                          << ", path=";
+                for (const Move m : tactic.path) std::cout << m.to_uci() << " ";
+                std::cout << " seed_q=" << tactic.seed_q << std::endl;
+
+                validator.set_bias_path(tactic.path);
+                validator.set_value_seed(key_pos.key(), tactic.seed_q, kTacticSeedVisits);
+            }
+
             validator.run();
             (void) validator.get_best_move();  // populates validation_info.best_score
 

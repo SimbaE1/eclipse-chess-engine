@@ -7,6 +7,7 @@
 
 #include "bitboard.hpp"
 #include "movegen.hpp"
+#include "nnue.hpp"
 #include "syzygy.hpp"
 #include "tt.hpp"
 #include "types.hpp"
@@ -568,6 +569,35 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
     return best;
 }
 
+// Walk the TT from `pos` (a disposable copy -- this never undoes) following
+// each position's stored best move, up to `max_len` plies. Every node
+// visited during search already calls g_tt.store() with its best move, so
+// this reconstructs the PV without needing a dedicated triangular array.
+// Stops early on a TT miss, a stored move that's no longer legal (stale
+// entry got overwritten by a different position with the same key slot),
+// or a missing move (upper-bound-only entries store one).
+std::vector<Move> extract_pv_from_tt(Position pos, int max_len) {
+    std::vector<Move> pv;
+    pv.reserve(static_cast<std::size_t>(max_len));
+    for (int i = 0; i < max_len; ++i) {
+        TTEntry entry;
+        if (!g_tt.probe(pos.key(), entry) || entry.move == MoveNone) break;
+
+        MoveList legal;
+        generate_legal_moves(pos, legal);
+        bool is_legal = false;
+        for (int j = 0; j < legal.size; ++j) {
+            if (legal[static_cast<std::size_t>(j)] == entry.move) { is_legal = true; break; }
+        }
+        if (!is_legal) break;
+
+        StateInfo st;
+        pos.do_move(entry.move, st);
+        pv.push_back(entry.move);
+    }
+    return pv;
+}
+
 }  // namespace
 
 Result find_best_move(Position& pos, int max_depth, std::int64_t time_budget_ms) {
@@ -635,6 +665,90 @@ Score score_move(Position& pos, Move m, int max_depth, std::int64_t time_budget_
 
     ctx.key_history.pop_back();
     pos.undo_move(m, st);
+    return result;
+}
+
+TacticNode find_tactic_node(Position& pos, int max_depth, std::int64_t time_budget_ms) {
+    init_search_tables();
+    TacticNode result;
+    SearchCtx ctx{Clock::now(), time_budget_ms};
+
+    std::vector<Score>             scores;
+    std::vector<std::vector<Move>> pvs;
+    scores.reserve(static_cast<std::size_t>(max_depth));
+    pvs.reserve(static_cast<std::size_t>(max_depth));
+
+    Score last_score = 0;
+    for (int d = 1; d <= max_depth; ++d) {
+        Move best_at_d;
+        Score s;
+        if (d <= 4) {
+            s = negamax(pos, d, -kInfinite, kInfinite, 0, best_at_d, ctx, MoveNone);
+        } else {
+            Score delta = 50;
+            Score alpha = std::max(-kInfinite, last_score - delta);
+            Score beta  = std::min( kInfinite, last_score + delta);
+            while (true) {
+                s = negamax(pos, d, alpha, beta, 0, best_at_d, ctx, MoveNone);
+                if (ctx.aborted) break;
+                if      (s <= alpha) { delta *= 4; alpha = std::max(-kInfinite, last_score - delta); }
+                else if (s >= beta)  { delta *= 4; beta  = std::min( kInfinite, last_score + delta); }
+                else break;
+                if (delta >= 800) { alpha = -kInfinite; beta = kInfinite; }
+            }
+        }
+        if (ctx.aborted) break;
+        last_score = s;
+        scores.push_back(s);
+        pvs.push_back(extract_pv_from_tt(pos, std::min(d, 12)));
+    }
+
+    // Scan for the shallowest stable swing: a real, newly-discovered line,
+    // not aspiration-window noise from one unlucky re-search. Skips the
+    // first few (noisy) depths and requires the new score to hold for the
+    // next couple of completed depths before trusting it.
+    constexpr int   kMinDepthIdx        = 3;   // 0-indexed; skips depths 1-3
+    constexpr Score kSwingThreshold     = 60;  // cp -- below this, not a real "aha"
+    constexpr Score kStabilityTolerance = 25;  // cp drift allowed across confirming depths
+
+    const int n = static_cast<int>(scores.size());
+    for (int k = kMinDepthIdx; k < n; ++k) {
+        const Score swing = static_cast<Score>(scores[static_cast<std::size_t>(k)] -
+                                                scores[static_cast<std::size_t>(k - 1)]);
+        if (std::abs(swing) < kSwingThreshold) continue;
+        if (k + 1 >= n) continue;  // no confirming depth completed -- can't trust it yet
+
+        bool stable = true;
+        for (int j = k + 1; j <= k + 2 && j < n; ++j) {
+            if (std::abs(static_cast<int>(scores[static_cast<std::size_t>(j)]) -
+                         static_cast<int>(scores[static_cast<std::size_t>(k)])) > kStabilityTolerance) {
+                stable = false;
+                break;
+            }
+        }
+        if (!stable) continue;
+
+        const auto& prev_pv = pvs[static_cast<std::size_t>(k - 1)];
+        const auto& cur_pv  = pvs[static_cast<std::size_t>(k)];
+        std::size_t div = 0;
+        while (div < prev_pv.size() && div < cur_pv.size() && prev_pv[div] == cur_pv[div]) ++div;
+        if (div >= cur_pv.size()) continue;  // depths agree on every move we have -- no new line found
+
+        result.found        = true;
+        result.aha_depth    = k + 1;
+        result.root_score_cp = scores[static_cast<std::size_t>(k)];
+        result.path.assign(cur_pv.begin(), cur_pv.begin() + static_cast<long>(div) + 1);
+
+        // scores[k] is from `pos`'s STM perspective; negate once per ply to
+        // get the tactic node's value from ITS OWN side-to-move perspective
+        // (same alternation as Result::score / adjust_root_q in mcts.cpp).
+        const bool  odd_path_len = (result.path.size() % 2) == 1;
+        const Score node_score_cp = odd_path_len ? static_cast<Score>(-scores[static_cast<std::size_t>(k)])
+                                                  : scores[static_cast<std::size_t>(k)];
+        result.seed_q = static_cast<float>(node_score_cp) / nnue::output_cp_per_unit();
+        break;
+    }
+
     return result;
 }
 

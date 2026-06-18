@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <vector>
 
 #include "eval.hpp"
 #include "move.hpp"
@@ -41,5 +42,35 @@ Result find_best_move(Position& pos, int max_depth, std::int64_t time_budget_ms)
 // non-top-ordered move (the common case when AB and MCTS disagree) never
 // gets an honest number unless asked for explicitly like this.
 Score score_move(Position& pos, Move m, int max_depth, std::int64_t time_budget_ms);
+
+// Result of find_tactic_node(): the specific node, several plies into `pos`,
+// where AB's iterative deepening first discovered a refutation/tactic --
+// AB's "aha moment" -- along with its value from that node's own
+// side-to-move perspective, in MCTS Q-units ([-1, 1], cp / output_cp_per_unit).
+struct TacticNode {
+    bool               found = false;
+    std::vector<Move>  path;        // moves from `pos` down to (and including) the tactic node
+    float               seed_q = 0.0f;       // value AT the tactic node, ITS OWN side-to-move's perspective
+    Score                root_score_cp = 0;  // value of `pos` itself (root of this trace), pos's own STM perspective, at aha_depth
+    int                  aha_depth = 0;       // AB depth at which the swing was confirmed stable
+};
+
+// Runs iterative deepening at `pos`, recording the score AND principal
+// variation at every completed depth (PV extracted by walking the TT --
+// every node visited during search already stores its best move there).
+// Scans the depth sequence for the shallowest point where the score jumps
+// sharply AND stays close to the new value for the next couple of
+// completed depths -- a real, newly-discovered line, not aspiration-window
+// noise from one unlucky re-search. The node where that depth's PV first
+// diverges from the previous depth's PV is the tactic node: the position
+// AB didn't realize was bad/good until it searched one ply deeper than
+// before.
+//
+// Used to seed MCTS's evaluation at that exact node (see
+// MCTS::set_value_seed) instead of leaving it to NNUE judgment + visit
+// allocation that may never reach it. Returns found=false if no stable
+// swing is found in the time/depth budget -- callers should treat that as
+// "AB didn't find anything conclusive enough to trust," not retry harder.
+TacticNode find_tactic_node(Position& pos, int max_depth, std::int64_t time_budget_ms);
 
 }  // namespace eclipse::ab

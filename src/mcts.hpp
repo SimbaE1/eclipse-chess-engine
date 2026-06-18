@@ -206,6 +206,35 @@ public:
     // Must be called before save_to_cache() (which nulls the root).
     Move get_ponder_move_after(Move best_move) const;
 
+    // ---- Tactic-node seeding (used by search.cpp's AB-validation step) ----
+    //
+    // AB's iterative deepening can find a refutation several plies into a
+    // line before MCTS's own policy priors would ever steer it there -- by
+    // the time MCTS's NNUE-based judgment of the position after AB's move
+    // matters, the critical node is buried deep enough that visits never
+    // reach it. Two soft (not forced) nudges address that:
+    //
+    //  - set_bias_path(): at each depth along this move sequence (root=0),
+    //    expand_under_lock multiplies that depth's matching child's prior so
+    //    PUCT is more likely to actually walk down this line instead of
+    //    wherever the policy net's untouched judgment would normally go.
+    //  - set_value_seed(): the FIRST time a node matching this exact
+    //    position (by Zobrist key) gets created, it starts with
+    //    `virtual_visits` worth of `q` already backed in, instead of 0
+    //    visits. This is a prior, not a terminal marking (see is_terminal
+    //    elsewhere) -- real visits accumulated afterward average normally
+    //    and can move the value away from the seed if deeper search there
+    //    disagrees with AB's read.
+    //
+    // Both are no-ops unless explicitly set (empty path / key 0), so they
+    // add no cost to normal root search.
+    void set_bias_path(std::vector<Move> path) { bias_path_ = std::move(path); }
+    void set_value_seed(std::uint64_t key, float q, int virtual_visits) {
+        value_seed_key_    = key;
+        value_seed_q_      = q;
+        value_seed_visits_ = virtual_visits;
+    }
+
 private:
     void   worker_loop();
     // Collect up to `batch_size` leaves (selection + expansion, with virtual
@@ -217,6 +246,12 @@ private:
     void   expand_under_lock(Node* node, Position& pos, int depth);
     float  evaluate_node(const Position& pos);
     void   log_search_summary(const Node& chosen, std::int32_t chosen_visits) const;
+
+    // See set_bias_path()/set_value_seed() above.
+    std::vector<Move> bias_path_;
+    std::uint64_t      value_seed_key_    = 0;
+    float              value_seed_q_      = 0.0f;
+    int                value_seed_visits_ = 0;
 
     Position&   root_pos;
     SearchInfo& search_info;

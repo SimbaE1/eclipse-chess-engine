@@ -10,6 +10,10 @@ add_executable(nnue_eval_server nnue_eval_server.cpp)
 target_link_libraries(nnue_eval_server PRIVATE eclipse_core)
 target_include_directories(nnue_eval_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
+add_executable(tactic_trace_tool tactic_trace_tool.cpp)
+target_link_libraries(tactic_trace_tool PRIVATE eclipse_core)
+target_include_directories(tactic_trace_tool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
 eclipse_add_test(test_types)
 eclipse_add_test(test_bitboard)
 eclipse_add_test(test_attacks)
