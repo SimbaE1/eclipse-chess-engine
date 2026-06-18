@@ -16,6 +16,11 @@ struct Result {
     Score score      = 0;            // from root side-to-move's perspective
     int   reached_d  = 0;            // depth actually completed
     std::int64_t nodes = 0;
+    // Root score at each completed depth (depth_scores[i] == score after
+    // depth i+1), root side-to-move perspective. Lets callers see whether the
+    // eval is still drifting with depth -- a move that looks fine shallow but
+    // erodes deeper (a slow-burn positional trap) -- and decide to search on.
+    std::vector<Score> depth_scores;
 };
 
 // Iterative-deepening alpha-beta search with quiescence at the leaves.
@@ -27,7 +32,14 @@ struct Result {
 // has elapsed; whichever comes first. Returns the best move found at
 // the deepest completed iteration. If no time is available at all
 // (budget <= 0) the depth-1 result is returned.
-Result find_best_move(Position& pos, int max_depth, std::int64_t time_budget_ms);
+//
+// `num_threads` > 1 runs Lazy SMP: helper threads share the global TT to push
+// the main worker deeper in the same wall-clock. Pass the thread count only
+// where those threads are actually free (e.g. the reconciliation extension,
+// where MCTS is idle) -- the steady-state parallel phase should pass its
+// reserved AB-thread count so it doesn't oversubscribe against MCTS.
+Result find_best_move(Position& pos, int max_depth, std::int64_t time_budget_ms,
+                      int num_threads = 1);
 
 // Scores one specific move with an iterative-deepening full-window search,
 // from `pos`'s side-to-move perspective (same convention as Result::score).

@@ -46,7 +46,7 @@ void TranspositionTable::store(std::uint64_t key, Move move, Score score, int de
                                  || score <= -TTEntry::kTTMateScore);
 
     if (e.key != key || new_is_exact_mate || depth >= e.depth) {
-        e.save(key, move, score, depth, flag, ply);
+        e.save(key, move, score, depth, flag, ply, generation_);
     }
 }
 

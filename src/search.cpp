@@ -81,6 +81,51 @@ constexpr std::int64_t kCrossCheckBudgetMs = 150;
 constexpr std::int64_t kMinExtensionMs = 300;
 constexpr int          kMaxExtensionRounds = 2;
 
+// Eval-instability detection. A move can look fine at shallow depth and erode
+// the deeper a searcher looks -- the Ba4-style slow trap (+98cp at d7, +46cp
+// at d13, -280cp by SF d22). When AB's root score for its pick is still
+// drifting at the deepest completed depth, the shallow read isn't trustworthy;
+// if there's clock slack we deepen both searchers and re-check rather than
+// committing. Tuned conservatively against AB's per-depth trajectory.
+constexpr int   kMinDepthsForTrend = 6;   // need this many completed depths to judge
+constexpr Score kUnsettledStepCp   = 45;  // a jump this big at the last ply = not settled
+constexpr int   kUnsettledWindow   = 5;   // # of depth-to-depth transitions to scan
+constexpr Score kUnsettledDriftCp  = 40;  // net drift over the window to count as unsettled
+constexpr Score kStillMovingCp     = 12;  // recent spread below this = converged, leave it
+
+// True if `ds` (root scores per completed depth) hasn't converged. Real AB
+// trajectories are noisy (aspiration re-searches spike single plies), so we
+// don't require strict monotonicity -- we look for a substantial NET drift
+// over the recent window that is STILL moving at the deepest plies. That
+// catches the slow-burn trap (Ba4: 179@d1 -> 84@d8 -> ~50@d11, despite a
+// noisy d6 spike) while leaving genuinely settled evals alone. Mate/TB tails
+// are treated as settled -- a deeper look has nothing to add.
+bool eval_unsettled(const std::vector<Score>& ds) {
+    const int n = static_cast<int>(ds.size());
+    if (n < kMinDepthsForTrend) return false;
+    if (ds[static_cast<std::size_t>(n - 1)] >= kMateInMaxPly ||
+        ds[static_cast<std::size_t>(n - 1)] <= -kMateInMaxPly) return false;
+
+    // (1) Big single-ply move at the deepest completed depth: clearly unsettled.
+    if (std::abs(static_cast<int>(ds[static_cast<std::size_t>(n - 1)]) -
+                 static_cast<int>(ds[static_cast<std::size_t>(n - 2)])) >= kUnsettledStepCp)
+        return true;
+
+    // (2) Net drift over the window AND still moving (recent plies not in a
+    //     tight band). Both conditions are needed: net drift alone fires on a
+    //     move that rose then settled; the "still moving" spread gates that out.
+    const int w   = std::min(n - 1, kUnsettledWindow);
+    const int net = static_cast<int>(ds[static_cast<std::size_t>(n - 1)]) -
+                    static_cast<int>(ds[static_cast<std::size_t>(n - 1 - w)]);
+    int lo = ds[static_cast<std::size_t>(n - 1)], hi = lo;
+    for (int i = std::max(0, n - 3); i < n; ++i) {
+        lo = std::min(lo, static_cast<int>(ds[static_cast<std::size_t>(i)]));
+        hi = std::max(hi, static_cast<int>(ds[static_cast<std::size_t>(i)]));
+    }
+    const bool still_moving = (hi - lo) >= kStillMovingCp;
+    return std::abs(net) >= kUnsettledDriftCp && still_moving;
+}
+
 void log_ab_outcome(const ab::Result& ab, Move mcts_move, Score mcts_cp, const char* tag) {
     std::cout << "info string AB " << tag
               << ": mcts " << mcts_move.to_uci() << " " << mcts_cp << "cp"
@@ -205,8 +250,9 @@ Move search(Position& pos, SearchInfo& info) {
         // 1/8 is reserved for validation if AB disagrees with MCTS.
         info.threads        = total_threads - info.ab_threads;
         info.limits.time_ms = main_phase_time;
-        ab_thread = std::thread([&ab_result, &ab_pos, main_phase_time]() {
-            ab_result = ab::find_best_move(ab_pos, kAbMaxDepth, main_phase_time);
+        const int ab_phase_threads = info.ab_threads;  // AB's reserved share
+        ab_thread = std::thread([&ab_result, &ab_pos, main_phase_time, ab_phase_threads]() {
+            ab_result = ab::find_best_move(ab_pos, kAbMaxDepth, main_phase_time, ab_phase_threads);
         });
     } else if (total_time_ms > 0 && info.ab_threads > 0) {
         // Sequential mode: reserve 10% (clamped) for the post-MCTS AB run,
@@ -229,12 +275,13 @@ Move search(Position& pos, SearchInfo& info) {
     if (parallel_ab) {
         ab_thread.join();
     } else if (total_time_ms > 0 && info.ab_threads > 0) {
-        // Run the small reserved slice now, on this thread.
+        // Run the small reserved slice now, on this thread. MCTS has finished,
+        // so AB can use every thread (Lazy SMP) for the deepest read possible.
         std::int64_t ab_budget = total_time_ms * kAbSeqBudgetPctNum / kAbSeqBudgetPctDen;
         ab_budget = std::clamp(ab_budget, kAbSeqBudgetMinMs, kAbSeqBudgetMaxMs);
         if (ab_budget > total_time_ms / 2) ab_budget = total_time_ms / 2;
         if (ab_budget < 1) ab_budget = 1;
-        ab_result = ab::find_best_move(pos, kAbMaxDepth, ab_budget);
+        ab_result = ab::find_best_move(pos, kAbMaxDepth, ab_budget, total_threads);
     }
 
     info.limits.time_ms = orig_time_ms;  // restore for caller introspection
@@ -276,11 +323,56 @@ Move search(Position& pos, SearchInfo& info) {
     //      for prioritizing the underlying eval-quality fix later).
     Position ab_pos_cc = pos;  // scratch copy for score_move (mutates internally but restores)
     int extension_rounds = 0;
+
+    // Spend a bounded slice of clock slack deepening BOTH searchers, then let
+    // the loop re-check. Shared by the "both sides refuted each other" case and
+    // the "they agree but the eval is still drifting" case. Returns false (no
+    // extension performed) when the round cap or slack budget is exhausted.
+    auto try_extend = [&](const char* reason) -> bool {
+        if (extension_rounds >= kMaxExtensionRounds ||
+            info.limits.extra_budget_ms < kMinExtensionMs) {
+            return false;
+        }
+        const std::int64_t chunk = std::min(info.limits.extra_budget_ms,
+                                             std::max<std::int64_t>(orig_time_ms, kMinExtensionMs));
+        info.limits.extra_budget_ms -= chunk;
+        ++extension_rounds;
+        std::cout << "info string AB/MCTS reconciliation: extending by " << chunk
+                  << "ms (" << reason << ", round " << extension_rounds << ", "
+                  << info.limits.extra_budget_ms << "ms slack left)" << std::endl;
+
+        // Extend MCTS on the SAME tree (more visits on the same position).
+        info.limits.time_ms = chunk / 2;
+        info.start_time     = std::chrono::steady_clock::now();
+        mcts_search.run(/*keep_existing_root=*/true);
+        info.best_move = mcts_search.get_best_move();
+
+        // Extend AB. MCTS has just finished its slice above and is idle, so AB
+        // gets ALL threads here (Lazy SMP) -- this focused deeper re-check is
+        // exactly where the otherwise-idle cores buy depth, the whole point of
+        // extending. Its global TT is already warm, so early depths resolve
+        // almost instantly and it picks up roughly where it left off.
+        ab_result = ab::find_best_move(pos, kAbMaxDepth, chunk - chunk / 2, total_threads);
+        return true;
+    };
+
     bool resolved = false;
     while (!resolved) {
         resolved = true;  // unless the extension branch below says otherwise
 
         if (ab_result.move == MoveNone) break;  // AB not running at all (ab_threads==0)
+
+        // Before trusting AB's read at all -- whether to confirm MCTS's move or
+        // to override with AB's own pick -- make sure that read has actually
+        // settled. If AB's score is still drifting with depth and there's clock
+        // slack, deepen both searchers and re-check first. A shallow read here
+        // is exactly what commits to a slow-burn trap (the Ba4 case: AB's own
+        // d8 pick is Ba4 at +84cp, but it erodes to ~+50 by d11 and AB switches
+        // to Nf5). Runs whether or not AB and MCTS currently agree.
+        if (eval_unsettled(ab_result.depth_scores) && try_extend("eval unsettled")) {
+            resolved = false;
+            continue;
+        }
 
         const Score ab_view_of_mcts_move =
             ab::score_move(ab_pos_cc, info.best_move, kAbMaxDepth, kCrossCheckBudgetMs);
@@ -295,6 +387,14 @@ Move search(Position& pos, SearchInfo& info) {
         const bool ab_has_better_alternative =
             ab_result.score >= info.best_score + info.override_margin;
 
+        // A tactic found in the line AFTER MCTS's move = a refutation of that
+        // move (the opponent wins). Distinct from a tactic after AB's move,
+        // which would mean AB's move is the improvement. We track this one
+        // separately so the validation phase can judge AB's alternative against
+        // what MCTS's move is *actually* worth once refuted -- rather than
+        // assuming the disagreement means AB's move is better.
+        ab::TacticNode mcts_refutation;
+
         // The cheap cross-check above (kCrossCheckBudgetMs, warm-TT reuse)
         // can miss a refutation that's genuinely several plies deep -- it's
         // built for speed, not depth. Before concluding "no disagreement",
@@ -308,20 +408,20 @@ Move search(Position& pos, SearchInfo& info) {
             Position deeper_pos = ab_pos_cc;
             StateInfo deeper_st;
             deeper_pos.do_move(info.best_move, deeper_st);
-            const ab::TacticNode deep_tactic =
+            mcts_refutation =
                 ab::find_tactic_node(deeper_pos, kAbMaxDepth, kDetectionTraceBudgetMs);
             // root_score_cp is from deeper_pos's own STM (the opponent,
             // since we just played info.best_move) -- negate once to get it
             // back to our/root perspective, matching info.best_score's
             // convention, before comparing against the same margin the
             // cheap check uses.
-            const Score our_perspective_cp = static_cast<Score>(-deep_tactic.root_score_cp);
-            if (deep_tactic.found && our_perspective_cp <= info.best_score - info.override_margin) {
+            const Score our_perspective_cp = static_cast<Score>(-mcts_refutation.root_score_cp);
+            if (mcts_refutation.found && our_perspective_cp <= info.best_score - info.override_margin) {
                 ab_views_mcts_move_as_bad = true;
                 std::cout << "info string AB deep cross-check: mcts " << info.best_move.to_uci()
-                          << " hides a refutation at depth " << deep_tactic.aha_depth
+                          << " hides a refutation at depth " << mcts_refutation.aha_depth
                           << " (" << our_perspective_cp << "cp vs claimed " << info.best_score << "cp), path=";
-                for (const Move m : deep_tactic.path) std::cout << m.to_uci() << " ";
+                for (const Move m : mcts_refutation.path) std::cout << m.to_uci() << " ";
                 std::cout << std::endl;
             }
         }
@@ -398,13 +498,30 @@ Move search(Position& pos, SearchInfo& info) {
             // our root perspective.
             const Score validated_cp = static_cast<Score>(-validation_info.best_score);
 
+            // The bar AB's move must clear is what MCTS's move is *actually*
+            // worth, not MCTS's own claim for it. info.best_score assumes MCTS
+            // gets to follow its move's optimistic line; if AB sees the move as
+            // worse (ab_view_of_mcts_move) or has a stable refutation of it
+            // (mcts_refutation), that optimistic figure is an overestimate and
+            // judging AB's alternative against it is unfair. Take the tightest
+            // (lowest) honest estimate. This is the "tactic makes MCTS's move
+            // worse" half of the picture -- the seed below is the "tactic makes
+            // AB's move better" half; we don't presume which one is in play.
+            Score mcts_move_bar = std::min(info.best_score, ab_view_of_mcts_move);
+            if (mcts_refutation.found) {
+                mcts_move_bar = std::min(mcts_move_bar,
+                                         static_cast<Score>(-mcts_refutation.root_score_cp));
+            }
+
             std::cout << "info string AB validation: ab " << ab_result.move.to_uci()
                       << " " << ab_result.score << "cp (d=" << ab_result.reached_d
                       << ")  mcts-verdict-after-move " << validated_cp << "cp"
-                      << "  vs mcts-original " << info.best_score << "cp"
+                      << "  vs mcts-claim " << info.best_score << "cp"
+                      << " (bar " << mcts_move_bar << "cp"
+                      << (mcts_refutation.found ? ", mcts-move refuted)" : ")")
                       << std::endl;
 
-            if (validated_cp >= info.best_score) {
+            if (validated_cp >= mcts_move_bar) {
                 log_ab_outcome(ab_result, info.best_move, info.best_score, "override (validated)");
                 info.best_move  = ab_result.move;
                 info.best_score = validated_cp;
@@ -415,34 +532,14 @@ Move search(Position& pos, SearchInfo& info) {
             log_ab_outcome(ab_result, info.best_move, info.best_score, "refuted (no validation phase)");
         }
 
-        // Both sides refuted each other. If there's clock slack and we
-        // haven't burned through the extension budget, deepen both
-        // searchers and re-check instead of guessing.
-        if (extension_rounds >= kMaxExtensionRounds || info.limits.extra_budget_ms < kMinExtensionMs) {
+        // Both sides refuted each other. If there's clock slack and we haven't
+        // burned through the extension budget, deepen both searchers and
+        // re-check instead of guessing.
+        if (!try_extend("double-disagreement")) {
             log_ab_outcome(ab_result, info.best_move, info.best_score,
                            "unresolved double-disagreement (kept mcts)");
             break;
         }
-
-        const std::int64_t chunk = std::min(info.limits.extra_budget_ms,
-                                             std::max<std::int64_t>(orig_time_ms, kMinExtensionMs));
-        info.limits.extra_budget_ms -= chunk;
-        ++extension_rounds;
-        std::cout << "info string AB/MCTS reconciliation: extending by " << chunk
-                  << "ms (round " << extension_rounds << ", "
-                  << info.limits.extra_budget_ms << "ms slack left)" << std::endl;
-
-        // Extend MCTS on the SAME tree (more visits on the same position).
-        info.limits.time_ms = chunk / 2;
-        info.start_time     = std::chrono::steady_clock::now();
-        mcts_search.run(/*keep_existing_root=*/true);
-        info.best_move = mcts_search.get_best_move();
-
-        // Extend AB. Its global TT is already warm from the previous call,
-        // so the early depths resolve almost instantly and it picks up
-        // roughly where it left off rather than truly restarting.
-        ab_result = ab::find_best_move(pos, kAbMaxDepth, chunk - chunk / 2);
-
         resolved = false;  // loop again to re-check with the deepened results
     }
     info.limits.time_ms = orig_time_ms;  // restore again; the extension branch mutated it

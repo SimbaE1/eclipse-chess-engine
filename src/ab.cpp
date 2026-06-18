@@ -3,7 +3,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <cmath>
+#include <thread>
+#include <vector>
 
 #include "bitboard.hpp"
 #include "movegen.hpp"
@@ -65,6 +69,19 @@ struct SearchCtx {
     // around each do_move so we can detect in-search repetitions.
     std::vector<std::uint64_t> key_history;
 
+    // When set, TT depth-cutoffs are only honoured for entries written in
+    // `cutoff_gen` (the generation this search stamped). Used by
+    // find_tactic_node so a deeper entry left by a prior search can't
+    // short-circuit a shallow depth and hide the depth-by-depth swing.
+    // Stale entries are still used for move ordering and still overwritten.
+    bool         gen_filter = false;
+    std::uint8_t cutoff_gen = 0;
+
+    // Shared across Lazy-SMP workers: any worker that hits the time limit (or
+    // the main worker finishing) sets it, and every worker bails at its next
+    // stride check. nullptr in single-threaded search.
+    std::atomic<bool>* stop = nullptr;
+
     SearchCtx(Clock::time_point s, std::int64_t b)
         : start(s), budget_ms(b), nodes(0), aborted(false) {}
 
@@ -74,6 +91,7 @@ struct SearchCtx {
         // that's still ~250 reads/sec — plenty of resolution for a budget
         // measured in milliseconds.
         if ((nodes & 0xFFFu) != 0) return false;
+        if (stop && stop->load(std::memory_order_relaxed)) return true;
         if (budget_ms <= 0) return false;
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             Clock::now() - start).count();
@@ -239,7 +257,8 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
     if (excluded == MoveNone && g_tt.probe(pos.key(), tt_entry)) {
         tt_hit  = true;
         tt_move = tt_entry.move;
-        if (tt_entry.depth >= depth) {
+        if (tt_entry.depth >= depth &&
+            (!ctx.gen_filter || tt_entry.generation == ctx.cutoff_gen)) {
             const Score s = tt_entry.score_from_tt(tt_entry.score, ply);
             if (tt_entry.flag == TT_EXACT) return s;
             if (tt_entry.flag == TT_LOWERBOUND) alpha = std::max(alpha, s);
@@ -600,16 +619,15 @@ std::vector<Move> extract_pv_from_tt(Position pos, int max_len) {
 
 }  // namespace
 
-Result find_best_move(Position& pos, int max_depth, std::int64_t time_budget_ms) {
-    init_search_tables();
+// One iterative-deepening worker loop. `start_depth` lets Lazy-SMP helper
+// threads begin a ply ahead of the main worker so they fill the shared TT with
+// different subtrees instead of duplicating the main line. Best move from each
+// completed depth is preserved even if the next depth aborts, so the caller
+// always sees a sane move.
+static Result id_search(Position& pos, int max_depth, SearchCtx& ctx, int start_depth) {
     Result r;
-    SearchCtx ctx{Clock::now(), time_budget_ms};
-
-    // Iterative deepening: best move from each completed depth is preserved
-    // even if the next depth gets aborted by the time check, so the caller
-    // always sees a sane move.
     Score last_score = 0;
-    for (int d = 1; d <= max_depth; ++d) {
+    for (int d = start_depth; d <= max_depth; ++d) {
         Move best_at_d;
         Score s;
 
@@ -640,9 +658,55 @@ Result find_best_move(Position& pos, int max_depth, std::int64_t time_budget_ms)
         r.move      = best_at_d;
         r.score     = s;
         r.reached_d = d;
+        r.depth_scores.push_back(s);
         last_score  = s;
     }
     r.nodes = ctx.nodes;
+    return r;
+}
+
+Result find_best_move(Position& pos, int max_depth, std::int64_t time_budget_ms,
+                      int num_threads) {
+    init_search_tables();
+    num_threads = std::max(1, num_threads);
+    const auto start = Clock::now();
+
+    if (num_threads == 1) {
+        SearchCtx ctx{start, time_budget_ms};
+        return id_search(pos, max_depth, ctx, 1);
+    }
+
+    // Lazy SMP: workers share the global TT (lockless -- probe's key check
+    // catches most torn reads; an occasional stale score is the standard,
+    // accepted Lazy-SMP tradeoff). Each worker gets its own Position (the NNUE
+    // accumulator is per-position) and SearchCtx (killers/history are
+    // per-thread). Only the main worker's result is returned; the helpers
+    // exist to warm the shared TT so the main worker reaches depth faster.
+    std::atomic<bool>        stop{false};
+    std::vector<Result>      results(static_cast<std::size_t>(num_threads));
+    std::vector<std::thread> helpers;
+    helpers.reserve(static_cast<std::size_t>(num_threads - 1));
+
+    auto worker = [&](int id) {
+        Position  p = pos;                 // own accumulator/board state
+        SearchCtx ctx{start, time_budget_ms};
+        ctx.stop = &stop;
+        // Main (id 0) runs every depth so its depth_scores trajectory is the
+        // clean per-depth sequence the caller's instability check relies on;
+        // helpers start a ply ahead to desync.
+        const int start_depth = (id == 0) ? 1 : (1 + (id % 2));
+        results[static_cast<std::size_t>(id)] = id_search(p, max_depth, ctx, start_depth);
+        if (id == 0) stop.store(true, std::memory_order_relaxed);  // main done -> halt helpers
+    };
+
+    for (int i = 1; i < num_threads; ++i) helpers.emplace_back(worker, i);
+    worker(0);
+    for (auto& t : helpers) t.join();
+
+    // Keep the main worker's move/score/trajectory; sum nodes for honest nps.
+    Result r = results[0];
+    for (int i = 1; i < num_threads; ++i)
+        r.nodes += results[static_cast<std::size_t>(i)].nodes;
     return r;
 }
 
@@ -671,7 +735,25 @@ Score score_move(Position& pos, Move m, int max_depth, std::int64_t time_budget_
 TacticNode find_tactic_node(Position& pos, int max_depth, std::int64_t time_budget_ms) {
     init_search_tables();
     TacticNode result;
+
+    // This needs a genuine depth-by-depth progression to detect a swing --
+    // negamax's `if (tt_entry.depth >= depth) return cached` shortcut means
+    // a TT already warmed by a deeper prior search (the main AB search and
+    // the cross-check both just ran on related positions) would hand every
+    // shallow depth here the SAME pre-existing deep answer instead of a real
+    // depth-limited result, making the whole swing-detection loop see no
+    // swing at all -- not because there isn't one, but because every depth
+    // looks identical.
+    //
+    // Rather than clear the whole 256MB table (slow, and it throws away the
+    // warm cache the rest of the search wants), we bump the TT generation and
+    // only honour depth-cutoffs from entries we ourselves wrote this call.
+    // Prior searches' deeper entries are ignored for cutoffs (so each depth
+    // is genuinely depth-limited) but still used for move ordering and still
+    // overwritten normally, so the surrounding searches keep their warm cache.
     SearchCtx ctx{Clock::now(), time_budget_ms};
+    ctx.cutoff_gen = g_tt.new_generation();
+    ctx.gen_filter = true;
 
     std::vector<Score>             scores;
     std::vector<std::vector<Move>> pvs;
@@ -713,15 +795,31 @@ TacticNode find_tactic_node(Position& pos, int max_depth, std::int64_t time_budg
 
     const int n = static_cast<int>(scores.size());
     for (int k = kMinDepthIdx; k < n; ++k) {
-        const Score swing = static_cast<Score>(scores[static_cast<std::size_t>(k)] -
-                                                scores[static_cast<std::size_t>(k - 1)]);
+        const Score k_score = scores[static_cast<std::size_t>(k)];
+        const Score swing = static_cast<Score>(k_score - scores[static_cast<std::size_t>(k - 1)]);
         if (std::abs(swing) < kSwingThreshold) continue;
         if (k + 1 >= n) continue;  // no confirming depth completed -- can't trust it yet
 
+        // A swing into mate/tablebase territory (|score| >= kMateInMaxPly) is
+        // the common endgame case: the search/TB reveals the position as
+        // decisively won or lost a few plies deep. There the exact magnitude
+        // (mate distance, or kMateScore-1-ply from a TB probe) drifts by far
+        // more than kStabilityTolerance between depths, so the cp-drift test
+        // would wrongly reject it. For a decisive score we instead require the
+        // confirming depths to stay decisive for the SAME side -- the verdict,
+        // not the precise distance, is what has to hold.
+        const bool decisive = std::abs(static_cast<int>(k_score)) >= kMateInMaxPly;
+
         bool stable = true;
         for (int j = k + 1; j <= k + 2 && j < n; ++j) {
-            if (std::abs(static_cast<int>(scores[static_cast<std::size_t>(j)]) -
-                         static_cast<int>(scores[static_cast<std::size_t>(k)])) > kStabilityTolerance) {
+            const Score sj = scores[static_cast<std::size_t>(j)];
+            if (decisive) {
+                if (std::abs(static_cast<int>(sj)) < kMateInMaxPly ||
+                    (sj > 0) != (k_score > 0)) {
+                    stable = false;
+                    break;
+                }
+            } else if (std::abs(static_cast<int>(sj) - static_cast<int>(k_score)) > kStabilityTolerance) {
                 stable = false;
                 break;
             }
@@ -736,16 +834,19 @@ TacticNode find_tactic_node(Position& pos, int max_depth, std::int64_t time_budg
 
         result.found        = true;
         result.aha_depth    = k + 1;
-        result.root_score_cp = scores[static_cast<std::size_t>(k)];
+        result.root_score_cp = k_score;
         result.path.assign(cur_pv.begin(), cur_pv.begin() + static_cast<long>(div) + 1);
 
         // scores[k] is from `pos`'s STM perspective; negate once per ply to
         // get the tactic node's value from ITS OWN side-to-move perspective
         // (same alternation as Result::score / adjust_root_q in mcts.cpp).
         const bool  odd_path_len = (result.path.size() % 2) == 1;
-        const Score node_score_cp = odd_path_len ? static_cast<Score>(-scores[static_cast<std::size_t>(k)])
-                                                  : scores[static_cast<std::size_t>(k)];
-        result.seed_q = static_cast<float>(node_score_cp) / nnue::output_cp_per_unit();
+        const Score node_score_cp = odd_path_len ? static_cast<Score>(-k_score) : k_score;
+        // MCTS Q values live in tanh space (see mcts.cpp leaf backup), so the
+        // seed has to too -- a raw cp/unit would blow past (-1, 1) entirely
+        // for a decisive score and grossly overweight the seeded node. tanh
+        // saturates a mate/TB verdict toward +/-1 as intended.
+        result.seed_q = std::tanh(static_cast<float>(node_score_cp) / nnue::output_cp_per_unit());
         break;
     }
 

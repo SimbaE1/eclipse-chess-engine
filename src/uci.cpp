@@ -30,6 +30,10 @@ constexpr const char* kEngineAuthor  = "SimbaE11";
 
 Position    g_pos;
 SearchInfo  g_search_info;
+
+// True once the user sets AbThreads explicitly, after which the Threads
+// handler stops auto-deriving the AB-thread count from the total.
+static bool g_ab_threads_explicit = false;
 std::thread g_search_thread;
 
 void join_search_thread() {
@@ -139,6 +143,12 @@ void cmd_setoption(const std::vector<std::string>& tok) {
     } else if (name == "Threads") {
         const int n = std::atoi(value.c_str());
         g_search_info.threads = std::clamp(n, 1, 128);
+        // Derived AbThreads default: ~1 AB (Lazy-SMP) thread per 4 total,
+        // floor, min 1. So 4 threads -> 1 AB / 3 MCTS (unchanged), 8 -> 2 AB /
+        // 6 MCTS, etc. Only applied while the user hasn't set AbThreads
+        // explicitly; an explicit AbThreads always wins regardless of order.
+        if (!g_ab_threads_explicit)
+            g_search_info.ab_threads = std::max(1, g_search_info.threads / 4);
     } else if (name == "Hash") {
         g_tt.resize(std::atoi(value.c_str()));
     } else if (name == "MctsHash") {
@@ -148,6 +158,7 @@ void cmd_setoption(const std::vector<std::string>& tok) {
     } else if (name == "AbThreads") {
         const int n = std::atoi(value.c_str());
         g_search_info.ab_threads = std::clamp(n, 0, 128);
+        g_ab_threads_explicit = true;  // pin it; stop deriving from Threads
     } else if (name == "Cpuct") {
         char* end = nullptr;
         const float f = std::strtof(value.c_str(), &end);
