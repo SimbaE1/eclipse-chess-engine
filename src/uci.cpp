@@ -189,7 +189,11 @@ void cmd_setoption(const std::vector<std::string>& tok) {
 void cmd_isready() {
     zobrist::init();
     init_attacks();
-#if defined(__AVX2__)
+#if defined(__AVX512BW__) && !defined(ECLIPSE_NO_AVX512)
+    // Must come before the __AVX2__ check: -march=native defines both macros,
+    // and the NNUE hot paths use the AVX-512 ladder under this exact guard.
+    std::cout << "info string SIMD: AVX-512\n";
+#elif defined(__AVX2__)
     std::cout << "info string SIMD: AVX2\n";
 #elif defined(__ARM_NEON)
     std::cout << "info string SIMD: NEON\n";
