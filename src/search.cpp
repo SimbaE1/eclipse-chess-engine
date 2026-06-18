@@ -22,12 +22,15 @@ namespace {
 constexpr int kAbMaxDepth = 32;
 
 // Sequential-mode AB budget: only used when Threads=1, so AB runs AFTER
-// MCTS on the same thread. Capped tight because every ms here is a ms
-// MCTS doesn't get.
-constexpr std::int64_t kAbSeqBudgetPctNum = 5;
-constexpr std::int64_t kAbSeqBudgetPctDen = 100;
+// MCTS on the same thread. Set to 1/4 of the move so AB gets the same
+// compute share it would in parallel mode (1 dedicated thread per 4 ==
+// 25% of cores for the whole search). The old 5%/500ms-cap starved the
+// tactical verifier at 1 thread relative to how it's funded at 4+. The
+// total/2 guard at the use sites still prevents AB from ever taking the
+// majority of the clock; kAbSeqBudgetMinMs keeps a usable floor at fast TCs.
+constexpr std::int64_t kAbSeqBudgetPctNum = 1;
+constexpr std::int64_t kAbSeqBudgetPctDen = 4;
 constexpr std::int64_t kAbSeqBudgetMinMs  = 25;
-constexpr std::int64_t kAbSeqBudgetMaxMs  = 500;
 
 // Validation budget: when AB disagrees with MCTS on a non-mate move, carve
 // out this fraction of the move budget to run MCTS on the position AFTER
@@ -304,10 +307,10 @@ Move search(Position& pos, SearchInfo& info) {
             ab_result = ab::find_best_move(ab_pos, kAbMaxDepth, main_phase_time, ab_phase_threads);
         });
     } else if (total_time_ms > 0 && info.ab_threads > 0) {
-        // Sequential mode: reserve 10% (clamped) for the post-MCTS AB run,
-        // plus the validation slice if it's enabled.
+        // Sequential mode: reserve 1/4 of the move for the post-MCTS AB run
+        // (see kAbSeqBudget* above), plus the validation slice if enabled.
         std::int64_t ab_budget = total_time_ms * kAbSeqBudgetPctNum / kAbSeqBudgetPctDen;
-        ab_budget = std::clamp(ab_budget, kAbSeqBudgetMinMs, kAbSeqBudgetMaxMs);
+        if (ab_budget < kAbSeqBudgetMinMs) ab_budget = kAbSeqBudgetMinMs;
         if (ab_budget > total_time_ms / 2) ab_budget = total_time_ms / 2;
         if (ab_budget < 1) ab_budget = 1;
         info.limits.time_ms = main_phase_time - ab_budget;
@@ -324,10 +327,10 @@ Move search(Position& pos, SearchInfo& info) {
     if (parallel_ab) {
         ab_thread.join();
     } else if (total_time_ms > 0 && info.ab_threads > 0) {
-        // Run the small reserved slice now, on this thread. MCTS has finished,
+        // Run the reserved 1/4 slice now, on this thread. MCTS has finished,
         // so AB can use every thread (Lazy SMP) for the deepest read possible.
         std::int64_t ab_budget = total_time_ms * kAbSeqBudgetPctNum / kAbSeqBudgetPctDen;
-        ab_budget = std::clamp(ab_budget, kAbSeqBudgetMinMs, kAbSeqBudgetMaxMs);
+        if (ab_budget < kAbSeqBudgetMinMs) ab_budget = kAbSeqBudgetMinMs;
         if (ab_budget > total_time_ms / 2) ab_budget = total_time_ms / 2;
         if (ab_budget < 1) ab_budget = 1;
         ab_result = ab::find_best_move(pos, kAbMaxDepth, ab_budget, total_threads);
