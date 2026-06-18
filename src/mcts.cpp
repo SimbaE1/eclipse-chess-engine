@@ -78,7 +78,10 @@ private:
 
     static Mag& magazine() {
         static thread_local Mag mag;
-        mag.pool = &instance();
+        // Bind the pool once per thread. The pointer never changes, so doing it
+        // on every alloc just paid a function-local-static guard (an atomic
+        // acquire load) per node created — pure overhead in the hottest path.
+        if (!mag.pool) mag.pool = &instance();
         return mag;
     }
 
@@ -333,7 +336,7 @@ void MCTS::run(bool keep_existing_root) {
             // list before they start traversing. Done under the (uncontested) root
             // mutex for symmetry with deeper expansion.
             {
-                std::lock_guard<std::mutex> lock(root->expand_mutex);
+                std::lock_guard<Spinlock> lock(root->expand_mutex);
                 expand_under_lock(root.get(), root_pos, 0);
             }
         }
@@ -703,7 +706,7 @@ int MCTS::iterate_batch(int batch_size) {
             leaf.is_rep = true;  // don't cache — value is history-dependent
         } else {
             {
-                std::unique_lock<std::mutex> lock(node->expand_mutex);
+                std::unique_lock<Spinlock> lock(node->expand_mutex);
                 if (!node->is_expanded.load(std::memory_order_acquire) && !node->is_terminal) {
                     // depth of the leaf being expanded: root is path index 0.
                     expand_under_lock(node, pos, path_len - 1);

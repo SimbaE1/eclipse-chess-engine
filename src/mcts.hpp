@@ -90,6 +90,30 @@ using NodePtr = std::unique_ptr<Node, NodeDeleter>;
 // Construct a pooled Node. Drop-in replacement for std::make_unique<Node>.
 NodePtr make_node(Move m, Node* parent, float prior) noexcept;
 
+// One-byte spinlock used to serialize node expansion. Replaces a per-Node
+// std::mutex (64 B on macOS) — every Node carries one, so shrinking it to a
+// single byte nearly halves Node's footprint and packs the hot fields (N/W/P
+// read by select() across millions of nodes) far more densely in cache. The
+// expansion critical section is tiny and same-node contention is rare (virtual
+// loss disperses workers), so a brief spin beats a kernel futex round-trip.
+// Exposes lock()/unlock() so std::lock_guard / std::unique_lock work unchanged.
+struct Spinlock {
+    std::atomic<bool> locked{false};
+    void lock() noexcept {
+        for (;;) {
+            if (!locked.exchange(true, std::memory_order_acquire)) return;
+            while (locked.load(std::memory_order_relaxed)) {
+#if defined(__i386__) || defined(__x86_64__)
+                __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+                __asm__ __volatile__("yield");
+#endif
+            }
+        }
+    }
+    void unlock() noexcept { locked.store(false, std::memory_order_release); }
+};
+
 struct Node {
     Move  move   = MoveNone;
     Node* parent = nullptr;
@@ -111,7 +135,7 @@ struct Node {
     // so children is never observed half-built.
     std::atomic<bool> is_expanded{false};
     bool              is_terminal = false;  // set under expand_mutex, then frozen
-    std::mutex        expand_mutex;
+    Spinlock          expand_mutex;
 
     Node(Move m, Node* p, float prior) noexcept : move(m), parent(p), P(prior) {}
 
