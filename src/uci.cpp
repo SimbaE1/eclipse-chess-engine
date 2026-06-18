@@ -285,19 +285,38 @@ void cmd_go(const std::vector<std::string>& tok) {
         // keeps us from starving the next move in a long endgame.
         const auto root = policy::get_root_info(g_pos);
         const int  mlh_our_moves = static_cast<int>(root.mlh_plies / 2.0f);
-        const int  divisor = std::clamp(mlh_our_moves, 5, 60);
+        // Floor of 8 (was 5): never plan to spend more than ~1/8 of the clock
+        // on a routine move. The old floor of 5 let a low MLH estimate budget
+        // ~20% of remaining time on a single calm position, which is how the
+        // engine bled its clock even when the eval was stable.
+        const int  divisor = std::clamp(mlh_our_moves, 8, 60);
 
         limits.time_ms = remain / divisor + inc * 4 / 5;
         // Safety: never burn more than 1/3 of remaining time on one move.
         const int safety_cap = remain / 3;
         if (limits.time_ms > safety_cap) limits.time_ms = safety_cap;
 
-        // Slack still available under the same safety_cap policy, in case
-        // search.cpp's reconciliation needs to extend a genuinely contested
-        // decision instead of falling back blind. Computed pre-overhead so
-        // it reflects real headroom against the cap, not the engine's fixed
-        // per-move floor below.
-        limits.extra_budget_ms = std::max<std::int64_t>(0, safety_cap - limits.time_ms);
+        // Hard wall-clock ceiling for the WHOLE move (every phase combined),
+        // not just the soft target above. search() enforces it as a single
+        // absolute deadline (see SearchLimits::hard_limit_ms), so the sum of
+        // the main search + validation + AB cross-check/tactic probes +
+        // extensions can never overrun it. Capped at the same 1/3 safety_cap,
+        // and kept a fixed latency margin below the real remaining time so the
+        // bestmove reaches lichess before the flag even with network + I/O lag.
+        // This is what guarantees we never flag while still doing fine.
+        constexpr int kLatencyMarginMs = 300;
+        const int hard_cap = std::min<int>(safety_cap, remain - kLatencyMarginMs);
+        limits.hard_limit_ms = std::max(1, hard_cap);
+
+        // The soft target must sit under the hard ceiling, otherwise the main
+        // phase alone would try to consume the entire budget and leave nothing
+        // for reconciliation (or worse, overshoot the deadline mid-phase).
+        if (limits.time_ms > limits.hard_limit_ms) limits.time_ms = limits.hard_limit_ms;
+
+        // Slack the reconciliation may borrow, measured against the SAME hard
+        // ceiling the deadline enforces — so extensions stay inside it instead
+        // of stacking on top of the safety_cap as they used to.
+        limits.extra_budget_ms = std::max<std::int64_t>(0, limits.hard_limit_ms - limits.time_ms);
 
         // Move-overhead subtraction. KNOWN LIMITATION: Eclipse has a fixed
         // per-move floor of ~120 ms even with a 1 ms budget — the cost of the

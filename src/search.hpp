@@ -43,6 +43,15 @@ struct SearchInfo {
     std::atomic<std::int64_t>               nodes_searched{0};
     std::chrono::steady_clock::time_point   start_time{};
 
+    // Absolute wall-clock instant past which the move MUST already be out.
+    // Derived once at search start from limits.hard_limit_ms; every phase
+    // clamps its own budget to what remains before this, and time_up() reports
+    // true once it passes regardless of which phase's per-phase budget is
+    // active. Default (epoch) means "no hard deadline" — phases that reset
+    // start_time (extensions) still honour this because it is absolute, not
+    // relative to start_time. See SearchLimits::hard_limit_ms.
+    std::chrono::steady_clock::time_point   hard_deadline{};
+
     // Wall-clock ms (steady_clock epoch) at which `ponderhit` arrived, or -1
     // if not yet received. The UCI main thread writes this and the search
     // thread reads it from time_up() — both non-atomic `start_time` and
@@ -63,6 +72,12 @@ struct SearchInfo {
     bool silent = false;
 
     bool time_up() const noexcept;
+
+    // ms remaining until hard_deadline (clamped to >= 0). Returns a large
+    // sentinel when no hard deadline is set, so call sites can min() against it
+    // unconditionally. Used by each phase to size or skip its budget so their
+    // cumulative wall time never crosses the deadline.
+    std::int64_t ms_until_hard_deadline() const noexcept;
 };
 
 // Iterative-deepening negamax with alpha-beta and quiescence. Prints `info`

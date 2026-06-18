@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <iostream>
+#include <limits>
 #include <thread>
 #include <utility>
 
@@ -138,14 +139,27 @@ void log_ab_outcome(const ab::Result& ab, Move mcts_move, Score mcts_cp, const c
 bool SearchInfo::time_up() const noexcept {
     if (limits.nodes > 0 && static_cast<std::uint64_t>(nodes_searched.load(std::memory_order_relaxed)) >= limits.nodes) return true;
     if (limits.depth > 0 && nodes_searched.load(std::memory_order_relaxed) >= limits.depth) return true;
+    // Absolute hard ceiling: the SUM of all phases must never cross this,
+    // whatever per-phase budget is currently active (extensions reset
+    // start_time, so a start_time-relative check alone would not catch an
+    // overrun). Checked first and unconditionally — it must override even the
+    // ponder path so a ponderhit that arrives near the deadline can't restart
+    // a full think we don't have time for.
+    if (hard_deadline.time_since_epoch().count() != 0 &&
+        std::chrono::steady_clock::now() >= hard_deadline) return true;
     if (limits.ponder) {
         // ponderhit_at_ms is the only cross-thread ponder signal (see
-        // search.hpp) — never touch start_time or limits.ponder here.
+        // search.hpp) — never touch start_time or limits.ponder here. The hard
+        // ceiling for a ponder search is measured from the ponderhit instant
+        // (not from when pondering began), so it isn't expressed via the
+        // absolute hard_deadline above — which stays unset for ponder searches.
         const auto ph = ponderhit_at_ms.load(std::memory_order_acquire);
         if (ph < 0) return false;  // still pondering, no ponderhit yet
         const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
-        return (now_ms - ph) >= limits.time_ms;
+        const auto since_hit = now_ms - ph;
+        if (since_hit >= limits.time_ms) return true;
+        return limits.hard_limit_ms > 0 && since_hit >= limits.hard_limit_ms;
     }
     if (limits.infinite || limits.time_ms <= 0) return false;
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -153,9 +167,44 @@ bool SearchInfo::time_up() const noexcept {
     return elapsed >= limits.time_ms;
 }
 
+std::int64_t SearchInfo::ms_until_hard_deadline() const noexcept {
+    constexpr std::int64_t kUnbounded = std::numeric_limits<std::int64_t>::max() / 4;
+
+    // Ponder searches carry the ceiling relative to the ponderhit instant
+    // rather than as an absolute deadline (see time_up()): unbounded while
+    // still pondering, then hard_limit_ms minus time since the hit.
+    if (limits.ponder) {
+        if (limits.hard_limit_ms <= 0) return kUnbounded;
+        const auto ph = ponderhit_at_ms.load(std::memory_order_acquire);
+        if (ph < 0) return kUnbounded;  // still pondering
+        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const auto left = limits.hard_limit_ms - (now_ms - ph);
+        return left > 0 ? left : 0;
+    }
+
+    // No hard deadline configured: return a large value so callers can min()
+    // their fixed budgets against it without changing behaviour.
+    if (hard_deadline.time_since_epoch().count() == 0) return kUnbounded;
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+        hard_deadline - std::chrono::steady_clock::now()).count();
+    return left > 0 ? left : 0;
+}
+
 Move search(Position& pos, SearchInfo& info) {
     info.nodes_searched.store(0, std::memory_order_relaxed);
     info.start_time     = std::chrono::steady_clock::now();
+    // Turn the hard ceiling into a single absolute deadline. Every phase below
+    // clamps its budget to info.ms_until_hard_deadline(), and time_up() trips
+    // once we pass it, so the total wall time for the move can never exceed
+    // limits.hard_limit_ms regardless of how many phases/extensions run. Left
+    // at epoch (no deadline) for movetime/depth/nodes/infinite searches.
+    // Ponder searches are excluded here: their ceiling is measured from the
+    // ponderhit instant inside time_up()/ms_until_hard_deadline(), not from
+    // now, so the absolute deadline stays unset for them.
+    info.hard_deadline = (info.limits.hard_limit_ms > 0 && !info.limits.ponder)
+        ? info.start_time + std::chrono::milliseconds(info.limits.hard_limit_ms)
+        : std::chrono::steady_clock::time_point{};
     info.ponderhit_at_ms.store(-1, std::memory_order_relaxed);
     info.best_move      = MoveNone;
     info.best_score     = -kInfinite;
@@ -324,17 +373,31 @@ Move search(Position& pos, SearchInfo& info) {
     Position ab_pos_cc = pos;  // scratch copy for score_move (mutates internally but restores)
     int extension_rounds = 0;
 
+    // The AB cross-check / tactic-trace probes below run on their OWN clock
+    // (ab::SearchCtx), so they can't see info.hard_deadline. Clamp every probe
+    // budget to the time actually left before the deadline so they can't push
+    // the move past it. Always >= 1 (a 0 budget means "unlimited" to ab.cpp).
+    auto probe_budget = [&](std::int64_t want) -> std::int64_t {
+        return std::max<std::int64_t>(1, std::min(want, info.ms_until_hard_deadline()));
+    };
+
     // Spend a bounded slice of clock slack deepening BOTH searchers, then let
     // the loop re-check. Shared by the "both sides refuted each other" case and
     // the "they agree but the eval is still drifting" case. Returns false (no
     // extension performed) when the round cap or slack budget is exhausted.
     auto try_extend = [&](const char* reason) -> bool {
+        // Never extend past the hard deadline: cap the slice at what's left of
+        // the move's total budget. With nothing left to spend, don't extend —
+        // returning false makes the caller commit to the current pick.
+        const std::int64_t time_left = info.ms_until_hard_deadline();
         if (extension_rounds >= kMaxExtensionRounds ||
-            info.limits.extra_budget_ms < kMinExtensionMs) {
+            info.limits.extra_budget_ms < kMinExtensionMs ||
+            time_left < kMinExtensionMs) {
             return false;
         }
-        const std::int64_t chunk = std::min(info.limits.extra_budget_ms,
-                                             std::max<std::int64_t>(orig_time_ms, kMinExtensionMs));
+        const std::int64_t chunk = std::min({info.limits.extra_budget_ms,
+                                             std::max<std::int64_t>(orig_time_ms, kMinExtensionMs),
+                                             time_left});
         info.limits.extra_budget_ms -= chunk;
         ++extension_rounds;
         std::cout << "info string AB/MCTS reconciliation: extending by " << chunk
@@ -362,6 +425,11 @@ Move search(Position& pos, SearchInfo& info) {
 
         if (ab_result.move == MoveNone) break;  // AB not running at all (ab_threads==0)
 
+        // Out of time for reconciliation: commit to MCTS's move rather than
+        // start probes/validation we can't afford. The hard deadline already
+        // reserves a latency margin, so stopping here keeps us from flagging.
+        if (info.ms_until_hard_deadline() <= 0) break;
+
         // Before trusting AB's read at all -- whether to confirm MCTS's move or
         // to override with AB's own pick -- make sure that read has actually
         // settled. If AB's score is still drifting with depth and there's clock
@@ -375,7 +443,7 @@ Move search(Position& pos, SearchInfo& info) {
         }
 
         const Score ab_view_of_mcts_move =
-            ab::score_move(ab_pos_cc, info.best_move, kAbMaxDepth, kCrossCheckBudgetMs);
+            ab::score_move(ab_pos_cc, info.best_move, kAbMaxDepth, probe_budget(kCrossCheckBudgetMs));
 
         // "Bad" means AB sees a problem with MCTS's specific move — a
         // confirmed loss, or a score well below what MCTS itself claims.
@@ -409,7 +477,7 @@ Move search(Position& pos, SearchInfo& info) {
             StateInfo deeper_st;
             deeper_pos.do_move(info.best_move, deeper_st);
             mcts_refutation =
-                ab::find_tactic_node(deeper_pos, kAbMaxDepth, kDetectionTraceBudgetMs);
+                ab::find_tactic_node(deeper_pos, kAbMaxDepth, probe_budget(kDetectionTraceBudgetMs));
             // root_score_cp is from deeper_pos's own STM (the opponent,
             // since we just played info.best_move) -- negate once to get it
             // back to our/root perspective, matching info.best_score's
@@ -460,8 +528,13 @@ Move search(Position& pos, SearchInfo& info) {
             SearchInfo validation_info;
             validation_info.threads        = total_threads;  // all threads, focused
             validation_info.ab_threads     = 0;              // pure MCTS verdict
-            validation_info.limits.time_ms = validation_budget;
+            // Cap the validation MCTS at whatever is left before the deadline,
+            // and share the SAME absolute deadline so its workers stop on time
+            // even though it runs from a fresh start_time.
+            validation_info.limits.time_ms = std::min<std::int64_t>(validation_budget,
+                                                                    info.ms_until_hard_deadline());
             validation_info.start_time     = std::chrono::steady_clock::now();
+            validation_info.hard_deadline  = info.hard_deadline;
             validation_info.silent         = true;           // don't emit info lines from opponent's POV
 
             mcts::MCTS validator(validation_pos, validation_info);
@@ -474,7 +547,7 @@ Move search(Position& pos, SearchInfo& info) {
             // the path so MCTS is actually likely to walk down to it.
             Position tactic_trace_pos = validation_pos;
             const ab::TacticNode tactic = (orig_time_ms >= kMinTimeForDeepDetectionMs)
-                ? ab::find_tactic_node(tactic_trace_pos, kAbMaxDepth, kTacticTraceBudgetMs)
+                ? ab::find_tactic_node(tactic_trace_pos, kAbMaxDepth, probe_budget(kTacticTraceBudgetMs))
                 : ab::TacticNode{};
             if (tactic.found) {
                 Position key_pos = validation_pos;

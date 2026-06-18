@@ -28,6 +28,17 @@ struct SearchLimits {
     // search.cpp's AB/MCTS reconciliation to extend search on a genuine
     // disagreement instead of always falling back immediately.
     std::int64_t  extra_budget_ms = 0;
+
+    // Absolute hard ceiling on TOTAL wall-clock time for this move, in ms from
+    // search start. Unlike time_ms (the soft target for the main MCTS phase)
+    // and extra_budget_ms (slack the reconciliation may borrow), this bounds
+    // the SUM of every phase the search runs: main MCTS+AB, the validation
+    // MCTS, the AB cross-check/tactic-trace probes, and any extension rounds.
+    // search() turns it into a single absolute deadline that time_up() and
+    // every sub-phase budget respect, so the engine physically cannot overrun
+    // the clock and flag. Set by uci.cpp with a latency margin already
+    // subtracted. 0 = no hard ceiling (movetime/depth/nodes/infinite/ponder).
+    std::int64_t  hard_limit_ms = 0;
 };
 
 // Piece-type indexing leaves slot 0 free as NoPieceType so a Piece can encode
