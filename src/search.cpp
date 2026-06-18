@@ -44,6 +44,20 @@ bool is_mate_score(Score s) noexcept {
     return s >= kMateInMaxPly || s <= -kMateInMaxPly;
 }
 
+// Cross-check budget: cheap because it reuses the just-finished AB search's
+// warm TT — most of the relevant subtree is already resolved, this just
+// asks for an honest score on a SPECIFIC move that AB's own root loop may
+// only have given a cheap alpha-beta bound to (see ab::score_move).
+constexpr std::int64_t kCrossCheckBudgetMs = 150;
+
+// Reconciliation extension: if AB and MCTS both disagree with each other's
+// pick even after validation, and there's slack left in the clock (see
+// SearchLimits::extra_budget_ms), spend a bounded amount of it deepening
+// both searchers instead of guessing. Capped so a genuinely murky position
+// can't eat the whole remaining clock on one move.
+constexpr std::int64_t kMinExtensionMs = 300;
+constexpr int          kMaxExtensionRounds = 2;
+
 void log_ab_outcome(const ab::Result& ab, Move mcts_move, Score mcts_cp, const char* tag) {
     std::cout << "info string AB " << tag
               << ": mcts " << mcts_move.to_uci() << " " << mcts_cp << "cp"
@@ -209,40 +223,80 @@ Move search(Position& pos, SearchInfo& info) {
 
     info.best_move = mcts_search.get_best_move();
 
-    // Collect potential ponder moves before save_to_cache() nulls the root.
-    const Move pre_reconcile_best = info.best_move;
-    const Move mcts_ponder = mcts_search.get_ponder_move_after(pre_reconcile_best);
-    const Move ab_ponder   = (ab_result.move != MoveNone && ab_result.move != pre_reconcile_best)
-        ? mcts_search.get_ponder_move_after(ab_result.move)
-        : MoveNone;
-
-    mcts_search.save_to_cache();  // preserve subtree for tree reuse next move
-
     // ----- AB-vs-MCTS reconciliation -----
     //
-    // Three cases when AB suggests a different move than MCTS:
+    // AB's own root loop only gives an exact score to its top-ordered move;
+    // every other root move (MCTS's pick, when they disagree, is rarely
+    // AB's top-ordered move) only gets a cheap alpha-beta bound. So instead
+    // of just comparing "is AB's own favorite better than MCTS's", we ask AB
+    // directly what it thinks of the move MCTS actually wants to play
+    // (ab::score_move, reusing AB's now-warm TT — cheap). That catches AB
+    // quietly knowing a move is bad even when AB's own alternative doesn't
+    // look dramatically better in cp terms.
     //
-    //  (1) AB's score is a mate. Mate is objective truth (within AB's depth),
-    //      not subject to validation. Play AB's move unconditionally.
-    //
-    //  (2) Validation phase is on AND there's a non-trivial advantage AB
-    //      claims. Carve out the reserved slice to run focused MCTS at the
-    //      position AFTER AB's first move. The opponent moves at that
-    //      position, so MCTS naturally explores their best refutations. If
-    //      MCTS's verdict (negated to our POV) still beats what we'd get from
-    //      MCTS's original choice, AB's tactic is real and we play it.
-    //      Otherwise the opponent has a hidden refutation MCTS sees but AB
-    //      missed — keep MCTS's pick.
-    //
-    //  (3) Validation off OR margin too thin. Just verify-log; no override.
-    //
-    if (ab_result.move != MoveNone && ab_result.move != info.best_move) {
-        if (is_mate_score(ab_result.score)) {
+    // Cases:
+    //  (1) AB's score for MCTS's move is a mate (we get mated). Objective
+    //      truth within AB's depth — take AB's own pick unconditionally if
+    //      it disagrees, no validation needed.
+    //  (2) AB's score for MCTS's move is far worse than MCTS's own claim
+    //      (or AB has a different pick at all that beats the margin):
+    //      validate AB's alternative via focused MCTS at the position after
+    //      it, same as before. Validated -> override. Refuted -> see (3).
+    //  (3) Both refuted (AB's view of MCTS's move says "bad", but MCTS's
+    //      counter-check says AB's fix doesn't hold either): if there's
+    //      still slack in the clock (extra_budget_ms), spend a bounded slice
+    //      deepening both searchers and re-check, instead of guessing.
+    //      Otherwise keep MCTS's move and log loudly — this is a real
+    //      "neither searcher trusts the position" signal worth tracking.
+    //  (4) No disagreement at all: log the cross-check anyway (always-on
+    //      telemetry on how often/where the two searchers diverge, useful
+    //      for prioritizing the underlying eval-quality fix later).
+    Position ab_pos_cc = pos;  // scratch copy for score_move (mutates internally but restores)
+    int extension_rounds = 0;
+    bool resolved = false;
+    while (!resolved) {
+        resolved = true;  // unless the extension branch below says otherwise
+
+        if (ab_result.move == MoveNone) break;  // AB not running at all (ab_threads==0)
+
+        const Score ab_view_of_mcts_move =
+            ab::score_move(ab_pos_cc, info.best_move, kAbMaxDepth, kCrossCheckBudgetMs);
+
+        // "Bad" means AB sees a problem with MCTS's specific move — a
+        // confirmed loss, or a score well below what MCTS itself claims.
+        // A winning mate on MCTS's own move is NOT a disagreement; there's
+        // nothing to fix.
+        const bool ab_views_mcts_move_as_bad =
+            (is_mate_score(ab_view_of_mcts_move) && ab_view_of_mcts_move < 0) ||
+            ab_view_of_mcts_move <= info.best_score - info.override_margin;
+        const bool ab_has_better_alternative =
+            ab_result.score >= info.best_score + info.override_margin;
+
+        const bool ab_disagrees =
+            ab_result.move != info.best_move &&
+            (ab_views_mcts_move_as_bad || ab_has_better_alternative);
+
+        std::cout << "info string AB cross-check: mcts " << info.best_move.to_uci()
+                  << " " << info.best_score << "cp"
+                  << " (ab's view " << ab_view_of_mcts_move << "cp)"
+                  << "  ab's own pick " << ab_result.move.to_uci()
+                  << " " << ab_result.score << "cp"
+                  << " (d=" << ab_result.reached_d << ", nodes=" << ab_result.nodes << ")"
+                  << std::endl;
+
+        if (!ab_disagrees) {
+            log_ab_outcome(ab_result, info.best_move, info.best_score, "verify");
+            break;
+        }
+
+        if (is_mate_score(ab_view_of_mcts_move) && ab_view_of_mcts_move < 0) {
             log_ab_outcome(ab_result, info.best_move, info.best_score, "mate-override");
             info.best_move  = ab_result.move;
             info.best_score = ab_result.score;
-        } else if (do_validation_phase &&
-                   ab_result.score >= info.best_score + info.override_margin) {
+            break;
+        }
+
+        if (do_validation_phase) {
             // Run focused MCTS at the post-AB-move position. Opponent to move
             // there, so the returned best_score is from THEIR perspective.
             Position  validation_pos = pos;
@@ -275,20 +329,50 @@ Move search(Position& pos, SearchInfo& info) {
                 log_ab_outcome(ab_result, info.best_move, info.best_score, "override (validated)");
                 info.best_move  = ab_result.move;
                 info.best_score = validated_cp;
-            } else {
-                log_ab_outcome(ab_result, info.best_move, info.best_score, "refuted (kept mcts)");
+                break;
             }
+            log_ab_outcome(ab_result, info.best_move, info.best_score, "refuted");
         } else {
-            log_ab_outcome(ab_result, info.best_move, info.best_score, "verify");
+            log_ab_outcome(ab_result, info.best_move, info.best_score, "refuted (no validation phase)");
         }
-    } else if (ab_result.move != MoveNone) {
-        log_ab_outcome(ab_result, info.best_move, info.best_score, "verify");
-    }
 
-    // Pick ponder move based on which move survived reconciliation.
-    const Move ponder_move = (info.best_move == pre_reconcile_best)
-        ? mcts_ponder
-        : (info.best_move == ab_result.move ? ab_ponder : MoveNone);
+        // Both sides refuted each other. If there's clock slack and we
+        // haven't burned through the extension budget, deepen both
+        // searchers and re-check instead of guessing.
+        if (extension_rounds >= kMaxExtensionRounds || info.limits.extra_budget_ms < kMinExtensionMs) {
+            log_ab_outcome(ab_result, info.best_move, info.best_score,
+                           "unresolved double-disagreement (kept mcts)");
+            break;
+        }
+
+        const std::int64_t chunk = std::min(info.limits.extra_budget_ms,
+                                             std::max<std::int64_t>(orig_time_ms, kMinExtensionMs));
+        info.limits.extra_budget_ms -= chunk;
+        ++extension_rounds;
+        std::cout << "info string AB/MCTS reconciliation: extending by " << chunk
+                  << "ms (round " << extension_rounds << ", "
+                  << info.limits.extra_budget_ms << "ms slack left)" << std::endl;
+
+        // Extend MCTS on the SAME tree (more visits on the same position).
+        info.limits.time_ms = chunk / 2;
+        info.start_time     = std::chrono::steady_clock::now();
+        mcts_search.run(/*keep_existing_root=*/true);
+        info.best_move = mcts_search.get_best_move();
+
+        // Extend AB. Its global TT is already warm from the previous call,
+        // so the early depths resolve almost instantly and it picks up
+        // roughly where it left off rather than truly restarting.
+        ab_result = ab::find_best_move(pos, kAbMaxDepth, chunk - chunk / 2);
+
+        resolved = false;  // loop again to re-check with the deepened results
+    }
+    info.limits.time_ms = orig_time_ms;  // restore again; the extension branch mutated it
+
+    // Collect ponder move from whatever survived reconciliation, before
+    // save_to_cache() nulls the root.
+    const Move ponder_move = mcts_search.get_ponder_move_after(info.best_move);
+
+    mcts_search.save_to_cache();  // preserve subtree for tree reuse next move
 
     if (info.best_move == MoveNone) {
         // Should only happen if the root has no legal moves (game already

@@ -281,6 +281,13 @@ void cmd_go(const std::vector<std::string>& tok) {
         const int safety_cap = remain / 3;
         if (limits.time_ms > safety_cap) limits.time_ms = safety_cap;
 
+        // Slack still available under the same safety_cap policy, in case
+        // search.cpp's reconciliation needs to extend a genuinely contested
+        // decision instead of falling back blind. Computed pre-overhead so
+        // it reflects real headroom against the cap, not the engine's fixed
+        // per-move floor below.
+        limits.extra_budget_ms = std::max<std::int64_t>(0, safety_cap - limits.time_ms);
+
         // Move-overhead subtraction. KNOWN LIMITATION: Eclipse has a fixed
         // per-move floor of ~120 ms even with a 1 ms budget — the cost of the
         // root MLH/policy probe, the mandatory first MCTS batch across all

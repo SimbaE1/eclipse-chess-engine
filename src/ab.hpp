@@ -28,4 +28,18 @@ struct Result {
 // (budget <= 0) the depth-1 result is returned.
 Result find_best_move(Position& pos, int max_depth, std::int64_t time_budget_ms);
 
+// Scores one specific move with an iterative-deepening full-window search,
+// from `pos`'s side-to-move perspective (same convention as Result::score).
+// Reuses whatever is already cached in the global TT, so a call right after
+// find_best_move() on the same position is cheap — most of the relevant
+// subtree is already resolved.
+//
+// Used to get AB's independent opinion of a move chosen by another search
+// component (e.g. MCTS) directly, instead of only comparing against AB's
+// own top pick: AB's normal root loop only gives an exact score to the
+// first-ordered move, everything else gets a cheap alpha-beta bound, so a
+// non-top-ordered move (the common case when AB and MCTS disagree) never
+// gets an honest number unless asked for explicitly like this.
+Score score_move(Position& pos, Move m, int max_depth, std::int64_t time_budget_ms);
+
 }  // namespace eclipse::ab

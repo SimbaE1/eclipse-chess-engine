@@ -193,7 +193,12 @@ public:
 
     Move search(); // deprecated/wrapper
 
-    void run();
+    // keep_existing_root=true skips the tree-reuse/rebuild step and continues
+    // iterating on whatever tree is already in `root` (used to extend a
+    // search with more time on the SAME position, e.g. search.cpp's AB/MCTS
+    // reconciliation loop). Only valid on a second+ call after run() has
+    // already populated root at least once.
+    void run(bool keep_existing_root = false);
     void save_to_cache();          // call after get_best_move() to enable tree reuse
     void adjust_root_q(Move m, Score s);
     Move get_best_move();

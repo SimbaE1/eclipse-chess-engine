@@ -316,24 +316,26 @@ Move MCTS::search() {
     return get_best_move();
 }
 
-void MCTS::run() {
-    // Try to reuse the subtree from the previous search. If the opponent
-    // played the move we predicted (or we're pondering the same position),
-    // we inherit all accumulated visits instead of rebuilding from scratch.
-    NodePtr reused = try_find_subtree(root_pos);
-    if (reused) {
-        root = std::move(reused);
-        const auto cached_n = root->N.load(std::memory_order_relaxed);
-        std::cout << "info string tree-reuse: " << cached_n
-                  << " cached visits inherited" << std::endl;
-    } else {
-        root = make_node(MoveNone, nullptr, 1.0f);
-        // Root expansion is single-threaded so workers see a populated child
-        // list before they start traversing. Done under the (uncontested) root
-        // mutex for symmetry with deeper expansion.
-        {
-            std::lock_guard<std::mutex> lock(root->expand_mutex);
-            expand_under_lock(root.get(), root_pos, 0);
+void MCTS::run(bool keep_existing_root) {
+    if (!keep_existing_root || !root) {
+        // Try to reuse the subtree from the previous search. If the opponent
+        // played the move we predicted (or we're pondering the same position),
+        // we inherit all accumulated visits instead of rebuilding from scratch.
+        NodePtr reused = try_find_subtree(root_pos);
+        if (reused) {
+            root = std::move(reused);
+            const auto cached_n = root->N.load(std::memory_order_relaxed);
+            std::cout << "info string tree-reuse: " << cached_n
+                      << " cached visits inherited" << std::endl;
+        } else {
+            root = make_node(MoveNone, nullptr, 1.0f);
+            // Root expansion is single-threaded so workers see a populated child
+            // list before they start traversing. Done under the (uncontested) root
+            // mutex for symmetry with deeper expansion.
+            {
+                std::lock_guard<std::mutex> lock(root->expand_mutex);
+                expand_under_lock(root.get(), root_pos, 0);
+            }
         }
     }
 

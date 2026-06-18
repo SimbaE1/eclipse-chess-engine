@@ -26,11 +26,32 @@ import argparse
 import gzip
 import math
 import multiprocessing as mp
+import os
 import struct
 import time
 from pathlib import Path
 
 import numpy as np
+
+# Pause flag path is set per-process by preprocess() into this module global
+# before the Pool is created, so worker processes (which inherit it via fork)
+# see the same path without needing to thread it through every call.
+_PAUSE_FLAG: str | None = None
+
+
+def _wait_while_paused() -> None:
+    """Block (cheaply) while the pause-flag file exists.
+
+    Checked inside the worker, not just the main process's result loop --
+    `pool.imap` keeps feeding queued chunks to workers regardless of whether
+    the main process is blocked consuming results, so pausing only the main
+    loop would not actually stop CPU usage. Each worker blocks itself before
+    starting its next chunk instead.
+    """
+    if not _PAUSE_FLAG:
+        return
+    while os.path.exists(_PAUSE_FLAG):
+        time.sleep(1.0)
 
 # ── must stay in sync with train_halfkav2.py / src/nnue.cpp ─────────────────
 FT_IN_FEATURES = 45056
@@ -127,6 +148,7 @@ _BATCH = 50_000   # lines per worker task
 
 def _process_batch(args: tuple) -> bytes:
     """Worker: parse a list of raw text lines, return packed binary bytes."""
+    _wait_while_paused()
     lines, cp_scale, max_cp = args
     recs = []
     for line in lines:
@@ -179,6 +201,9 @@ def _line_batches(path: Path, cp_scale: float, skip_records: int = 0,
 
 
 def preprocess(args) -> None:
+    global _PAUSE_FLAG
+    _PAUSE_FLAG = args.pause_flag
+
     inp    = Path(args.data)
     out    = Path(args.out)
     limit  = args.max_records          # cap in INPUT-LINE space (see _line_batches)
@@ -265,6 +290,12 @@ def main() -> None:
                    help='drop positions with |cp| above this (near-mate noise '
                         'filter). Match whatever the consuming trainer uses, '
                         'e.g. 4000 for notebooks/eclipse_wdl_train.ipynb.')
+    p.add_argument('--pause-flag',  type=str,   default=None,
+                   help='path to a flag file; while it exists, worker processes '
+                        'block before starting their next chunk instead of '
+                        'consuming CPU. Created/removed externally, e.g. by '
+                        'scripts/bot_pause_watcher.py while a lichess-bot game '
+                        'is in progress.')
     preprocess(p.parse_args())
 
 

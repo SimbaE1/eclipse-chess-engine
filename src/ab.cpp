@@ -616,4 +616,26 @@ Result find_best_move(Position& pos, int max_depth, std::int64_t time_budget_ms)
     return r;
 }
 
+Score score_move(Position& pos, Move m, int max_depth, std::int64_t time_budget_ms) {
+    init_search_tables();
+    SearchCtx ctx{Clock::now(), time_budget_ms};
+
+    StateInfo st;
+    const std::uint64_t parent_key = pos.key();
+    pos.do_move(m, st);
+    ctx.key_history.push_back(parent_key);
+
+    Score result = 0;
+    for (int d = 1; d <= max_depth; ++d) {
+        Move dummy;
+        const Score s = -negamax(pos, d - 1, -kInfinite, kInfinite, 1, dummy, ctx, MoveNone, m);
+        if (ctx.aborted) break;
+        result = s;
+    }
+
+    ctx.key_history.pop_back();
+    pos.undo_move(m, st);
+    return result;
+}
+
 }  // namespace eclipse::ab

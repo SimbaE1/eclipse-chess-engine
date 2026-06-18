@@ -20,6 +20,14 @@ struct SearchLimits {
     std::int64_t  time_ms  = 0;
     bool          infinite = false;
     bool          ponder   = false;
+
+    // Extra time still safely spendable on THIS move beyond `time_ms`, per
+    // the remain/3 safety cap already enforced in uci.cpp's cmd_go (the
+    // allocated time_ms is usually well under that cap). 0 when there's no
+    // clock to borrow from (movetime/depth/nodes-limited searches). Used by
+    // search.cpp's AB/MCTS reconciliation to extend search on a genuine
+    // disagreement instead of always falling back immediately.
+    std::int64_t  extra_budget_ms = 0;
 };
 
 // Piece-type indexing leaves slot 0 free as NoPieceType so a Piece can encode
