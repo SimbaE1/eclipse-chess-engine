@@ -77,6 +77,12 @@ std::array<std::int16_t, kFtOutSize>          g_ft_b{};
 // weights are contiguous.
 std::vector<std::int8_t>                      g_l1_w;
 std::array<std::int32_t, kL1OutSize>          g_l1_b{};
+// Column-major (input-stationary) copy of the L1 weights: g_l1_w_col[i*kL1OutSize
+// + o] == g_l1_w[o*kL1InSize + i]. The FT output feeding L1 is ~98% zeros, so
+// the L1 dot product is computed sparsely: for each nonzero input i we add
+// in[i] * (its weight column = all kL1OutSize outputs, contiguous here) into an
+// int32 accumulator. Row-major g_l1_w is kept for the scalar fallback path.
+std::vector<std::int8_t>                      g_l1_w_col;
 std::vector<std::int8_t>                      g_l2_w;
 std::array<std::int32_t, kL2OutSize>          g_l2_b{};
 std::vector<std::int8_t>                      g_l3_w;
@@ -112,6 +118,7 @@ void reset_state() noexcept {
     }
     g_ft_b.fill(0);
     g_l1_w.clear();
+    g_l1_w_col.clear();
     g_l1_b.fill(0);
     g_l2_w.clear();
     g_l2_b.fill(0);
@@ -222,6 +229,15 @@ bool load(const std::string& path) {
     if (!read_array(f, g_l1_w.data(), g_l1_w.size())) {
         std::fprintf(stderr, "info string NNUE load failed: short read on l1_w\n");
         return false;
+    }
+    // Transpose L1 weights into the input-stationary (column-major) layout used
+    // by the sparse forward path: g_l1_w_col[i*kL1OutSize + o] = g_l1_w[o*kL1InSize + i].
+    g_l1_w_col.assign(static_cast<std::size_t>(kL1InSize) * kL1OutSize, 0);
+    for (int o = 0; o < kL1OutSize; ++o) {
+        const std::int8_t* row = g_l1_w.data() + static_cast<std::size_t>(o) * kL1InSize;
+        for (int i = 0; i < kL1InSize; ++i) {
+            g_l1_w_col[static_cast<std::size_t>(i) * kL1OutSize + static_cast<std::size_t>(o)] = row[i];
+        }
     }
 
     // L2
@@ -496,6 +512,82 @@ void affine_clipped_relu(const std::uint8_t* in,
 #endif
 }
 
+// Sparse variant of affine_clipped_relu for the FT->L1 layer. The input (FT
+// clipped-ReLU output) is ~98% zeros for these nets, so instead of a dense
+// dot per output we accumulate input-stationary: gather the nonzero input
+// indices, and for each one add in[i] * w_col[i][*] into an int32 accumulator
+// over all kOut outputs. Produces bit-identical results to the dense path
+// (same integer sum; int32 accumulation never saturates), at a fraction of the
+// arithmetic and weight-memory traffic. `w_col` is column-major [kIn, kOut].
+template <int kIn, int kOut>
+void affine_clipped_relu_sparse(const std::uint8_t* in,
+                                const std::int8_t*  w_col,    // [kIn, kOut]
+                                const std::int32_t* b,
+                                std::uint8_t*       out) noexcept {
+#if defined(__AVX2__)
+    static_assert(kOut % 32 == 0, "sparse affine: kOut must be a multiple of 32");
+    static_assert(kIn  % 32 == 0, "sparse affine: kIn must be a multiple of 32");
+
+    alignas(64) std::int32_t acc[kOut];
+    for (int o = 0; o < kOut; ++o) acc[o] = b[o];
+
+    // Gather nonzero input indices 32 at a time via movemask. Inputs are uint8
+    // in [0, kFtQuant=127], so reinterpreted as int8 they are all >= 0 and
+    // cmpgt(x, 0) flags exactly the nonzero lanes.
+    const __m256i zero = _mm256_setzero_si256();
+    for (int base = 0; base < kIn; base += 32) {
+        const __m256i x = _mm256_load_si256(reinterpret_cast<const __m256i*>(in + base));
+        unsigned mask = static_cast<unsigned>(
+            _mm256_movemask_epi8(_mm256_cmpgt_epi8(x, zero)));
+        while (mask) {
+            const int i = base + __builtin_ctz(mask);
+            mask &= mask - 1;
+            const __m256i vv = _mm256_set1_epi32(in[i]);
+            const std::int8_t* wc = w_col + static_cast<std::size_t>(i) * kOut;
+            for (int o = 0; o < kOut; o += 32) {
+                const __m256i w8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(wc + o));
+                const __m128i lo = _mm256_castsi256_si128(w8);
+                const __m128i hi = _mm256_extracti128_si256(w8, 1);
+                const __m256i w0 = _mm256_cvtepi8_epi32(lo);
+                const __m256i w1 = _mm256_cvtepi8_epi32(_mm_srli_si128(lo, 8));
+                const __m256i w2 = _mm256_cvtepi8_epi32(hi);
+                const __m256i w3 = _mm256_cvtepi8_epi32(_mm_srli_si128(hi, 8));
+                __m256i* ap = reinterpret_cast<__m256i*>(acc + o);
+                _mm256_store_si256(ap + 0, _mm256_add_epi32(_mm256_load_si256(ap + 0), _mm256_mullo_epi32(w0, vv)));
+                _mm256_store_si256(ap + 1, _mm256_add_epi32(_mm256_load_si256(ap + 1), _mm256_mullo_epi32(w1, vv)));
+                _mm256_store_si256(ap + 2, _mm256_add_epi32(_mm256_load_si256(ap + 2), _mm256_mullo_epi32(w2, vv)));
+                _mm256_store_si256(ap + 3, _mm256_add_epi32(_mm256_load_si256(ap + 3), _mm256_mullo_epi32(w3, vv)));
+            }
+        }
+    }
+
+    // Post-shift and clamp to uint8 [0, kFtQuant]. Only kOut elements, dwarfed
+    // by the sparse accumulation above, so kept scalar for obvious correctness.
+    for (int o = 0; o < kOut; ++o) {
+        std::int32_t s = acc[o] >> kWeightShift;
+        if (s < 0)        s = 0;
+        if (s > kFtQuant) s = kFtQuant;
+        out[o] = static_cast<std::uint8_t>(s);
+    }
+#else
+    // Scalar sparse fallback.
+    std::int32_t acc[kOut];
+    for (int o = 0; o < kOut; ++o) acc[o] = b[o];
+    for (int i = 0; i < kIn; ++i) {
+        const int v = in[i];
+        if (v == 0) continue;
+        const std::int8_t* wc = w_col + static_cast<std::size_t>(i) * kOut;
+        for (int o = 0; o < kOut; ++o) acc[o] += v * static_cast<std::int32_t>(wc[o]);
+    }
+    for (int o = 0; o < kOut; ++o) {
+        std::int32_t s = acc[o] >> kWeightShift;
+        if (s < 0)        s = 0;
+        if (s > kFtQuant) s = kFtQuant;
+        out[o] = static_cast<std::uint8_t>(s);
+    }
+#endif
+}
+
 #if defined(__AVX2__)
 template <int kIn, int kOut>
 void affine_clipped_relu_batch(const std::uint8_t* in,
@@ -689,7 +781,7 @@ Score evaluate(const Position& pos) noexcept {
 #endif
 
     alignas(64) std::uint8_t l1_out[kL1OutSize];
-    affine_clipped_relu<kL1InSize, kL1OutSize>(ft_out, g_l1_w.data(), g_l1_b.data(), l1_out);
+    affine_clipped_relu_sparse<kL1InSize, kL1OutSize>(ft_out, g_l1_w_col.data(), g_l1_b.data(), l1_out);
 
     alignas(64) std::uint8_t l2_out[kL2OutSize];
     affine_clipped_relu<kL1OutSize, kL2OutSize>(l1_out, g_l2_w.data(), g_l2_b.data(), l2_out);
@@ -771,14 +863,12 @@ void evaluate_batch(const Accumulator* accs, const Color* stms, Score* scores, i
     }
 #endif
 
-    // 2. Batched L1 Layer
-#if defined(__AVX2__)
-    affine_clipped_relu_batch<kL1InSize, kL1OutSize>(ft_scratch, g_l1_w.data(), g_l1_b.data(), l1_scratch, n);
-#else
+    // 2. Batched L1 Layer (sparse: FT output is ~98% zeros, so the dense dot
+    // is wasteful — accumulate input-stationary over the few nonzero inputs).
     for (int b = 0; b < n; ++b) {
-        affine_clipped_relu<kL1InSize, kL1OutSize>(&ft_scratch[b * kL1InSize], g_l1_w.data(), g_l1_b.data(), &l1_scratch[b * kL1OutSize]);
+        affine_clipped_relu_sparse<kL1InSize, kL1OutSize>(
+            &ft_scratch[b * kL1InSize], g_l1_w_col.data(), g_l1_b.data(), &l1_scratch[b * kL1OutSize]);
     }
-#endif
 
     // 3. Batched L2 Layer
 #if defined(__AVX2__)
