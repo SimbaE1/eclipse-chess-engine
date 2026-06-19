@@ -57,7 +57,7 @@ Both the trained NNUE and the converted Lc0 policy are bundled in the repo's
 GitHub Release. `gh` (already auth'd if you cloned via `gh repo clone`):
 
 ```bash
-gh release download v0.8.0 --pattern '*.nnue' --pattern 'policy.onnx' -D data/
+gh release download v0.9.0 --pattern '*.nnue' --pattern 'policy.onnx' -D data/
 mv data/eclipse_*.nnue data/eclipse.nnue          # what UCI EvalFile expects
 ```
 

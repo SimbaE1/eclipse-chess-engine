@@ -35,7 +35,7 @@ cmake --build build -j
 Then grab the neural net into `data/`:
 
 ```bash
-gh release download v0.8.0 --pattern '*.nnue' -D data/
+gh release download v0.9.0 --pattern '*.nnue' -D data/
 mv data/eclipse_*.nnue data/eclipse.nnue      # the name EvalFile defaults to
 ```
 
