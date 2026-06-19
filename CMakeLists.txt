@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(eclipse
-    VERSION 0.0.1
+    VERSION 0.9.2
     DESCRIPTION "Eclipse chess engine"
     LANGUAGES C CXX)
 
