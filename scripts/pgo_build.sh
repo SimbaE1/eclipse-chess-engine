@@ -94,6 +94,14 @@ mkdir -p "$(dirname "$PROFDATA")"
 echo "    merged -> $PROFDATA"
 
 cmake -S . -B build -DECLIPSE_PGO=use -DECLIPSE_PGO_DATA="$PROFDATA" >/dev/null
-cmake --build build -j
+# --clean-first forces a FULL recompile against the freshly merged profdata.
+# Without it, an incremental rebuild (when build/ was already PGO=use, so the
+# reconfigure above is a no-op) only recompiles changed sources -- the rest keep
+# the ProfileSummary embedded from the previous profdata, and ThinLTO aborts the
+# link with "module flags 'ProfileSummary': IDs have conflicting values". A
+# changed profile summary isn't a tracked dependency, so the recompile must be
+# forced. (The merged profdata lives at build/eclipse.profdata, which the clean
+# target does not touch -- it only removes CMake-generated build outputs.)
+cmake --build build -j --clean-first
 
 echo "==> PGO build complete: build/src/eclipse"
