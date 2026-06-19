@@ -142,5 +142,43 @@ int main() {
         ECLIPSE_CHECK(sub.time_up());
     }
 
+    // A node-limited search terminates and returns a legal move (the bounded
+    // search path that go-nodes / internal probes rely on).
+    {
+        Position p = Position::startpos();
+        SearchInfo info;
+        info.limits.nodes = 2000;
+        const Move m = search(p, info);
+        ECLIPSE_CHECK(!m.is_null());
+        ECLIPSE_CHECK(is_legal(p, m));
+    }
+
+    // Robustness sweep: across a spread of opening/middlegame/endgame and
+    // tactical positions (both colors), a short search must always return a
+    // legal, non-null move and never crash. This is the cheap net that catches
+    // movegen/search edge cases (pins, checks, promotions, ep) regressing.
+    {
+        static const char* kFens[] = {
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R b KQkq - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+            "r2q1rk1/pp2ppbp/2p2np1/6B1/3PP1b1/2N2N2/PPP2PPP/R2QKB1R b KQ - 0 1",
+            "8/8/8/3k4/8/8/8/KQ6 w - - 0 1",      // KQvK (won endgame)
+            "8/5k2/8/8/8/8/3K4/7R w - - 0 1",      // KRvK (won endgame)
+            "6k1/5ppp/8/8/8/8/5PPP/6K1 w - - 0 1", // dead-equal pawn endgame
+            "4k3/8/4K3/4P3/8/8/8/8 w - - 0 1",     // KPvK
+        };
+        for (const char* fen : kFens) {
+            Position p;
+            ECLIPSE_CHECK(p.set_from_fen(fen));
+            SearchInfo info;
+            info.limits.depth = 3;
+            const Move m = search(p, info);
+            ECLIPSE_CHECK(!m.is_null());
+            ECLIPSE_CHECK(is_legal(p, m));
+        }
+    }
+
     return eclipse::test::summarize("search");
 }
