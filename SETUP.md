@@ -34,10 +34,14 @@ Produces:
 - `build/src/eclipse` — UCI engine binary
 - `build/tests/test_*` — unit + smoke tests
 
-## 3. Get the policy network
+## 3. (Optional) Get the policy network
 
-The Lc0 transformer that drives MCTS priors. Source format is a Leela `.pb` file
-which `lc0` converts to ONNX:
+By default Eclipse derives MCTS priors from the NNUE value net — this Lc0
+transformer is an **optional** A/B path, consulted only when you set the UCI
+options `PolicyMode onnx` + `PolicyFile data/policy.onnx`. Without it, MCTS uses
+NNUE/heuristic priors and the time-manager's moves-left estimate falls back to a
+fixed default. **Skip this whole section for normal play.** Source format is a
+Leela `.pb` file which `lc0` converts to ONNX:
 
 1. Download `t1-256x10-distilled-swa-2432500.pb` (or any other Lc0 net you
    prefer) from https://training.lczero.org/networks/
@@ -51,13 +55,13 @@ which `lc0` converts to ONNX:
    says `Policy: Attention` and `Value: WDL` — those are the tensor names
    `policy.cpp` expects.
 
-## 4. Get the NNUE weights (and policy ONNX shortcut)
+## 4. Get the NNUE weights
 
-Both the trained NNUE and the converted Lc0 policy are bundled in the repo's
-GitHub Release. `gh` (already auth'd if you cloned via `gh repo clone`):
+The trained NNUE is the only weight file normal play needs; it's published as a
+GitHub Release asset. `gh` (already auth'd if you cloned via `gh repo clone`):
 
 ```bash
-gh release download v0.9.0 --pattern '*.nnue' --pattern 'policy.onnx' -D data/
+gh release download v0.9.0 --pattern '*.nnue' -D data/
 mv data/eclipse_*.nnue data/eclipse.nnue          # what UCI EvalFile expects
 ```
 
@@ -71,7 +75,7 @@ https://github.com/SimbaE1/eclipse-chess-engine/releases
 If you'd rather scp from another machine you've already built on:
 ```bash
 scp m1-air:/Users/ezra/TCEC/eclipse/data/eclipse.nnue data/
-scp m1-air:/Users/ezra/TCEC/eclipse/data/policy.onnx data/
+# data/policy.onnx too, but only if you use the optional PolicyMode onnx path
 ```
 
 With the release in `data/`, you can skip step 3 (policy conversion) entirely —
@@ -103,7 +107,7 @@ Then in the UCI prompt:
 ```
 uci
 setoption name EvalFile value PATH/TO/eclipse/data/eclipse.nnue
-setoption name PolicyFile value PATH/TO/eclipse/data/policy.onnx
+# optional A/B path only: setoption name PolicyMode onnx + PolicyFile <policy.onnx>
 isready
 position startpos
 go movetime 5000
@@ -121,7 +125,6 @@ python scripts/play_human.py --side w --engine-time-ms 5000
 cutechess-cli \
     -engine cmd="$PWD/build/src/eclipse" name="Eclipse" proto=uci \
         option.EvalFile="$PWD/data/eclipse.nnue" \
-        option.PolicyFile="$PWD/data/policy.onnx" \
     -engine cmd="$(which stockfish)" name="SF-1800" proto=uci \
         option.UCI_LimitStrength=true option.UCI_Elo=1800 \
     -each tc=60+1 -rounds 10 -games 2 -repeat -recover \
