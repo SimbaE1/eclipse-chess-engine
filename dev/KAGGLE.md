@@ -8,10 +8,10 @@ The two source-of-truth files are:
 
 | What                            | Where                                  |
 |---------------------------------|----------------------------------------|
-| Data extraction                 | `scripts/extract_lichess_wdl.py`       |
-| Trainer (also embedded in the notebook) | `scripts/train_halfkav2.py`    |
-| Quantizer / `.nnue` packer      | `scripts/convert_halfkav2_nnue.py`     |
-| The notebook                    | `notebooks/eclipse_wdl_train.ipynb`    |
+| Data extraction                 | `dev/scripts/extract_lichess_wdl.py`       |
+| Trainer (also embedded in the notebook) | `dev/scripts/train_halfkav2.py`    |
+| Quantizer / `.nnue` packer      | `dev/scripts/convert_halfkav2_nnue.py`     |
+| The notebook                    | `dev/notebooks/eclipse_wdl_train.ipynb`    |
 
 When any of those scripts change in a way that affects the trained net,
 either:
@@ -74,7 +74,7 @@ printf 'WhiteElo >= "2500"\nBlackElo >= "2500"\n' > /tmp/elo_filter.pgn
 nohup bash -c '
   zstd -dc lichess_db_2025-01.pgn.zst \
     | pgn-extract -s --quiet -t /tmp/elo_filter.pgn 2>/dev/null \
-    | python3 scripts/extract_lichess_wdl.py \
+    | python3 dev/scripts/extract_lichess_wdl.py \
         --target 10_000_000 \
         --output data/wdl_training.txt
 ' > extract.log 2>&1 &
@@ -161,7 +161,7 @@ your notebook can pin to a specific version or always pull `latest`.
 
 ### Open the notebook
 
-1. `notebooks/eclipse_wdl_train.ipynb` → upload to Kaggle as a new notebook
+1. `dev/notebooks/eclipse_wdl_train.ipynb` → upload to Kaggle as a new notebook
    (Code → New Notebook → File → Upload).
 2. **Add data**: attach the `eclipse-partial` dataset (contains `eval_training.txt.gz`).
 3. **Settings → Accelerator**: GPU T4 ×2 (DataParallel across both).
@@ -272,7 +272,7 @@ Once `halfkav2.pt` is in `/kaggle/working/`, click **Output** in the
 notebook UI → download `halfkav2.pt` → drop it into `data/`:
 
 ```bash
-python scripts/convert_halfkav2_nnue.py from-torch \
+python dev/scripts/convert_halfkav2_nnue.py from-torch \
     --state-dict data/halfkav2.pt \
     --out data/eclipse.nnue \
     --output-cp-per-unit 410.0
@@ -344,7 +344,7 @@ This is the "since v0.1.0" rundown for anyone resuming after a break:
 # extract (local)
 zstd -dc lichess_db_2025-01.pgn.zst \
   | pgn-extract -s --quiet -t /tmp/elo_filter.pgn 2>/dev/null \
-  | python3 scripts/extract_lichess_wdl.py \
+  | python3 dev/scripts/extract_lichess_wdl.py \
       --target 10_000_000 --output data/wdl_training.txt
 
 # upload (local → Kaggle)
@@ -352,10 +352,10 @@ gzip -k data/wdl_training.txt
 # → upload data/wdl_training.txt.gz to kaggle dataset 'eclipse-wdl-training'
 
 # train (Kaggle, GPU T4)
-# → run notebooks/eclipse_wdl_train.ipynb with the dataset attached
+# → run dev/notebooks/eclipse_wdl_train.ipynb with the dataset attached
 
 # pack (local)
-python scripts/convert_halfkav2_nnue.py from-torch \
+python dev/scripts/convert_halfkav2_nnue.py from-torch \
     --state-dict data/halfkav2.pt \
     --out data/eclipse.nnue --output-cp-per-unit 410.0
 ```

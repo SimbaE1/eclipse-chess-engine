@@ -10,7 +10,7 @@
 //   ECLIPSE_NNUE_PATH=...      "infrastructure" mode: load + forward pass +
 //                              determinism. Works with any valid file
 //                              including the `init` scaffold from
-//                              scripts/convert_halfkav2_nnue.py - no strength
+//                              dev/scripts/convert_halfkav2_nnue.py - no strength
 //                              claim is checked.
 //
 //   ECLIPSE_NNUE_PATH=...

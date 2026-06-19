@@ -1,163 +1,156 @@
-# Eclipse — setup on a fresh machine
+# Setting up Eclipse
 
-Steps to get from "fresh clone" to "engine playing chess" on a new Mac. Once
-it's running, see [`README.md`](README.md) for how to play and configure it, and
-[`DEVELOPMENT.md`](DEVELOPMENT.md) for the engine internals and net-improvement
-pipeline.
+A detailed, step-by-step guide to get from a fresh machine to Eclipse playing
+chess. For a condensed version and how to *play* once it's running, see
+[`README.md`](README.md).
 
-## 1. Dependencies (Homebrew)
+There are four required steps — **dependencies → clone → build → get the net** —
+plus optional tablebases. Budget ~5 minutes.
 
-```bash
-brew install cmake stockfish lc0 cutechess onnxruntime
-```
+---
 
-- **cmake** — build system
-- **stockfish** — reference engine for benchmarking + label generation
-- **lc0** — only needed for converting the Leela policy network to ONNX (one-time)
-- **cutechess** — engine-vs-engine tournaments for strength measurement
-- **onnxruntime** — runtime for the policy net inference at search time
+## 1. Install dependencies
 
-Python deps (for training/data scripts, not required just to run the engine):
+Eclipse needs **CMake** (build system), a **C++20 compiler**, and **ONNX
+Runtime** (used by the search; required to build).
+
+### macOS (Homebrew)
 
 ```bash
-pip install python-chess torch numpy
+brew install cmake onnxruntime
 ```
 
-## 2. Build the engine
+Xcode Command Line Tools provide the compiler (`xcode-select --install` if you
+don't have them).
+
+### Linux (Debian/Ubuntu)
+
+```bash
+sudo apt update
+sudo apt install -y build-essential cmake git
+```
+
+Install ONNX Runtime from the [official releases](https://github.com/microsoft/onnxruntime/releases)
+(grab a `onnxruntime-linux-x64-*.tgz`, extract it), then point CMake at it in
+step 3 with `-DONNXRUNTIME_ROOT=/path/to/onnxruntime`.
+
+---
+
+## 2. Clone the repository
+
+Eclipse uses the [Fathom](https://github.com/jdart1/Fathom) library for Syzygy
+tablebase probing as a **git submodule**, so clone with `--recursive`:
+
+```bash
+git clone --recursive https://github.com/SimbaE1/eclipse-chess-engine.git
+cd eclipse-chess-engine
+```
+
+Already cloned without `--recursive`? Pull the submodule in:
+
+```bash
+git submodule update --init --recursive
+```
+
+---
+
+## 3. Build
 
 ```bash
 cmake -S . -B build
 cmake --build build -j
 ```
 
-Produces:
-- `build/src/eclipse` — UCI engine binary
-- `build/tests/test_*` — unit + smoke tests
+On Linux, if ONNX Runtime isn't auto-found:
 
-## 3. (Optional) Get the policy network
+```bash
+cmake -S . -B build -DONNXRUNTIME_ROOT=/path/to/onnxruntime
+cmake --build build -j
+```
 
-By default Eclipse derives MCTS priors from the NNUE value net — this Lc0
-transformer is an **optional** A/B path, consulted only when you set the UCI
-options `PolicyMode onnx` + `PolicyFile data/policy.onnx`. Without it, MCTS uses
-NNUE/heuristic priors and the time-manager's moves-left estimate falls back to a
-fixed default. **Skip this whole section for normal play.** Source format is a
-Leela `.pb` file which `lc0` converts to ONNX:
+This produces:
 
-1. Download `t1-256x10-distilled-swa-2432500.pb` (or any other Lc0 net you
-   prefer) from https://training.lczero.org/networks/
-2. Convert it:
-   ```bash
-   lc0 leela2onnx \
-       --input=/path/to/t1-256x10-distilled-swa-2432500.pb \
-       --output=data/policy.onnx
-   ```
-   Output is ~80 MB. The conversion logs the network architecture; verify it
-   says `Policy: Attention` and `Value: WDL` — those are the tensor names
-   `policy.cpp` expects.
+- `build/src/eclipse` — the UCI engine binary
+- `build/tests/test_*` — unit and smoke tests
 
-## 4. Get the NNUE weights
+The build is Release with `-march=native` (tuned for your CPU) by default.
 
-The trained NNUE is the only weight file normal play needs; it's published as a
-GitHub Release asset. `gh` (already auth'd if you cloned via `gh repo clone`):
+---
+
+## 4. Get the neural network
+
+The trained NNUE weights ship as a **GitHub Release** asset (~90 MB, too big for
+the repo). The engine looks for it at `data/eclipse.nnue` by default.
+
+With the [GitHub CLI](https://cli.github.com/):
 
 ```bash
 gh release download v0.9.0 --pattern '*.nnue' -D data/
-mv data/eclipse_*.nnue data/eclipse.nnue          # what UCI EvalFile expects
+mv data/eclipse_*.nnue data/eclipse.nnue
 ```
 
-(Use the latest release tag — `gh release list` shows them.) Alternatively grab
-them via the Releases page (this repo is private, so use `gh` until/unless you
-make it public):
-```
-https://github.com/SimbaE1/eclipse-chess-engine/releases
-```
+Without `gh`, download the latest `.nnue` from the
+[releases page](https://github.com/SimbaE1/eclipse-chess-engine/releases/latest)
+and save it as `data/eclipse.nnue`.
 
-If you'd rather scp from another machine you've already built on:
-```bash
-scp m1-air:/Users/ezra/TCEC/eclipse/data/eclipse.nnue data/
-# data/policy.onnx too, but only if you use the optional PolicyMode onnx path
-```
+> The small policy-index map (`data/lc0_policy_map.txt`) is already in the repo,
+> so once the `.nnue` is in place you have everything needed for normal play.
 
-With the release in `data/`, you can skip step 3 (policy conversion) entirely —
-`policy.onnx` is the same artifact `lc0 leela2onnx` would produce.
+---
 
-The 1858-entry policy index → UCI move map (`data/lc0_policy_map.txt`) is
-required for the policy net to produce meaningful priors. It's committed to
-the repo since it's tiny (~17 KB) and identical for every Lc0 net, so a
-fresh clone has everything it needs after the release-download step.
+## 5. (Optional) Syzygy endgame tablebases
 
-## 5. Verify
+For perfect endgame play, download [Syzygy tablebases](https://syzygy-tables.info/)
+(3–4–5-piece sets are ~1 GB and plenty for casual play; 6-piece is ~150 GB). Put
+them in a folder and pass that path as the `SyzygyPath` UCI option. Without
+tablebases Eclipse plays endgames from its own evaluation — it just won't be
+provably perfect.
 
-```bash
-ECLIPSE_NNUE_PATH=$PWD/data/eclipse.nnue \
-ECLIPSE_NNUE_TRAINED=1 \
-./build/tests/test_nnue
-```
+---
 
-Expected output ends with `PASS  nnue`. If it fails, the NNUE file is corrupted
-or the engine was built against a different `kFtOutSize` than the file's header.
+## 6. Verify it works
 
-## 6. Run it
+Quick sanity check — load the net and run the built-in benchmark:
 
 ```bash
-./build/src/eclipse
+printf 'setoption name EvalFile value data/eclipse.nnue\nsetoption name Threads value 4\nisready\nbench\nquit\n' | ./build/src/eclipse
 ```
 
-Then in the UCI prompt:
-```
-uci
-setoption name EvalFile value PATH/TO/eclipse/data/eclipse.nnue
-# optional A/B path only: setoption name PolicyMode onnx + PolicyFile <policy.onnx>
-isready
-position startpos
-go movetime 5000
-```
-
-Or use the friendly Python wrapper to play interactively:
+You should see a `NNUE loaded:` line and a `Benchmark: … nodes … nps` summary. If
+you'd rather run the test suite:
 
 ```bash
-python scripts/play_human.py --side w --engine-time-ms 5000
+ctest --test-dir build
 ```
 
-## 7. Benchmark against Stockfish at a target Elo
+---
 
-```bash
-cutechess-cli \
-    -engine cmd="$PWD/build/src/eclipse" name="Eclipse" proto=uci \
-        option.EvalFile="$PWD/data/eclipse.nnue" \
-    -engine cmd="$(which stockfish)" name="SF-1800" proto=uci \
-        option.UCI_LimitStrength=true option.UCI_Elo=1800 \
-    -each tc=60+1 -rounds 10 -games 2 -repeat -recover \
-    -pgnout data/eclipse_vs_sf1800.pgn -ratinginterval 4
-```
+## 7. Play
 
-PGNs of benchmark runs are committed to `data/*.pgn`. Strength results so far:
+You're done — head back to [`README.md`](README.md#play-against-it) for playing
+in a GUI, in the terminal, or over raw UCI.
 
-| NNUE version | Training positions | vs SF-1800 | Elo |
-|---|---|---|---|
-| v1 | 677,840 | (see PGN) | TBD |
-| v2 | 1,580,000 | (see PGN) | TBD |
+The fastest way to try it: load it into a UCI GUI (Cute Chess, Arena, …) with
+`EvalFile` set to your `data/eclipse.nnue`, or challenge the live bot at
+[@EclipseBOT](https://lichess.org/@/EclipseBOT).
 
-## Training a new NNUE
+---
 
-Full pipeline lives in `scripts/`:
+## Troubleshooting
 
-| Stage | Script | Notes |
-|---|---|---|
-| Extract Lichess positions | `sample_lichess.py` / `extract_lichess_evals.py` | Streaming, filters by Elo + TC |
-| Label with Stockfish | `label_with_stockfish.py` | Optional — only if not using Lichess's built-in evals |
-| Train HalfKAv2 net | `train_halfkav2.py` | PyTorch, supports `--device cuda/mps/cpu` |
-| Pack to .nnue | `convert_halfkav2_nnue.py` | Quantizes float32 -> int8/int16 |
+| Symptom | Fix |
+|---|---|
+| `Could not locate onnxruntime` | `brew install onnxruntime` (macOS), or pass `-DONNXRUNTIME_ROOT=/path/to/onnxruntime` (Linux). |
+| Build errors mentioning `extern/fathom` / `tbprobe` | The submodule wasn't fetched — run `git submodule update --init --recursive`. |
+| `failed to load NNUE` / version mismatch | The `.nnue` is for a different build, or got truncated. Re-download the net for your release and rebuild the engine. |
+| Engine runs but plays instantly / weakly | `EvalFile` isn't set or points at a missing file — confirm `data/eclipse.nnue` exists and the path is correct. |
 
-Recommended workflow for the Mac Pro: extract data locally (network-bound),
-upload to Kaggle, train on a T4 in a notebook, download the `.pt`, pack locally.
-See [`KAGGLE.md`](KAGGLE.md) for the end-to-end Kaggle pipeline and
-[`notebooks/eclipse_wdl_train.ipynb`](notebooks/eclipse_wdl_train.ipynb) for
-the notebook itself.
+---
 
-## Architecture overview
+## Building/training it yourself
 
-Eclipse is multi-threaded MCTS + a HalfKAv2 NNUE value net (`45056 → 1024×2 →
-512 → 128 → 1`, incremental accumulator, AVX-512/AVX2/NEON SIMD) with an
-alpha-beta tactical verifier and Syzygy probing. Full details, the search
-tunables, and the source map are in [`DEVELOPMENT.md`](DEVELOPMENT.md).
+Everything for hacking on the engine or training a new network lives under
+[`dev/`](dev/) — start with [`dev/DEVELOPMENT.md`](dev/DEVELOPMENT.md) (internals,
+build/test loop) and [`dev/KAGGLE.md`](dev/KAGGLE.md) (the training pipeline). The
+optional Lc0 policy network (an A/B experiment, not needed for normal play) is
+documented there too.

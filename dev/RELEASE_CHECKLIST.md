@@ -24,7 +24,7 @@ training, but an undertrained/mis-tuned wide net can land neutral or worse.
       (SPRT pass, or a few hundred games with non-overlapping error bars).
 - [ ] Engine C++ side updated for the wider net (`kFtOutSize` in `src/nnue.hpp`,
       accumulator width + SIMD ladders in `src/nnue.cpp`/`src/accumulator.hpp`,
-      `scripts/convert_halfkav2_nnue.py`) — and it loads + benches correctly.
+      `dev/scripts/convert_halfkav2_nnue.py`) — and it loads + benches correctly.
 - [ ] Deployed net tagged/published so the README download link is reproducible.
 
 ## 3. Rating settled

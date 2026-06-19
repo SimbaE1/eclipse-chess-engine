@@ -1,6 +1,5 @@
 # Build artifacts
-build/
-build-*/
+build*/
 out/
 *.o
 *.obj
@@ -15,6 +14,12 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+
+# Local run artifacts (data extraction, profiling, bot pid files)
+*.pid
+extract*.log*
+*.profraw
+*.profdata
 
 # Trained weights and training data (downloaded separately - see SETUP.md)
 data/

@@ -1,8 +1,8 @@
 # Eclipse — development
 
 Internals, build/test loop, and the net-improvement pipeline. For installing and
-*playing* the engine, see [`README.md`](README.md); for a fresh-machine bootstrap
-see [`SETUP.md`](SETUP.md); for training data + GPU training see
+*playing* the engine, see [`README.md`](../README.md); for a fresh-machine bootstrap
+see [`SETUP.md`](../SETUP.md); for training data + GPU training see
 [`KAGGLE.md`](KAGGLE.md).
 
 > **Status:** late proof-of-concept. The search, NNUE, policy, ponder, and
@@ -65,18 +65,18 @@ All are runtime `setoption`s, so you can A/B them in a match without rebuilding.
 |---|---|
 | `src/` | Engine (C++20): search, NNUE, policy, UCI, movegen, Syzygy |
 | `tests/` | Unit + smoke tests (`ctest`) |
-| `scripts/` | Data, training, conversion, and **match/eval tooling** |
-| `notebooks/` | `eclipse_wdl_train.ipynb` — the Kaggle training notebook |
+| `dev/scripts/` | Data, training, conversion, and **match/eval tooling** |
+| `dev/notebooks/` | `eclipse_wdl_train.ipynb` — the Kaggle training notebook |
 | `data/` | Nets (`eclipse.nnue`, `policy.onnx`), books, benchmark PGNs (nets are git-ignored; they ship via GitHub Releases) |
 | `extern/` | Vendored deps (e.g. Fathom for Syzygy) |
-| [`SETUP.md`](SETUP.md) | Fresh-machine install → build → run |
+| [`SETUP.md`](../SETUP.md) | Fresh-machine install → build → run |
 | [`KAGGLE.md`](KAGGLE.md) | End-to-end data + GPU training pipeline |
 
 ---
 
 ## Development loop
 
-Build and test (see [`SETUP.md`](SETUP.md) for first-time dependencies):
+Build and test (see [`SETUP.md`](../SETUP.md) for first-time dependencies):
 
 ```bash
 cmake -S . -B build          # configure (Release by default, -march=native on)
@@ -95,7 +95,7 @@ cmake --build build-debug -j && ctest --test-dir build-debug
 Run a quick standalone search to eyeball nps / depth / score:
 
 ```bash
-scripts/engine_diag.sh data/eclipse.nnue 3000 4   # <net> [movetime_ms] [threads]
+dev/scripts/engine_diag.sh data/eclipse.nnue 3000 4   # <net> [movetime_ms] [threads]
 ```
 
 Or the built-in fixed-node benchmark (100k nodes from the start position):
@@ -135,16 +135,16 @@ lichess   eclipse_wdl_train   _net.sh        + analyze  to data/eclipse.nnue
 
 Data engineering runs locally (network-bound), training runs on Kaggle's free
 T4s (compute-bound). Full details in [`KAGGLE.md`](KAGGLE.md); the notebook is
-`notebooks/eclipse_wdl_train.ipynb`. Each chunk it trains is checkpointed to the
+`dev/notebooks/eclipse_wdl_train.ipynb`. Each chunk it trains is checkpointed to the
 Kaggle dataset `simbae11/eclipse-checkpoint` as `halfkav2.pt` +
 `resume_state.pt`.
 
 | Stage | Script |
 |---|---|
-| Extract Lichess positions | `scripts/extract_lichess_wdl.py`, `scripts/sample_lichess.py` |
-| (Optional) Stockfish labels | `scripts/label_with_stockfish.py` |
-| Train HalfKAv2 | `scripts/train_halfkav2.py` (mirrored in the notebook) |
-| Pack to `.nnue` | `scripts/convert_halfkav2_nnue.py` |
+| Extract Lichess positions | `dev/scripts/extract_lichess_wdl.py`, `dev/scripts/sample_lichess.py` |
+| (Optional) Stockfish labels | `dev/scripts/label_with_stockfish.py` |
+| Train HalfKAv2 | `dev/scripts/train_halfkav2.py` (mirrored in the notebook) |
+| Pack to `.nnue` | `dev/scripts/convert_halfkav2_nnue.py` |
 
 ### 2. Fetch the latest checkpoint → `data/eclipse.nnue`
 
@@ -153,7 +153,7 @@ scale:
 
 ```bash
 export KAGGLE_API_TOKEN=KGAT_xxxxxxxx        # Bearer token, not stored in repo
-scripts/fetch_latest_net.sh                  # -> data/eclipse.nnue (cp=300), verified
+dev/scripts/fetch_latest_net.sh                  # -> data/eclipse.nnue (cp=300), verified
 ```
 
 It reports the checkpoint's epoch/chunk, converts `halfkav2.pt` with
@@ -177,7 +177,7 @@ curl -sL -o /tmp/uho.zip \
   https://github.com/official-stockfish/books/raw/master/UHO_4060_v2.epd.zip
 unzip -o /tmp/uho.zip -d data/books/
 
-scripts/run_match.sh \
+dev/scripts/run_match.sh \
   --net1 data/eclipse_candidate.nnue --net2 data/eclipse.nnue \
   --name1 cand --name2 cur \
   --tc 5+3 --games 40 \
@@ -189,18 +189,18 @@ Watch and analyze (all read the live PGN safely — cutechess only appends a gam
 once it finishes):
 
 ```bash
-python3 scripts/match_score.py /tmp/cand_vs_cur.pgn          # results + running score
-python3 scripts/match_depth.py /tmp/cand_vs_cur.pgn          # depth + time/move per net
-python3 scripts/analyze_accuracy.py /tmp/cand_vs_cur.pgn \   # SF accuracy + ACPL (cached)
+python3 dev/scripts/match_score.py /tmp/cand_vs_cur.pgn          # results + running score
+python3 dev/scripts/match_depth.py /tmp/cand_vs_cur.pgn          # depth + time/move per net
+python3 dev/scripts/analyze_accuracy.py /tmp/cand_vs_cur.pgn \   # SF accuracy + ACPL (cached)
     --stockfish "$(which stockfish)" --depth 15
 ```
 
 `analyze_accuracy.py` caches per game (keyed by PGN path + game + depth), so
 re-running on a growing match only evaluates new games. For ponderhits / nps,
-launch with `scripts/run_match.sh --debug ...` and read the log:
+launch with `dev/scripts/run_match.sh --debug ...` and read the log:
 
 ```bash
-scripts/ponderhit_stats.sh /tmp/cand_vs_cur_debug.log
+dev/scripts/ponderhit_stats.sh /tmp/cand_vs_cur_debug.log
 ```
 
 > **Reading the numbers.** Accuracy% saturates near the top and is a poor
@@ -225,17 +225,17 @@ cp data/eclipse_candidate.nnue data/eclipse.nnue
 
 | Script | Purpose |
 |---|---|
-| `scripts/run_match.sh` | cutechess launcher; `--book` for imbalanced openings, `--debug`, `--dry-run` |
-| `scripts/match_score.py` | Per-game results + running W/D/L score from a PGN |
-| `scripts/match_depth.py` | Per-net avg/max depth and time-per-move from PGN comments |
-| `scripts/analyze_accuracy.py` | Stockfish accuracy% + ACPL per game (cached; `--no-cache`) |
-| `scripts/engine_diag.sh` | Live nps/depth/seldepth from one standalone search |
-| `scripts/ponderhit_stats.sh` | Ponderhit count + avg nps from a cutechess `-debug` log |
-| `scripts/fetch_latest_net.sh` | Download latest Kaggle checkpoint → `data/eclipse.nnue` (cp=300) |
-| `scripts/bench_vs_stockfish.py` | Calibrate strength vs Stockfish at a target Elo |
+| `dev/scripts/run_match.sh` | cutechess launcher; `--book` for imbalanced openings, `--debug`, `--dry-run` |
+| `dev/scripts/match_score.py` | Per-game results + running W/D/L score from a PGN |
+| `dev/scripts/match_depth.py` | Per-net avg/max depth and time-per-move from PGN comments |
+| `dev/scripts/analyze_accuracy.py` | Stockfish accuracy% + ACPL per game (cached; `--no-cache`) |
+| `dev/scripts/engine_diag.sh` | Live nps/depth/seldepth from one standalone search |
+| `dev/scripts/ponderhit_stats.sh` | Ponderhit count + avg nps from a cutechess `-debug` log |
+| `dev/scripts/fetch_latest_net.sh` | Download latest Kaggle checkpoint → `data/eclipse.nnue` (cp=300) |
+| `dev/scripts/bench_vs_stockfish.py` | Calibrate strength vs Stockfish at a target Elo |
 
 `watch` keeps any of the PGN readers live:
 
 ```bash
-watch -n 30 'python3 scripts/match_score.py /tmp/cand_vs_cur.pgn'
+watch -n 30 'python3 dev/scripts/match_score.py /tmp/cand_vs_cur.pgn'
 ```

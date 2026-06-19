@@ -1,87 +1,89 @@
-# Eclipse
+# Eclipse ♟️🌒
 
-A UCI chess engine aiming for TCEC-competitive strength. Eclipse pairs an
-**MCTS search** with a **HalfKAv2 NNUE** evaluation and an alpha-beta tactical
-verifier — so it plays positionally like a neural engine but doesn't fall for
-tactics. It runs in any standard chess GUI and on the command line.
+**Eclipse is a free, open-source UCI chess engine.** It pairs a neural-network
+evaluation (**HalfKAv2 NNUE**) with a **Monte-Carlo Tree Search**, backed by an
+**alpha-beta tactical verifier** — so it plays with the positional feel of a
+neural engine while a classical searcher guards against tactical blunders. It
+also probes **Syzygy endgame tablebases** for perfect endings.
 
-> **Status:** late proof-of-concept — fully playable. It speaks UCI, supports
-> multi-threading, pondering, and Syzygy tablebases.
+It runs anywhere a UCI engine does: any chess GUI, the command line, or as a
+Lichess bot.
 
-This page is for **running and playing** Eclipse. If you want to hack on the
-engine itself, see [`DEVELOPMENT.md`](DEVELOPMENT.md).
+> **▶ Play it right now on Lichess: [@EclipseBOT](https://lichess.org/@/EclipseBOT)**
+> — challenge it to a rated or casual game.
+
+> **Status:** v0.9.2 — a fully playable late proof-of-concept. UCI, multi-threaded
+> search, pondering, and Syzygy tablebases all work. Strength is still climbing as
+> the network improves.
 
 ---
 
-## 1. Get it
+## What makes it tick
 
-Eclipse builds from source; the neural net ships separately as a release asset
-(it's ~90 MB, too big for the repo).
+| Component | What it does |
+|---|---|
+| **NNUE value net** | HalfKAv2 architecture (`45056 → 1024×2 → 512 → 128 → 1`), int8/int16 quantized with an incremental accumulator and AVX-512 / AVX2 / NEON SIMD. This is Eclipse's "judgement." |
+| **MCTS search** | Multi-threaded PUCT tree search explores the most promising lines — the source of its human-like, plan-oriented play. |
+| **Alpha-beta verifier** | A classical tactical search runs alongside MCTS; when it spots a tactic the tree missed, it corrects the move choice. Neural intuition, tactical safety net. |
+| **Syzygy tablebases** | Optional; when the board is small enough, Eclipse plays endgames perfectly. |
+
+---
+
+## Quick start
+
+You'll build Eclipse from source (it's small and fast to build) and download the
+neural net separately. Full step-by-step — including a clean Linux setup and
+troubleshooting — is in **[SETUP.md](SETUP.md)**.
 
 ```bash
-# clone (private repo — use the GitHub CLI)
-gh repo clone SimbaE1/eclipse-chess-engine
+# 1. clone (with the Fathom tablebase submodule)
+git clone --recursive https://github.com/SimbaE1/eclipse-chess-engine.git
 cd eclipse-chess-engine
 
-# install build + runtime dependencies (macOS / Homebrew)
+# 2. install build dependencies (macOS / Homebrew)
 brew install cmake onnxruntime
 
-# build (Release, tuned for your CPU)
+# 3. build
 cmake -S . -B build
 cmake --build build -j
 # -> build/src/eclipse
-```
 
-Then grab the neural net into `data/`:
-
-```bash
+# 4. download the neural net into data/
 gh release download v0.9.0 --pattern '*.nnue' -D data/
-mv data/eclipse_*.nnue data/eclipse.nnue      # the name EvalFile defaults to
+mv data/eclipse_*.nnue data/eclipse.nnue
 ```
 
-> First time on a fresh machine, or hitting build/dependency trouble? The
-> step-by-step bootstrap (including the optional policy net and a verify step)
-> is in [`SETUP.md`](SETUP.md).
-
-Optional but recommended for strong endgame play — point Eclipse at
-[Syzygy tablebases](https://syzygy-tables.info/) you've downloaded (3–4–5 man is
-plenty for casual play).
+No `gh`? Grab the `.nnue` from the [releases page](https://github.com/SimbaE1/eclipse-chess-engine/releases/latest)
+and save it as `data/eclipse.nnue`.
 
 ---
 
-## 2. Play against it
+## Play against it
 
 ### In a chess GUI (recommended)
 
-Eclipse is a standard UCI engine, so it drops into any UCI GUI — **Cute Chess**,
-**Arena**, **BanksiaGUI**, **Scid vS. PC**, etc. Add a new engine and point it at:
+Eclipse is a standard UCI engine, so it drops into **Cute Chess**, **Arena**,
+**BanksiaGUI**, **Scid vs. PC**, and friends. Add a new engine pointing at the
+binary, then set its options:
 
 - **Command:** `…/eclipse-chess-engine/build/src/eclipse`
-- Then set these engine options in the GUI:
-  - `EvalFile` → `…/eclipse-chess-engine/data/eclipse.nnue` *(required)*
-  - `Threads` → how many CPU cores to use (e.g. 4)
-  - `Hash` → transposition memory in MB (e.g. 256)
-  - `SyzygyPath` → your tablebase folder *(optional)*
+- `EvalFile` → `…/eclipse-chess-engine/data/eclipse.nnue` *(required)*
+- `Threads` → number of CPU cores to use (e.g. `4`)
+- `Hash` → transposition memory in MB (e.g. `256`)
+- `SyzygyPath` → your tablebase folder *(optional, for perfect endgames)*
 
-Now start a game against it like any other engine.
+### In the terminal
 
-### In the terminal (quick game, no GUI)
-
-A small Python helper lets you play right in the terminal (needs
-`pip install python-chess`):
+A small helper lets you play right in your shell (`pip install python-chess`):
 
 ```bash
 python scripts/play_human.py --side w --tc 5+3 --threads 4
 ```
 
-- `--side w|b` — which color **you** play (default white)
-- `--tc 5+3` — time control (5 min + 3 s); or `--tc fixed --engine-time-ms 3000`
-  for a flat think-time per move
-- `--threads`, `--hash`, `--syzygy` — passed through to the engine
+Enter moves in UCI form (`e2e4`, `g1f3`, `e7e8q` to promote). `--side w|b`
+chooses your color; `--tc 5+3` is the time control.
 
-Type your moves in UCI form (e.g. `e2e4`, `g1f3`, `e7e8q` to promote).
-
-### Raw UCI (for the curious)
+### Raw UCI
 
 ```bash
 ./build/src/eclipse
@@ -91,78 +93,54 @@ uci
 setoption name EvalFile value data/eclipse.nnue
 setoption name Threads value 4
 setoption name Hash value 256
-setoption name SyzygyPath value /path/to/syzygy
 isready
 position startpos
 go movetime 5000
 ```
-It replies with `bestmove …`. `quit` to exit.
+It replies `bestmove …`. Type `quit` to exit.
 
 ---
 
-## 3. Configure it
+## Options
 
-The options you'll actually touch as a player:
+The settings you'll actually touch as a player:
 
 | Option | Default | What it does |
 |---|---|---|
 | `EvalFile` | — | Path to the `.nnue` net **(required)** |
-| `Threads` | 1 | CPU cores for search — set this to your core count |
+| `Threads` | 1 | CPU cores for search — set to your core count |
 | `Hash` | 256 | Search memory (MB) |
 | `SyzygyPath` | — | Folder of Syzygy tablebases for perfect endgames |
 | `Ponder` | on | Let it think on your time (the GUI manages this) |
 
-Eclipse also exposes search-strength knobs (`Cpuct`, `PolicyDepth`, …) for
-tinkerers — those and their trade-offs are documented in
-[`DEVELOPMENT.md`](DEVELOPMENT.md#search-tunables-uci-options).
+There are additional search-tuning knobs (`Cpuct`, `PolicyDepth`, …) for the
+curious — see [`dev/DEVELOPMENT.md`](dev/DEVELOPMENT.md).
 
 ---
 
-## 4. Test it / measure its strength
+## Want maximum speed?
 
-**Quick self-check** — a fixed-node benchmark prints nodes/sec:
-
-```bash
-printf 'setoption name EvalFile value data/eclipse.nnue\nsetoption name Threads value 4\nisready\nbench\nquit\n' | ./build/src/eclipse
-```
-
-**Play it against another engine** with [cutechess-cli](https://github.com/cutechess/cutechess).
-For example, a 10-game match at 5 min + 3 s vs. another UCI engine, giving
-Eclipse 4 cores and its tablebases (no result adjudication):
+The default build is already optimized for your CPU. For an extra ~10–20% from
+profile-guided optimization:
 
 ```bash
-cutechess-cli \
-  -engine name=eclipse cmd=./build/src/eclipse \
-    option.EvalFile=$PWD/data/eclipse.nnue \
-    option.Threads=4 option.Hash=256 \
-    option.SyzygyPath=/path/to/syzygy \
-  -engine name=opponent cmd=/path/to/other-engine \
-    option.Hash=256 \
-  -each tc=5+3 proto=uci \
-  -games 10 -repeat -concurrency 1 \
-  -pgnout /tmp/eclipse_match.pgn
+./scripts/pgo_build.sh        # builds an instrumented binary, profiles it, rebuilds
 ```
 
-Then read off the result:
-
-```bash
-python3 scripts/match_score.py /tmp/eclipse_match.pgn     # running W/D/L score
-```
-
-For deeper analysis (per-net depth/time, Stockfish accuracy + ACPL, live
-watching) and the net-vs-net testing workflow, see
-[`DEVELOPMENT.md`](DEVELOPMENT.md#testing--evaluation-toolkit-reference).
+This is the build that runs on [@EclipseBOT](https://lichess.org/@/EclipseBOT).
 
 ---
 
-## Documentation
+## For developers
 
-| Doc | For |
-|---|---|
-| **README.md** (this) | Download, play, configure, test |
-| [`SETUP.md`](SETUP.md) | Fresh-machine bootstrap, step by step |
-| [`DEVELOPMENT.md`](DEVELOPMENT.md) | Engine internals, build/test loop, net-improvement pipeline |
-| [`KAGGLE.md`](KAGGLE.md) | Training a new NNUE (data + GPU pipeline) |
+This repository is set up for **using** Eclipse. If you want to hack on the
+engine, retrain the network, or run strength tests, everything lives under
+[`dev/`](dev/):
+
+- [`dev/DEVELOPMENT.md`](dev/DEVELOPMENT.md) — engine internals, the build/test loop, search tunables
+- [`dev/KAGGLE.md`](dev/KAGGLE.md) — the NNUE training pipeline (data → GPU → `.nnue`)
+- `dev/scripts/` — training, data, conversion, and match/evaluation tooling
+- `dev/notebooks/` — the training notebook
 
 ## License
 
