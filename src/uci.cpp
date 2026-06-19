@@ -289,16 +289,21 @@ void cmd_go(const std::vector<std::string>& tok) {
         // keeps us from starving the next move in a long endgame.
         const auto root = policy::get_root_info(g_pos);
         const int  mlh_our_moves = static_cast<int>(root.mlh_plies / 2.0f);
-        // Floor of 20 (was 8, was 5): never plan to spend more than ~1/20 of the
-        // clock on a routine move. The floor matters when the MLH head
-        // UNDER-predicts how long the game will last: it then reports few moves
-        // remaining, the divisor collapses to the floor, and we budget that
-        // fraction of the clock EVERY move. A floor of 8 = 12.5%/move, which over
-        // a normal-length game bleeds the clock to zero and flags — exactly what
-        // happened on 2026-06-18 (flagged a +14 position vs SF lvl5 at 10+15).
-        // 20 = ~5%/move is sustainable with increment across an 80+ move game,
-        // while still letting an accurate (larger) MLH estimate spend more early.
-        const int  divisor = std::clamp(mlh_our_moves, 20, 60);
+        // Floor of 40 (was 20, was 8, was 5): never plan to spend more than
+        // ~1/40 of the clock on a routine move. The floor matters when the MLH
+        // head UNDER-predicts how long the game will last: it then reports few
+        // moves remaining, the divisor collapses to the floor, and we budget
+        // that fraction of the clock EVERY move.
+        //
+        // The soft budget remain/D + 0.8*inc drives the clock to an equilibrium
+        // of D*0.2*inc, where each move spends exactly the increment and the
+        // clock holds flat. Higher D => smaller per-move spend (faster play) AND
+        // a higher resting clock (more safety). D=8 => 12.5%/move, bled to flag
+        // (2026-06-18 vs SF lvl5). D=20 => ~5%/move, rests at only 60s @ +15s.
+        // D=40 => ~2.5%/move and rests at ~120s @ +15s: noticeably faster moves
+        // and a comfortable cushion, while an accurate (larger) MLH estimate can
+        // still spend a bit more early. Upper clamp 60 caps the richest case.
+        const int  divisor = std::clamp(mlh_our_moves, 40, 60);
 
         limits.time_ms = remain / divisor + inc * 4 / 5;
         // Safety: never burn more than 1/3 of remaining time on one move.
@@ -316,6 +321,24 @@ void cmd_go(const std::vector<std::string>& tok) {
         constexpr int kLatencyMarginMs = 300;
         const int hard_cap = std::min<int>(safety_cap, remain - kLatencyMarginMs);
         limits.hard_limit_ms = std::max(1, hard_cap);
+
+        // No-flag guarantee for the low-clock regime. The soft-budget equilibrium
+        // above only holds in the limit; a sharp position late in the game can
+        // still trigger extensions up to the 1/3 safety_cap, and 1/3 of a low
+        // clock spends MORE than the increment refunds — so the clock keeps
+        // draining and eventually flags (the won-game flag we kept seeing). When
+        // we are genuinely low (within ~8 increments), clamp the WHOLE move to
+        // 2/3 of the increment. The deadline bounds the search phases, but a
+        // small tail (final AB verify/reconciliation + bestmove I/O, measured at
+        // ~1.5s) lands on top, so capping at 0.9*inc would only net ~+0.1s. At
+        // 2/3*inc the real spend (~2/3*inc + tail) stays clearly under the
+        // increment, so every move from here nets positive and the clock
+        // strictly recovers — flagging is impossible regardless of search phase.
+        // With +15s that's a ~10s cap (~11-12s real). Only engages when low, so
+        // normal play is unaffected.
+        if (inc > 0 && remain < 8 * inc) {
+            limits.hard_limit_ms = std::min<std::int64_t>(limits.hard_limit_ms, inc * 2 / 3);
+        }
 
         // The soft target must sit under the hard ceiling, otherwise the main
         // phase alone would try to consume the entire budget and leave nothing
