@@ -3,6 +3,9 @@
 // Smoke tests for the search layer. Not a strength test - just confirms
 // search runs, terminates, and picks plausible moves in obvious positions.
 
+#include <atomic>
+#include <chrono>
+
 #include "check.hpp"
 #include "eval.hpp"
 #include "movegen.hpp"
@@ -104,6 +107,39 @@ int main() {
         const Move m = search(p, info);
         // 0 legal moves; the search should not produce a "best move".
         ECLIPSE_CHECK(m.is_null());
+    }
+
+    // time_up() bounds for internal sub-searches (the validation MCTS).
+    //
+    // Regression guard for the won-game ponder flag: the validator runs on its
+    // own SearchInfo with limits.time_ms clamped to whatever is left on the
+    // move, which can be 0 when the budget is already spent. time_up() treats
+    // time_ms<=0 as "unbounded" (correct for `go infinite`/depth searches), so
+    // without a backstop a zero-budget validator under a ponder parent (whose
+    // hard_deadline is epoch) would spin until the node pool filled, overrunning
+    // the move by 100s+. The fix makes search() bind the validator an ABSOLUTE
+    // deadline and point ext_stop at the parent's stop. Verify both here.
+    {
+        using Clock = std::chrono::steady_clock;
+        // Zero budget, no hard deadline: this is the unbounded case (the bug).
+        SearchInfo info;
+        info.limits.time_ms = 0;
+        ECLIPSE_CHECK(!info.time_up());  // documents the footgun the fix guards
+
+        // An absolute deadline already in the past bounds it even at time_ms=0.
+        info.hard_deadline = Clock::now() - std::chrono::milliseconds(1);
+        ECLIPSE_CHECK(info.time_up());
+
+        // ext_stop (parent abort) overrides everything, even with no deadline
+        // and a positive budget — a ponder miss must abort the sub-search.
+        SearchInfo sub;
+        sub.limits.time_ms = 1'000'000;       // plenty of budget on its own
+        sub.start_time     = Clock::now();    // ...and the clock just started
+        std::atomic<bool> parent_stop{false};
+        sub.ext_stop = &parent_stop;
+        ECLIPSE_CHECK(!sub.time_up());
+        parent_stop.store(true, std::memory_order_relaxed);
+        ECLIPSE_CHECK(sub.time_up());
     }
 
     return eclipse::test::summarize("search");

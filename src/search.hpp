@@ -71,6 +71,15 @@ struct SearchInfo {
     // GUI's current root — their PV moves would be flagged as illegal otherwise.
     bool silent = false;
 
+    // Optional external abort flag. An internal sub-search (the validation
+    // MCTS) runs on its OWN SearchInfo, so the parent's `stop` atomic — the one
+    // the UCI `join_search_thread()`/ponder-miss path sets — never reaches it.
+    // Pointing this at the parent's `&stop` makes time_up() honour that abort,
+    // so a ponder miss can't leave the validator running (and blocking the
+    // join) after the move it belongs to is already over. Null for top-level
+    // searches, which use their own `stop` directly.
+    const std::atomic<bool>* ext_stop = nullptr;
+
     bool time_up() const noexcept;
 
     // ms remaining until hard_deadline (clamped to >= 0). Returns a large

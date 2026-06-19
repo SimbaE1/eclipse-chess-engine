@@ -140,6 +140,10 @@ void log_ab_outcome(const ab::Result& ab, Move mcts_move, Score mcts_cp, const c
 }  // namespace
 
 bool SearchInfo::time_up() const noexcept {
+    // External abort (parent search's stop, for internal sub-searches). Checked
+    // first so a ponder miss / `stop` / `quit` aborts the sub-search before any
+    // budget arithmetic — it has no clock of its own to fall back on.
+    if (ext_stop && ext_stop->load(std::memory_order_relaxed)) return true;
     if (limits.nodes > 0 && static_cast<std::uint64_t>(nodes_searched.load(std::memory_order_relaxed)) >= limits.nodes) return true;
     if (limits.depth > 0 && nodes_searched.load(std::memory_order_relaxed) >= limits.depth) return true;
     // Absolute hard ceiling: the SUM of all phases must never cross this,
@@ -549,13 +553,34 @@ Move search(Position& pos, SearchInfo& info) {
             SearchInfo validation_info;
             validation_info.threads        = total_threads;  // all threads, focused
             validation_info.ab_threads     = 0;              // pure MCTS verdict
-            // Cap the validation MCTS at whatever is left before the deadline,
-            // and share the SAME absolute deadline so its workers stop on time
-            // even though it runs from a fresh start_time.
-            validation_info.limits.time_ms = std::min<std::int64_t>(validation_budget,
-                                                                    info.ms_until_hard_deadline());
+            // Cap the validation MCTS at whatever is left before the deadline.
+            const std::int64_t remaining_ms = info.ms_until_hard_deadline();
+            validation_info.limits.time_ms = std::min<std::int64_t>(validation_budget, remaining_ms);
             validation_info.start_time     = std::chrono::steady_clock::now();
-            validation_info.hard_deadline  = info.hard_deadline;
+            // Bind an ABSOLUTE deadline for the validator, derived from the time
+            // actually left on the move — do NOT just copy info.hard_deadline.
+            // For a ponder search that field is epoch (unset; the ponder ceiling
+            // lives in time_up()'s ponder branch, which a fresh SearchInfo can't
+            // use), and the validator's own time_ms can be 0 (budget already
+            // spent), which time_up() reads as "no limit" — so the validator
+            // would spin until the MCTS node pool fills, overrunning the move by
+            // 100s+ and flagging won games (the recurring ponder-path bug).
+            // ms_until_hard_deadline() already folds in the ponder math and
+            // returns 0 once stop is set, so this works for ponder and non-
+            // ponder alike and collapses to ~now (immediate stop) when nothing
+            // is left. Clamp to hard_limit_ms so the kUnbounded sentinel (untimed
+            // analysis) can't overflow the time_point; left epoch when untimed.
+            if (info.limits.hard_limit_ms > 0) {
+                const std::int64_t left = std::clamp<std::int64_t>(remaining_ms, 0,
+                                                                   info.limits.hard_limit_ms);
+                validation_info.hard_deadline = validation_info.start_time +
+                                                std::chrono::milliseconds(left);
+            }
+            // Also honour the parent's stop directly: a ponder miss sets
+            // info.stop, but the validator runs on its own SearchInfo, so
+            // without this it would keep going (and block the join) after the
+            // move is already over.
+            validation_info.ext_stop       = &info.stop;
             validation_info.silent         = true;           // don't emit info lines from opponent's POV
 
             mcts::MCTS validator(validation_pos, validation_info);
