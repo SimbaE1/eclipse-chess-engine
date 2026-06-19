@@ -46,8 +46,15 @@ struct Result {
 // / ponder-miss / quit unblocks the AB thread promptly instead of running out
 // its time budget — otherwise the join that gates the next search stalls and
 // the wasted work is billed to the real move's clock.
+// `ponder_hit_ms`, when non-null (e.g. &SearchInfo::ponderhit_at_ms), makes the
+// time budget ponder-aware: it is measured from the ponderhit instant, and the
+// search runs unbounded on the opponent's free time until the hit arrives. Pass
+// it only for a worker launched at `go ponder` (the parallel verifier); a search
+// started after the hit should leave it null and use the plain start-relative
+// budget.
 Result find_best_move(Position& pos, int max_depth, std::int64_t time_budget_ms,
-                      int num_threads = 1, const std::atomic<bool>* stop = nullptr);
+                      int num_threads = 1, const std::atomic<bool>* stop = nullptr,
+                      const std::atomic<std::int64_t>* ponder_hit_ms = nullptr);
 
 // Scores one specific move with an iterative-deepening full-window search,
 // from `pos`'s side-to-move perspective (same convention as Result::score).

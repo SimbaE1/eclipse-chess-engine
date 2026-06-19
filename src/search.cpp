@@ -319,8 +319,16 @@ Move search(Position& pos, SearchInfo& info) {
         info.limits.time_ms = main_phase_time;
         const int ab_phase_threads = info.ab_threads;  // AB's reserved share
         const std::atomic<bool>* ab_stop = &info.stop;
-        ab_thread = std::thread([&ab_result, &ab_pos, main_phase_time, ab_phase_threads, ab_stop]() {
-            ab_result = ab::find_best_move(ab_pos, kAbMaxDepth, main_phase_time, ab_phase_threads, ab_stop);
+        // This worker is launched at `go ponder` (when pondering begins). Make
+        // its budget ponder-aware so it spends main_phase_time AFTER the
+        // ponderhit — matching the (already ponder-aware) MCTS phase — instead
+        // of exhausting it during the opponent's free think and leaving the
+        // post-hit verify with no AB read. Null for a non-ponder search => plain
+        // start-relative budget.
+        const std::atomic<std::int64_t>* ab_ponder =
+            info.limits.ponder ? &info.ponderhit_at_ms : nullptr;
+        ab_thread = std::thread([&ab_result, &ab_pos, main_phase_time, ab_phase_threads, ab_stop, ab_ponder]() {
+            ab_result = ab::find_best_move(ab_pos, kAbMaxDepth, main_phase_time, ab_phase_threads, ab_stop, ab_ponder);
         });
     } else if (total_time_ms > 0 && info.ab_threads > 0) {
         // Sequential mode: reserve 1/4 of the move for the post-MCTS AB run

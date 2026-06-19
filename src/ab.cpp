@@ -86,6 +86,16 @@ struct SearchCtx {
     // Either being set aborts the search.
     const std::atomic<bool>* ext_stop = nullptr;
 
+    // Ponder-aware budget gate (e.g. &SearchInfo::ponderhit_at_ms), or null for
+    // a normal search. When set, budget_ms is measured from the ponderhit
+    // instant rather than from `start`: while still pondering (value < 0) the
+    // search runs on the opponent's free time, then spends budget_ms after the
+    // hit. This keeps a parallel AB worker — launched at `go ponder`, i.e. when
+    // pondering begins — from burning its whole budget during free time and
+    // leaving nothing for the post-ponderhit verify (the MCTS phase is already
+    // ponder-aware; this makes AB match it). Holds steady_clock-epoch ms.
+    const std::atomic<std::int64_t>* ponder_hit_ms = nullptr;
+
     SearchCtx(Clock::time_point s, std::int64_t b)
         : start(s), budget_ms(b), nodes(0), aborted(false) {}
 
@@ -98,6 +108,16 @@ struct SearchCtx {
         if (stop && stop->load(std::memory_order_relaxed)) return true;
         if (ext_stop && ext_stop->load(std::memory_order_relaxed)) return true;
         if (budget_ms <= 0) return false;
+        if (ponder_hit_ms) {
+            // Ponder search: budget runs from the ponderhit instant. Still
+            // pondering (no hit yet) => unbounded on free time (only stop/
+            // ext_stop above can abort, exactly as the MCTS phase behaves).
+            const auto ph = ponder_hit_ms->load(std::memory_order_acquire);
+            if (ph < 0) return false;
+            const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                Clock::now().time_since_epoch()).count();
+            return (now_ms - ph) >= budget_ms;
+        }
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             Clock::now() - start).count();
         return elapsed >= budget_ms;
@@ -671,7 +691,8 @@ static Result id_search(Position& pos, int max_depth, SearchCtx& ctx, int start_
 }
 
 Result find_best_move(Position& pos, int max_depth, std::int64_t time_budget_ms,
-                      int num_threads, const std::atomic<bool>* ext_stop) {
+                      int num_threads, const std::atomic<bool>* ext_stop,
+                      const std::atomic<std::int64_t>* ponder_hit_ms) {
     init_search_tables();
     num_threads = std::max(1, num_threads);
     const auto start = Clock::now();
@@ -679,6 +700,7 @@ Result find_best_move(Position& pos, int max_depth, std::int64_t time_budget_ms,
     if (num_threads == 1) {
         SearchCtx ctx{start, time_budget_ms};
         ctx.ext_stop = ext_stop;
+        ctx.ponder_hit_ms = ponder_hit_ms;
         return id_search(pos, max_depth, ctx, 1);
     }
 
@@ -698,6 +720,7 @@ Result find_best_move(Position& pos, int max_depth, std::int64_t time_budget_ms,
         SearchCtx ctx{start, time_budget_ms};
         ctx.stop = &stop;
         ctx.ext_stop = ext_stop;
+        ctx.ponder_hit_ms = ponder_hit_ms;
         // Main (id 0) runs every depth so its depth_scores trajectory is the
         // clean per-depth sequence the caller's instability check relies on;
         // helpers start a ply ahead to desync.
