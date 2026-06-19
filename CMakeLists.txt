@@ -68,6 +68,35 @@ if(ECLIPSE_SANITIZERS)
         $<$<CONFIG:Debug>:-fsanitize=address,undefined>)
 endif()
 
+# Profile-guided optimization (two stages, driven by scripts/pgo_build.sh):
+#   ECLIPSE_PGO=generate -> instrument the binary; running it emits .profraw
+#   ECLIPSE_PGO=use      -> optimize using the merged profile at ECLIPSE_PGO_DATA
+# Like LTO this only changes speed, not results (no -ffast-math; integer-SIMD
+# eval). The `use` mode degrades gracefully to a normal build if the profile
+# file is absent, so a stray `cmake --build` can never break on a missing
+# profile. OFF (default) builds exactly as before.
+set(ECLIPSE_PGO "OFF" CACHE STRING "PGO mode: OFF, generate, or use")
+set_property(CACHE ECLIPSE_PGO PROPERTY STRINGS OFF generate use)
+set(ECLIPSE_PGO_DATA "${CMAKE_BINARY_DIR}/eclipse.profdata"
+    CACHE FILEPATH "Merged PGO profile data consumed by ECLIPSE_PGO=use")
+if(ECLIPSE_PGO STREQUAL "generate")
+    set(_pgo_raw_dir "${CMAKE_BINARY_DIR}/pgo-raw")
+    target_compile_options(eclipse_arch INTERFACE -fprofile-generate=${_pgo_raw_dir})
+    target_link_options(eclipse_arch INTERFACE -fprofile-generate=${_pgo_raw_dir})
+    message(STATUS "PGO: instrumented build (raw profiles -> ${_pgo_raw_dir})")
+elseif(ECLIPSE_PGO STREQUAL "use")
+    if(EXISTS "${ECLIPSE_PGO_DATA}")
+        target_compile_options(eclipse_arch INTERFACE
+            -fprofile-use=${ECLIPSE_PGO_DATA}
+            -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date)
+        target_link_options(eclipse_arch INTERFACE -fprofile-use=${ECLIPSE_PGO_DATA})
+        message(STATUS "PGO: optimized build using ${ECLIPSE_PGO_DATA}")
+    else()
+        message(WARNING "PGO use requested but ${ECLIPSE_PGO_DATA} is missing -- "
+                        "building WITHOUT PGO. Run scripts/pgo_build.sh first.")
+    endif()
+endif()
+
 # ONNX Runtime - locate via Homebrew so this works on both Intel
 # (/usr/local) and Apple Silicon (/opt/homebrew) Macs without hardcoding.
 # Honor a caller-provided ONNXRUNTIME_ROOT first for cross-builds.
