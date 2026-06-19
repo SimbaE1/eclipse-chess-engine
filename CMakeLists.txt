@@ -19,6 +19,24 @@ option(ECLIPSE_NATIVE_ARCH "Build with -march=native (faster, host-specific)" ON
 option(ECLIPSE_SANITIZERS "Enable ASan + UBSan in Debug builds" OFF)
 option(ECLIPSE_WERROR "Treat warnings as errors" OFF)
 option(ECLIPSE_BUILD_TESTS "Build the unit-test suite" ON)
+option(ECLIPSE_LTO "Enable link-time optimization for optimized builds" ON)
+
+# Link-time (interprocedural) optimization. Lets the compiler inline the hot
+# NNUE / movegen / PUCT helpers across translation units. Eval is integer SIMD
+# and no -ffast-math is used, so results stay bit-identical — pure speed, no
+# behavioural change. Enabled only for optimized configs and only when the
+# toolchain actually supports it; Debug stays LTO-free for fast iteration.
+if(ECLIPSE_LTO)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT _eclipse_ipo_ok OUTPUT _eclipse_ipo_msg)
+    if(_eclipse_ipo_ok)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO ON)
+        message(STATUS "LTO enabled for optimized builds")
+    else()
+        message(STATUS "LTO requested but unsupported: ${_eclipse_ipo_msg}")
+    endif()
+endif()
 
 add_library(eclipse_warnings INTERFACE)
 target_compile_options(eclipse_warnings INTERFACE
