@@ -11,7 +11,7 @@ Lichess bot.
 
 > **▶ Play it right now on Lichess: [@EclipseBOT](https://lichess.org/@/EclipseBOT)**
 > — challenge it to a rated or casual game.
-> - Runs with 8 threads on an iMac pro, 5 piece syzygy with ponder and PGO.
+> *(Runs 8 threads on an iMac Pro, 5-piece Syzygy, ponder + PGO.)*
 
 > **Status:** v0.9.2 — a fully playable late proof-of-concept. UCI, multi-threaded
 > search, pondering, and Syzygy tablebases all work. Strength is still climbing as
