@@ -88,12 +88,20 @@ unsigned probe_root(const Position& pos, unsigned* results) {
 RootBest probe_root_best(const Position& pos) {
     if (!g_enabled) return {kTbFailed, 0, 0, 0, 0};
     if (pos.castling_rights() != NoCastling) return {kTbFailed, 0, 0, 0, 0};
+    // Illegal to probe if the side NOT to move is in check.
+    const Color opp = ~pos.side_to_move();
+    if (pos.is_square_attacked(pos.king_square(opp), pos.side_to_move()))
+        return {kTbFailed, 0, 0, 0, 0};
 
-    // TbRootMoves is ~100 KB — use a static to avoid stack overflow.
-    // Safe: this function is only called from the main thread before any
-    // search workers launch, and tb_probe_root_wdl is documented NOT thread-safe.
-    static TbRootMoves s_rm;
-    const int ok = tb_probe_root_wdl(
+    // DTZ-based root probe (was tb_probe_root_wdl). The WDL root probe ranks
+    // every winning move equally, so the engine had no progress gradient and
+    // would shuffle a won position into a 50-move / repetition draw (e.g. a
+    // drawn K+Q vs K). tb_probe_root ranks by distance-to-zero, so it returns a
+    // move that genuinely converges to mate AND respects the halfmove counter.
+    // It needs the .rtbz tables — returns TB_RESULT_FAILED if they're absent, so
+    // we fall back to search. Main-thread only (not thread-safe); called before
+    // any search workers launch.
+    const unsigned res = tb_probe_root(
         pos.pieces(White),
         pos.pieces(Black),
         pos.pieces(King),
@@ -106,32 +114,27 @@ RootBest probe_root_best(const Position& pos) {
         0u,            // castling (guarded above)
         ep_arg(pos),
         pos.side_to_move() == White,
-        true,          // useRule50
-        &s_rm);
+        nullptr);      // don't need the per-move results array
 
-    if (!ok || s_rm.size == 0) return {kTbFailed, 0, 0, 0, 0};
-
-    // Pick the move with the highest tbRank (1000=win, 899=cursed-win,
-    // 0=draw, -899=blessed-loss, -1000=loss).
-    const TbRootMove* best = &s_rm.moves[0];
-    for (unsigned i = 1; i < s_rm.size; ++i) {
-        if (s_rm.moves[i].tbRank > best->tbRank)
-            best = &s_rm.moves[i];
-    }
+    if (res == TB_RESULT_FAILED || res == TB_RESULT_CHECKMATE ||
+        res == TB_RESULT_STALEMATE)
+        return {kTbFailed, 0, 0, 0, 0};
 
     unsigned wdl;
-    if      (best->tbRank >= 1000) wdl = kTbWin;
-    else if (best->tbRank >= 899)  wdl = kTbCursedWin;
-    else if (best->tbRank >= 0)    wdl = kTbDraw;
-    else if (best->tbRank >= -899) wdl = kTbBlessedLoss;
-    else                           wdl = kTbLoss;
+    switch (TB_GET_WDL(res)) {
+        case TB_WIN:          wdl = kTbWin;         break;
+        case TB_CURSED_WIN:   wdl = kTbCursedWin;   break;
+        case TB_DRAW:         wdl = kTbDraw;        break;
+        case TB_BLESSED_LOSS: wdl = kTbBlessedLoss; break;
+        default:              wdl = kTbLoss;        break;
+    }
 
     return {
         wdl,
-        static_cast<unsigned>(TB_MOVE_FROM(best->move)),
-        static_cast<unsigned>(TB_MOVE_TO(best->move)),
-        static_cast<unsigned>(TB_MOVE_PROMOTES(best->move)),
-        0u   // DTZ not available without .rtbz files
+        static_cast<unsigned>(TB_GET_FROM(res)),
+        static_cast<unsigned>(TB_GET_TO(res)),
+        static_cast<unsigned>(TB_GET_PROMOTES(res)),
+        static_cast<unsigned>(TB_GET_DTZ(res)),
     };
 }
 

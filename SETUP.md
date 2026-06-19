@@ -100,11 +100,28 @@ and save it as `data/eclipse.nnue`.
 
 ## 5. (Optional) Syzygy endgame tablebases
 
-For perfect endgame play, download [Syzygy tablebases](https://syzygy-tables.info/)
-(3–4–5-piece sets are ~1 GB and plenty for casual play; 6-piece is ~150 GB). Put
-them in a folder and pass that path as the `SyzygyPath` UCI option. Without
-tablebases Eclipse plays endgames from its own evaluation — it just won't be
-provably perfect.
+For perfect endgame play, download Syzygy tablebases, put them in a folder, and
+pass that path as the `SyzygyPath` UCI option. Without tablebases Eclipse plays
+endgames from its own evaluation — it just won't be provably perfect.
+
+> **Important: download BOTH the WDL (`.rtbw`) and DTZ (`.rtbz`) files.** WDL
+> alone tells the engine a position is winning but not *how* to make progress, so
+> it can shuffle a won endgame (e.g. K+Q vs K) into a 50-move or repetition draw.
+> The DTZ files are what drive it to mate.
+
+The 3–4–5-piece set (~1 GB total for WDL+DTZ) is plenty for casual play; 6-piece
+is ~150 GB. From the Lichess mirror:
+
+```bash
+mkdir -p ~/syzygy && cd ~/syzygy
+base=https://tablebase.lichess.ovh/tables/standard
+for dir in 3-4-5-wdl 3-4-5-dtz; do
+  curl -s "$base/$dir/" | grep -oE '[A-Za-z0-9]+\.(rtbw|rtbz)' | sort -u \
+    | xargs -P 8 -I {} sh -c '[ -f "{}" ] || curl -s -O '"$base/$dir"'/{}'
+done
+```
+
+Then run Eclipse with `SyzygyPath` set to `~/syzygy`.
 
 ---
 

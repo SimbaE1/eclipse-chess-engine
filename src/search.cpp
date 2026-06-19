@@ -242,8 +242,13 @@ Move search(Position& pos, SearchInfo& info) {
     }
 
     // Root Syzygy probe: if all pieces fit in the tablebase, skip MCTS/AB
-    // entirely and return the DTZ-optimal move immediately.
-    if (syzygy::is_enabled() && !info.limits.ponder && !info.limits.infinite &&
+    // entirely and return the DTZ-optimal move immediately. Runs for ponder
+    // searches too (a TB position is solved instantly), but a ponder search
+    // holds the move until ponderhit — see below — so it can't emit bestmove
+    // mid-ponder. Previously this was skipped entirely when pondering, so on
+    // every pondered move the engine fell back to search and could fail to
+    // convert a won tablebase position.
+    if (syzygy::is_enabled() && !info.limits.infinite &&
         pos.castling_rights() == NoCastling &&
         static_cast<unsigned>(popcount(pos.occupied())) <= syzygy::max_pieces()) {
         const syzygy::RootBest rb = syzygy::probe_root_best(pos);
@@ -277,6 +282,16 @@ Move search(Position& pos, SearchInfo& info) {
                 std::cout << "info string TB root: wdl=" << wdl_str
                           << " dtz=" << rb.dtz << std::endl;
                 info.best_move = tb_move;
+                // A ponder search must not emit bestmove until the ponderhit
+                // arrives (or we're told to stop) — UCI forbids it mid-ponder.
+                // The TB move is already known, so just wait for the signal and
+                // release it instantly: full tablebase play, no wasted search.
+                if (info.limits.ponder) {
+                    while (info.ponderhit_at_ms.load(std::memory_order_acquire) < 0 &&
+                           !info.stop.load(std::memory_order_relaxed)) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
+                }
                 std::cout << "bestmove " << tb_move.to_uci() << std::endl;
                 return tb_move;
             }
