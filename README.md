@@ -11,6 +11,7 @@ Lichess bot.
 
 > **▶ Play it right now on Lichess: [@EclipseBOT](https://lichess.org/@/EclipseBOT)**
 > — challenge it to a rated or casual game.
+> - Runs with 8 threads on an iMac pro, 5 piece syzygy with ponder and PGO.
 
 > **Status:** v0.9.2 — a fully playable late proof-of-concept. UCI, multi-threaded
 > search, pondering, and Syzygy tablebases all work. Strength is still climbing as
@@ -120,7 +121,7 @@ curious — see [`dev/DEVELOPMENT.md`](dev/DEVELOPMENT.md).
 
 ## Want maximum speed?
 
-The default build is already optimized for your CPU. For an extra ~10–20% from
+The default build is already optimized for your CPU. For an extra ~2-10% from
 profile-guided optimization:
 
 ```bash
