@@ -225,6 +225,13 @@ void cmd_position(const std::vector<std::string>& tok) {
         return;
     }
 
+    // Record the Zobrist key of every position from the start of the move list
+    // so the search can detect repetitions against the GAME, not just within
+    // its own tree (see Position::repeats_game_history). game_keys.back() is the
+    // current root; earlier entries are the prior game positions.
+    std::vector<std::uint64_t> game_keys;
+    game_keys.push_back(g_pos.key());
+
     if (i < tok.size() && tok[i] == "moves") {
         ++i;
         // Single StateInfo we keep overwriting. We don't need to undo the
@@ -234,9 +241,21 @@ void cmd_position(const std::vector<std::string>& tok) {
             const Move m = parse_move(tok[i], g_pos);
             if (m.is_null()) break;
             g_pos.do_move(m, st);
+            game_keys.push_back(g_pos.key());
             ++i;
         }
     }
+
+    // Attach the pre-root history: the positions BEFORE the current root that
+    // are still reachable by reversible moves (within the halfmove clock).
+    // Positions across the last irreversible move can never repeat the current
+    // one, so slicing to that window keeps the per-node scan cheap. The current
+    // root (game_keys.back()) is excluded — the search's own tables own it.
+    const int n_root = static_cast<int>(game_keys.size()) - 1;
+    const int window = std::min(n_root, g_pos.halfmove_clock());
+    auto hist = std::make_shared<std::vector<std::uint64_t>>(
+        game_keys.begin() + (n_root - window), game_keys.begin() + n_root);
+    g_pos.set_rep_history(std::move(hist));
 }
 
 void cmd_go(const std::vector<std::string>& tok) {

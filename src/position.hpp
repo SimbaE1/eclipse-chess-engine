@@ -2,8 +2,10 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "accumulator.hpp"
 #include "bitboard.hpp"
@@ -60,6 +62,31 @@ public:
 
     Square king_square(Color c) const noexcept {
         return lsb(by_piece_[make_piece(c, King)]);
+    }
+
+    // ---- pre-root game-history repetition -------------------------------------
+    // The search's own repetition tables (AB's key_history, MCTS's per-path
+    // keys[]) only see positions reached AFTER the search root. They are blind
+    // to positions already played earlier in the GAME, so a winning engine will
+    // happily shuffle back into a position it has seen twice before and hand the
+    // opponent a claimable three-fold. To fix that, the UCI layer attaches the
+    // Zobrist keys of the pre-root game positions (the reversible window before
+    // the root) here. It is a shared_ptr so the per-path Position copies MCTS
+    // makes only bump a refcount rather than deep-copying the vector.
+    void set_rep_history(std::shared_ptr<const std::vector<std::uint64_t>> h) noexcept {
+        rep_history_ = std::move(h);
+    }
+
+    // True iff this exact position (by Zobrist key, which encodes side-to-move
+    // and all rights) appears in the attached pre-root game history. The search
+    // treats a true result as a draw (0.0) so a winning side avoids repeating a
+    // game position. A single match is enough: reaching a position seen before
+    // is already a draw we don't want to walk into.
+    bool repeats_game_history() const noexcept {
+        if (!rep_history_) return false;
+        for (const std::uint64_t k : *rep_history_)
+            if (k == key_) return true;
+        return false;
     }
 
     // Up-to-date NNUE accumulator for this position. Maintained incrementally
@@ -126,6 +153,12 @@ private:
     // evaluate() can lazy-refresh through the const accessor when the network
     // was loaded after the position was last set.
     mutable nnue::Accumulator acc_{};
+
+    // Pre-root game-history keys (reversible window before the search root).
+    // See set_rep_history() / repeats_game_history(). Default-null: a position
+    // with no attached history never reports a game-history repetition. Shared
+    // and read-only, so Position's default copy just shares the pointer.
+    std::shared_ptr<const std::vector<std::uint64_t>> rep_history_;
 
     // Hash-updating piece moves used by do_move().
     void put_piece   (Piece p, Square s);

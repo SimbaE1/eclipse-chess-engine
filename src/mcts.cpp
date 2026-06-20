@@ -681,6 +681,12 @@ int MCTS::iterate_batch(int batch_size) {
                     break;
                 }
             }
+            // The keys[] scan above only covers the in-tree path from the root.
+            // Also test the pre-root game history so we don't shuffle back into a
+            // position seen earlier in the actual game (a draw the opponent can
+            // claim). pos carries root_pos's shared history (copied per path).
+            if (!is_repetition && pos.repeats_game_history())
+                is_repetition = true;
 
             if (path_len < kMaxPathLen) {
                 leaf.path[path_len] = best_child;

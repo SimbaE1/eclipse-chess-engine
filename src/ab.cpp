@@ -274,6 +274,14 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
         }
     }
 
+    // Pre-root game-history repetition: the loop above only sees positions
+    // reached since the search root. If this node repeats a position already
+    // played earlier in the game, it's a draw the opponent can claim — score it
+    // as one so a winning side won't shuffle into it. Guarded by ply>0: at the
+    // root the current position legitimately IS the (already on-board) game
+    // state and must be searched for a win, not declared drawn.
+    if (ply > 0 && pos.repeats_game_history()) return kDraw;
+
     // TT probe first so we can use TT score to correct static_eval.
     const Score alpha_orig = alpha;
     TTEntry tt_entry;

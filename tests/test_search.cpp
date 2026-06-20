@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 
+#include "ab.hpp"
 #include "check.hpp"
 #include "eval.hpp"
 #include "movegen.hpp"
@@ -107,6 +108,39 @@ int main() {
         const Move m = search(p, info);
         // 0 legal moves; the search should not produce a "best move".
         ECLIPSE_CHECK(m.is_null());
+    }
+
+    // Repetition awareness against pre-root GAME history.
+    //
+    // Regression guard for the "drew a won position" bug: the search's own
+    // repetition tables only see positions reached after the root, so a winning
+    // engine would shuffle back into a position it had already played twice and
+    // hand the opponent a claimable three-fold. With the pre-root game history
+    // attached (Position::set_rep_history), a move returning to such a position
+    // must score as a draw (0), NOT the material eval that still shows a win.
+    {
+        const char* kFen = "4k3/8/8/8/8/8/8/3QK3 w - - 0 1";  // White up a queen
+        const Move qd1d2(D1, D2);                              // reversible, no capture
+
+        // The position Qd2 leads to; seed it as a prior game occurrence.
+        Position after;
+        after.set_from_fen(kFen);
+        StateInfo st;
+        after.do_move(qd1d2, st);
+
+        Position p;
+        p.set_from_fen(kFen);
+        ECLIPSE_CHECK(is_legal(p, qd1d2));
+        auto hist = std::make_shared<std::vector<std::uint64_t>>();
+        hist->push_back(after.key());
+        p.set_rep_history(hist);
+        // Returning to the seen position is a draw, despite being up a queen.
+        ECLIPSE_CHECK(ab::score_move(p, qd1d2, 4, 200) == kDraw);
+
+        // Identical position with no history attached: a clear material win.
+        Position p2;
+        p2.set_from_fen(kFen);
+        ECLIPSE_CHECK(ab::score_move(p2, qd1d2, 4, 200) > 500);
     }
 
     // time_up() bounds for internal sub-searches (the validation MCTS).
