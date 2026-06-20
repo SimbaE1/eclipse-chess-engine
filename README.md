@@ -28,8 +28,6 @@ Lichess bot.
 <a href="https://lichess.org/@/EclipseBOT">
   <img src="assets/lichess_latest_game.svg" alt="EclipseBOT's latest Lichess game" width="360">
 </a>
-
-<sub>Ratings update live (shields.io → Lichess API). The latest-game board refreshes hourly via a [GitHub Action](.github/workflows/lichess-readme.yml) that commits a freshly rendered SVG — no server, no Vercel.</sub>
 <!-- LICHESS:END -->
 
 ---
@@ -157,6 +155,11 @@ engine, retrain the network, or run strength tests, everything lives under
 - [`dev/KAGGLE.md`](dev/KAGGLE.md) — the NNUE training pipeline (data → GPU → `.nnue`)
 - `dev/scripts/` — training, data, conversion, and match/evaluation tooling
 - `dev/notebooks/` — the training notebook
+
+## Acknowledgements
+
+Eclipse builds on ideas and tools from DeepMind, the Stockfish & Lc0 teams,
+Syzygy, and many open-source libraries. See [`ACKNOWLEDGEMENTS.md`](ACKNOWLEDGEMENTS.md).
 
 ## License
 
