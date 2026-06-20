@@ -22,7 +22,9 @@ can be done before the reset is already done; at 5 PM you run **one command**.
 | `simbae11/eclipse-checkpoint` (`halfkav2.pt` 189 MB = **narrow** net, `resume_state.pt`) | **ready** | warm-start source — the narrow shape is what makes the widen fire |
 | `dev/notebooks/eclipse_wdl_train.ipynb` | `NET2WIDER=True`, FT 1024→2048 / L1 512→1024 / L2 128→256 | the trainer |
 | `dev/notebooks/kernel-metadata.json` | `id: simbae11/tcec-chess-engine`, `enable_gpu: true`, `dataset_sources: [eclipse-chunks-a, eclipse-checkpoint]` | push target |
-| GPU quota | **exhausted until ~5 PM** | the only blocker |
+| Notebook **Accelerator** | must be **GPU T4 ×2** (NOT plain "GPU" → can be a P100, which is incompatible — see §1) | usable GPU |
+| `KAGGLE_API_TOKEN` notebook **Secret** | must exist/enabled (gates the checkpoint *download*, not just sync — see §1/§4) | the widen fires |
+| GPU quota | rolling ~30 h/week; check via a push (`Maximum weekly GPU quota …` = not reset) | run blocker |
 
 **So the datasets do NOT need re-uploading.** The single action at 5 PM is the
 **notebook push**, which on Kaggle is *save + Run All* — i.e. it starts training.
@@ -40,6 +42,21 @@ kaggle kernels status simbae11/tcec-chess-engine
 You can't query remaining GPU hours from the CLI, so the real test is the push
 itself (next step). If it fails with `Maximum weekly GPU quota … reached`, the
 window hasn't rolled over yet — wait 10–15 min and retry.
+
+> ⚠️ **Accelerator MUST be `T4 ×2`, not the generic "GPU".** The plain "GPU"
+> setting can hand you a **Tesla P100** (CUDA capability sm_60), which the
+> installed PyTorch 2.10+cu128 does **not** support (sm_70+ only). Every CUDA
+> kernel then dies on the first forward pass with `CUDA error: no kernel image is
+> available for execution on the device` — after the from-scratch fallback has
+> already wasted a chunk. Check the notebook's **Settings → Accelerator → GPU T4
+> ×2** before launching. (Verified 2026-06-20: a P100 run crashed; the T4 ×2
+> restart ran clean.)
+>
+> ⚠️ **The `KAGGLE_API_TOKEN` Secret MUST exist before launch** — see §4. The
+> checkpoint is downloaded via the Kaggle **API using that secret**, NOT from the
+> mounted `/kaggle/input/eclipse-checkpoint/` path. No secret ⇒ `No checkpoint
+> found -- training from scratch`, the widen never fires, and checkpoint sync is
+> off (progress lost at session end). Confirm at notebook → **Add-ons → Secrets**.
 
 ---
 
@@ -68,14 +85,23 @@ Or open the kernel: <https://www.kaggle.com/code/simbae11/tcec-chess-engine>.
 In the first ~minute of logs you should see, in order:
 
 1. `found N premade chunk(s): [0, 1, 2, …]`
-2. `Resuming weights from …/halfkav2.pt`
-3. `net2widernet: widening FT 1024->2048, L1 512->1024, L2 128->256 (function-preserving)`
-4. `net2widernet: fresh optimizer/schedule for the widened net`
-5. training step/loss lines
+2. `downloaded: halfkav2.pt, resume_state.pt` (secret-gated — see §4)
+3. `Resuming weights from …/halfkav2.pt`
+4. `net2widernet: widening FT 1024->2048, L1 512->1024, L2 128->256 (function-preserving)`
+5. `net2widernet: fresh optimizer/schedule for the widened net`
+6. training step/loss lines
 
-If you see (3), the widen fired correctly. If instead it says it resumed a wide
+If you see (4), the widen fired correctly. If instead it says it resumed a wide
 checkpoint, that means a previous wide run already overwrote the checkpoint — see
 §6.
+
+> **The Logs tab looks empty/buffered for the first minute or two — that's
+> normal.** A committed *Save & Run All* run (what `kernels push` creates) batches
+> its log output instead of streaming it, and Python's stdout is block-buffered
+> when it's not a TTY, so prints appear in chunks (or only at exit). "Running for
+> Ns" with `0 B` output early on is healthy, not a hang. For true live streaming,
+> open the kernel via **Edit** (interactive sessions stream) — but only the
+> committed run saves checkpoints, so prefer to just wait.
 
 ---
 
@@ -88,11 +114,21 @@ narrow net, so the widen fires, then training continues from the
 function-preserving 2× net.
 
 **Cross-run checkpoint sync** is automatic: the notebook's cell 6 pulls
-`halfkav2.pt` + `resume_state.pt` from `eclipse-checkpoint` at start and pushes a
+`halfkav2.pt` + `resume_state.pt` from `eclipse-checkpoint` at start (via
+`ckpt_download()` → `kaggle datasets download -d eclipse-checkpoint`) and pushes a
 new version after every ~100 M-position chunk, using the Kaggle **Secret** named
-`KAGGLE_API_TOKEN`. That secret is already configured (prior runs updated the
-checkpoint dataset). If a run ever prints `no KAGGLE_API_TOKEN secret … training
-from scratch`, re-add it: notebook → **Add-ons → Secrets → `KAGGLE_API_TOKEN`**.
+`KAGGLE_API_TOKEN`. **This is the load path too, not just the save path** — the
+warm-start checkpoint comes from the API download, NOT the mounted
+`/kaggle/input/eclipse-checkpoint/` dir. So the secret is a hard prerequisite for
+the widen, not just for sync.
+
+If a run prints `no KAGGLE_API_TOKEN secret … training from scratch` (the message
+also fires on a transient `Connection error trying to communicate with service`
+during startup), the checkpoint is never fetched → `No checkpoint found --
+training from scratch` → the widen does NOT fire and progress is not saved. Fix:
+notebook → **Add-ons → Secrets → add/enable `KAGGLE_API_TOKEN`**, then re-run.
+(Verified 2026-06-20: the secret failed on first launch, restart with it present
+fired the widen.)
 
 ---
 
