@@ -19,6 +19,22 @@ Lichess bot.
 
 ---
 
+<!-- LICHESS:START -->
+## ♟️ Live on Lichess
+
+[![Lichess Rapid](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Flichess.org%2Fapi%2Fuser%2FEclipseBOT&query=%24.perfs.rapid.rating&label=rapid&color=5b8a3a&logo=lichess&logoColor=white&style=flat-square)](https://lichess.org/@/EclipseBOT/perf/rapid)
+[![Lichess Blitz](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Flichess.org%2Fapi%2Fuser%2FEclipseBOT&query=%24.perfs.blitz.rating&label=blitz&color=b58a3b&logo=lichess&logoColor=white&style=flat-square)](https://lichess.org/@/EclipseBOT/perf/blitz)
+[![Lichess Bullet](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Flichess.org%2Fapi%2Fuser%2FEclipseBOT&query=%24.perfs.bullet.rating&label=bullet&color=a94442&logo=lichess&logoColor=white&style=flat-square)](https://lichess.org/@/EclipseBOT/perf/bullet)
+
+<a href="https://lichess.org/@/EclipseBOT">
+  <img src="assets/lichess_latest_game.svg" alt="EclipseBOT's latest Lichess game" width="360">
+</a>
+
+<sub>Ratings update live (shields.io → Lichess API). The latest-game board refreshes hourly via a [GitHub Action](.github/workflows/lichess-readme.yml) that commits a freshly rendered SVG — no server, no Vercel.</sub>
+<!-- LICHESS:END -->
+
+---
+
 ## What makes it tick
 
 | Component | What it does |
