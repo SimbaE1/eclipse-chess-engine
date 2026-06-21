@@ -329,6 +329,29 @@ void cmd_go(const std::vector<std::string>& tok) {
         const int  divisor = std::clamp(mlh_our_moves, 40, 60);
 
         limits.time_ms = remain / divisor + inc * 4 / 5;
+
+        // Flat early-game cap. The remain/divisor term is ~proportional to the
+        // clock (divisor sits pinned near its floor for most of a game), so the
+        // soft budget is LARGEST early and decays as the clock drains — the
+        // front-loaded "logarithmic" curve where the opening costs the most. By
+        // design it drains 600s->~120s spending well over the increment per move
+        // early, which both wastes time on non-critical opening moves and is what
+        // bled won games to a flag. Clamp the routine per-move spend to a small
+        // multiple of the increment so the early game is FLAT instead of
+        // front-loaded: with +inc we can sustain ~inc/move indefinitely, so a
+        // routine move spends ~1.5x that and the clock drains gently and evenly.
+        // Critical moves still extend up to the hard ceiling (kHardBudgetMult x
+        // soft) below. Increment-only lever: in sudden-death (inc==0) there is no
+        // sustainable rate, so keep the pure remain/divisor policy. The low-clock
+        // equilibrium (clock resting at ~0.2*divisor*inc, spending exactly the
+        // increment) sits below this cap, so the no-flag behaviour is unchanged.
+        constexpr int kEarlySoftIncMultNum = 3;  // 3/2 = 1.5x the increment
+        constexpr int kEarlySoftIncMultDen = 2;
+        if (inc > 0) {
+            const int early_soft_cap = inc * kEarlySoftIncMultNum / kEarlySoftIncMultDen;
+            if (limits.time_ms > early_soft_cap) limits.time_ms = early_soft_cap;
+        }
+
         // Safety: never burn more than 1/3 of remaining time on one move.
         const int safety_cap = remain / 3;
         if (limits.time_ms > safety_cap) limits.time_ms = safety_cap;
