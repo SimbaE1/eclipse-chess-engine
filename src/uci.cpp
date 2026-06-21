@@ -17,6 +17,7 @@
 #include "position.hpp"
 #include "search.hpp"
 #include "syzygy.hpp"
+#include "thread_util.hpp"
 #include "tt.hpp"
 #include "zobrist.hpp"
 
@@ -34,7 +35,10 @@ SearchInfo  g_search_info;
 // True once the user sets AbThreads explicitly, after which the Threads
 // handler stops auto-deriving the AB-thread count from the total.
 static bool g_ab_threads_explicit = false;
-std::thread g_search_thread;
+// Large stack: the search runs negamax/qsearch (recursive) directly on this
+// thread, which would overflow the default secondary-thread stack. See
+// thread_util.hpp.
+BigThread   g_search_thread;
 
 void join_search_thread() {
     if (g_search_thread.joinable()) {
@@ -333,12 +337,27 @@ void cmd_go(const std::vector<std::string>& tok) {
         // not just the soft target above. search() enforces it as a single
         // absolute deadline (see SearchLimits::hard_limit_ms), so the sum of
         // the main search + validation + AB cross-check/tactic probes +
-        // extensions can never overrun it. Capped at the same 1/3 safety_cap,
-        // and kept a fixed latency margin below the real remaining time so the
-        // bestmove reaches lichess before the flag even with network + I/O lag.
-        // This is what guarantees we never flag while still doing fine.
+        // extensions can never overrun it. A fixed latency margin is kept below
+        // the real remaining time so the bestmove reaches lichess before the
+        // flag even with network + I/O lag.
+        //
+        // CRITICAL (2026-06-20 bleed fix): the ceiling is a small MULTIPLE OF
+        // THE SOFT BUDGET, not a fraction of the whole clock. The old code set
+        // it to remain/3, which in a 10+3 game is ~200s on move 1 — so the
+        // extension/validation/cross-check machinery (which fires on any
+        // "unsettled" eval, common positions for the current net) could legally
+        // spend up to a THIRD of the entire clock on a single move. No single
+        // move flagged, but a handful of 40-79s moves per game bled the clock
+        // from 600s to 0 while the opponent played ~12s/move (real loss
+        // G0woH69l: Eclipse averaged ~20.6s/move and flagged). Tying the
+        // ceiling to the soft budget means a hard move costs at most
+        // ~kHardBudgetMult x a routine move and scales DOWN with the clock, so
+        // the per-move spend can never run away. remain/3 is kept only as an
+        // absolute backstop that the soft-multiple is normally far below.
         constexpr int kLatencyMarginMs = 300;
-        const int hard_cap = std::min<int>(safety_cap, remain - kLatencyMarginMs);
+        constexpr int kHardBudgetMult  = 2;   // a critical move may cost up to 2x a routine one
+        const int hard_from_soft = static_cast<int>(limits.time_ms) * kHardBudgetMult;
+        const int hard_cap = std::min({hard_from_soft, safety_cap, remain - kLatencyMarginMs});
         limits.hard_limit_ms = std::max(1, hard_cap);
 
         // No-flag guarantee for the low-clock regime. The soft-budget equilibrium
@@ -388,7 +407,7 @@ void cmd_go(const std::vector<std::string>& tok) {
     g_search_info.limits = limits;
     join_search_thread();
     g_search_info.stop.store(false, std::memory_order_relaxed);
-    g_search_thread = std::thread([]() {
+    g_search_thread = BigThread([]() {
         search(g_pos, g_search_info);
     });
 }

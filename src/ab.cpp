@@ -17,6 +17,7 @@
 #include "types.hpp"
 
 #include "see.hpp"
+#include "thread_util.hpp"
 
 namespace eclipse::ab {
 
@@ -38,6 +39,16 @@ void init_search_tables() {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+
+// Hard recursion ceiling for negamax/qsearch. Check extensions keep depth
+// constant while in check, and qsearch follows capture/check sequences, so a
+// forcing line can recurse far past the nominal search depth. Without a ceiling
+// this overflows the thread stack on sharp positions (SIGBUS, exit code -10 in
+// real games). 240 is ~4x the deepest seldepth ever observed in real play, so
+// it never truncates a legitimate line, while staying well under the
+// kMateInMaxPly (=mate-1000) window so mate scores remain valid. Beyond this
+// ply we return the static eval — a position this deep is effectively a horizon.
+constexpr int kMaxSearchPly = 240;
 
 struct SearchCtx {
     Clock::time_point start;
@@ -193,6 +204,9 @@ Score qsearch(Position& pos, Score alpha, Score beta, int ply, SearchCtx& ctx) {
     ++ctx.nodes;
     if (ctx.time_up()) { ctx.aborted = true; return 0; }
 
+    // Recursion ceiling: bail to static eval rather than overflow the stack.
+    if (ply >= kMaxSearchPly) return evaluate(pos);
+
     // Fifty-move rule: no pawn move or capture in 100 half-moves → draw.
     if (pos.halfmove_clock() >= 100) return kDraw;
 
@@ -258,6 +272,11 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
 
     if (ctx.time_up()) { ctx.aborted = true; return 0; }
     if (depth <= 0) return qsearch(pos, alpha, beta, ply, ctx);
+
+    // Recursion ceiling: check extensions keep depth constant while in check, so
+    // a long forcing line can recurse here past any reasonable depth. Bail to
+    // static eval rather than overflow the stack.
+    if (ply >= kMaxSearchPly) return evaluate(pos);
 
     // Fifty-move rule.
     if (pos.halfmove_clock() >= 100) return kDraw;
@@ -720,7 +739,10 @@ Result find_best_move(Position& pos, int max_depth, std::int64_t time_budget_ms,
     // exist to warm the shared TT so the main worker reaches depth faster.
     std::atomic<bool>        stop{false};
     std::vector<Result>      results(static_cast<std::size_t>(num_threads));
-    std::vector<std::thread> helpers;
+    // Helpers (and the main search thread, see uci.cpp) run on a large stack:
+    // the recursive negamax/qsearch overflows the 512 KB default secondary-thread
+    // stack on macOS for deep forcing lines. See thread_util.hpp.
+    std::vector<BigThread>   helpers;
     helpers.reserve(static_cast<std::size_t>(num_threads - 1));
 
     auto worker = [&](int id) {
