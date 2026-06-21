@@ -56,7 +56,9 @@ struct SearchCtx {
     std::int64_t       nodes;
     bool               aborted;
 
-    // Killer moves: two per ply.
+    // Killer moves: two per ply. Sized 64; every access is guarded by
+    // `ply < 64` (plies beyond that simply get no killer bonus), so deep
+    // recursion up to kMaxSearchPly never indexes out of bounds.
     std::array<std::array<Move, 2>, 64> killers{};
 
     // History heuristic: [color][from][to].

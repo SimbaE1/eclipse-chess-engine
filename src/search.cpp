@@ -13,6 +13,7 @@
 #include "mcts.hpp"
 #include "movegen.hpp"
 #include "syzygy.hpp"
+#include "thread_util.hpp"
 
 namespace eclipse {
 
@@ -321,7 +322,10 @@ Move search(Position& pos, SearchInfo& info) {
     // referencing it.
     Position    ab_pos = pos;
     ab::Result  ab_result;
-    std::thread ab_thread;
+    // BigThread (16 MB stack), NOT std::thread: this worker runs ab::find_best_move,
+    // whose negamax/qsearch recursion overflows macOS's 512 KB default secondary
+    // stack on sharp mid-game positions -> SIGBUS (exit -10). See thread_util.hpp.
+    BigThread   ab_thread;
 
     const int          orig_threads = info.threads;
     const std::int64_t orig_time_ms = info.limits.time_ms;
@@ -342,7 +346,7 @@ Move search(Position& pos, SearchInfo& info) {
         // start-relative budget.
         const std::atomic<std::int64_t>* ab_ponder =
             info.limits.ponder ? &info.ponderhit_at_ms : nullptr;
-        ab_thread = std::thread([&ab_result, &ab_pos, main_phase_time, ab_phase_threads, ab_stop, ab_ponder]() {
+        ab_thread = BigThread([&ab_result, &ab_pos, main_phase_time, ab_phase_threads, ab_stop, ab_ponder]() {
             ab_result = ab::find_best_move(ab_pos, kAbMaxDepth, main_phase_time, ab_phase_threads, ab_stop, ab_ponder);
         });
     } else if (total_time_ms > 0 && info.ab_threads > 0) {

@@ -16,6 +16,7 @@
 #include "nnue.hpp"
 #include "see.hpp"
 #include "syzygy.hpp"
+#include "thread_util.hpp"
 
 namespace eclipse::mcts {
 
@@ -381,7 +382,10 @@ void MCTS::run(bool keep_existing_root) {
     if (threads == 1) {
         worker_loop();
     } else {
-        std::vector<std::thread> workers;
+        // BigThread (16 MB stack), NOT std::thread: worker_loop descends the MCTS
+        // tree and calls into qsearch/SEE; the 512 KB default macOS secondary
+        // stack is the SIGBUS source we are immunising against. See thread_util.hpp.
+        std::vector<BigThread> workers;
         workers.reserve(static_cast<std::size_t>(threads));
         for (int i = 0; i < threads; ++i) {
             workers.emplace_back([this] { worker_loop(); });
