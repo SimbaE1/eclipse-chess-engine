@@ -43,10 +43,10 @@ import numpy as np
 MAGIC               = 0xECCC0003
 VERSION             = 1
 FT_IN_FEATURES      = 45056          # HalfKAv2: 64 * 64 * 11
-FT_OUT              = 1024           # keep in sync with kFtOutSize in src/nnue.hpp
-L1_IN               = 2 * FT_OUT     # 2048 (concat of both perspectives)
-L1_OUT              = 512
-L2_OUT              = 128
+FT_OUT              = 2048           # keep in sync with kFtOutSize in src/nnue.hpp
+L1_IN               = 2 * FT_OUT     # 4096 (concat of both perspectives)
+L1_OUT              = 1024
+L2_OUT              = 256
 L3_OUT              = 1
 
 # Quantization scales - must match the C++ side exactly.

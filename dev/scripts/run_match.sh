@@ -28,7 +28,7 @@
 #   scripts/run_match.sh --net1 a.nnue --net2 b.nnue --dry-run
 set -euo pipefail
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ENGINE="$REPO/build/src/eclipse"
 CUTECHESS="${CUTECHESS:-/Users/ezra/cutechess/cutechess/build/cutechess-cli}"
 

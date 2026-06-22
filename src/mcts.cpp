@@ -52,9 +52,22 @@ public:
         return mag.slots[--mag.count];
     }
 
+    // Frees were previously one global-mutex acquisition PER NODE. That's fine
+    // under short fixed-movetime smoke tests (small trees), but under a real
+    // time control a search tree can reach millions of live nodes; tearing one
+    // down (see the detached-thread teardown in MCTS::save_to_cache) then
+    // hammers this same mutex millions of times back-to-back, starving the
+    // NEXT move's live search threads on their batched refill() of the same
+    // lock and making the search look hung for minutes. Batch frees into a
+    // thread-local chain (built lock-free) and splice the whole chain onto the
+    // global free list in one O(1) locked operation per kMagBatch nodes,
+    // matching alloc()'s refill() granularity.
     void free(Node* n) noexcept {
-        std::lock_guard<std::mutex> lk(mutex_);
-        push_locked(n);
+        FreeMag& fm = free_magazine();
+        next_of(n) = fm.head;
+        fm.head = n;
+        if (fm.tail == nullptr) fm.tail = n;
+        if (++fm.count == kMagBatch) flush(fm);
     }
 
     // Return a thread's leftover magazine slots to the global free list. Called
@@ -84,6 +97,31 @@ private:
         // acquire load) per node created — pure overhead in the hottest path.
         if (!mag.pool) mag.pool = &instance();
         return mag;
+    }
+
+    // Thread-local outgoing chain for free(), built without touching the
+    // global lock; flushed (spliced) onto free_head_ in one locked op per
+    // kMagBatch nodes, or on thread exit so nothing is lost.
+    struct FreeMag {
+        Node*    head  = nullptr;
+        Node*    tail  = nullptr;
+        int      count = 0;
+        NodePool* pool = nullptr;
+        ~FreeMag() { if (pool && head) pool->flush(*this); }
+    };
+
+    static FreeMag& free_magazine() {
+        static thread_local FreeMag fm;
+        if (!fm.pool) fm.pool = &instance();
+        return fm;
+    }
+
+    void flush(FreeMag& fm) noexcept {
+        std::lock_guard<std::mutex> lk(mutex_);
+        next_of(fm.tail) = free_head_;
+        free_head_ = fm.head;
+        fm.head = fm.tail = nullptr;
+        fm.count = 0;
     }
 
     // free_head_ is guarded by mutex_; intrusive next stored in the slot.

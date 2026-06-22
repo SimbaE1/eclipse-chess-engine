@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// HalfKAv2-1024x2-512-128-1 NNUE evaluation.
+// HalfKAv2-2048x2-1024-256-1 NNUE evaluation.
 //
 // Architecture (Stockfish-modern shape):
 //   Input features: HalfKAv2 - king-relative, perspective-doubled.
@@ -12,12 +12,12 @@
 //       Slots 5..10: opp (P,N,B,R,Q,K). Opp king IS a feature, which gives
 //                    the network direct information about the opposing king's
 //                    distance / mating geometry that plain HalfKP lacked.
-//   Feature transformer: 45056 -> 1024, int16 weights + bias.
-//   Concatenation: [accumulator_us, accumulator_them] -> 2048
-//   Activation: clipped ReLU [0, kFtQuant=127] -> uint8[2048]
-//   L1: 2048 -> 512, int8 weights, int32 bias.
-//   L2:  512 -> 128, int8 weights, int32 bias.
-//   L3:  128 -> 1,   int8 weights, int32 bias -> value logit.
+//   Feature transformer: 45056 -> 2048, int16 weights + bias.
+//   Concatenation: [accumulator_us, accumulator_them] -> 4096
+//   Activation: clipped ReLU [0, kFtQuant=127] -> uint8[4096]
+//   L1: 4096 -> 1024, int8 weights, int32 bias.
+//   L2: 1024 -> 256,  int8 weights, int32 bias.
+//   L3:  256 -> 1,    int8 weights, int32 bias -> value logit.
 //
 // Phase 1: scalar forward pass, non-incremental (recompute accumulator per eval).
 // Phase 2: incremental updates wired through StateInfo / do_move / undo_move.
@@ -42,9 +42,9 @@ namespace eclipse::nnue {
 // ---- Architecture constants ------------------------------------------------
 // kFtOutSize is defined in accumulator.hpp.
 
-constexpr int kL1InSize         = 2 * kFtOutSize; // = 2048
-constexpr int kL1OutSize        = 512;
-constexpr int kL2OutSize        = 128;
+constexpr int kL1InSize         = 2 * kFtOutSize; // = 4096
+constexpr int kL1OutSize        = 1024;
+constexpr int kL2OutSize        = 256;
 constexpr int kL3OutSize        = 1;
 
 constexpr int kFtKingSquares    = 64;
