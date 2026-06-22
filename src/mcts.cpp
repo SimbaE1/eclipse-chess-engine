@@ -434,7 +434,24 @@ void MCTS::run(bool keep_existing_root) {
 
 void MCTS::save_to_cache() {
     if (root) {
-        s_cached_pos  = std::make_unique<Position>(root_pos);
+        s_cached_pos = std::make_unique<Position>(root_pos);
+
+        // Destroying the OLD cached tree is recursive (Node::~Node tears down
+        // its children vector, each child's NodeDeleter takes NodePool's
+        // global mutex) and can be millions of nodes -- a multi-second
+        // synchronous stall sitting entirely outside the search's time
+        // budget, AFTER bestmove was already decided. Hand it to a detached
+        // thread instead so this call stays O(1). Safe: s_cached_root is
+        // only ever touched from the single-threaded UCI dispatch thread
+        // (see comment above), and the detached thread only owns the OLD
+        // tree it took -- never the new one being installed below.
+        NodePtr old_cached = std::move(s_cached_root);
+        if (old_cached) {
+            std::thread([cached = std::move(old_cached)]() mutable {
+                cached.reset();
+            }).detach();
+        }
+
         s_cached_root = std::move(root);
         // root is now null — MCTS must not be used after this call.
     }
