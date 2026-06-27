@@ -66,6 +66,8 @@ def main() -> int:
     repo = Path(__file__).resolve().parent.parent
     ap = argparse.ArgumentParser()
     ap.add_argument("--server", default=str(repo / "build/tests/nnue_eval_server"))
+    ap.add_argument("--server1")
+    ap.add_argument("--server2")
     ap.add_argument("--eval1", required=True)
     ap.add_argument("--eval2", required=True)
     ap.add_argument("--label1", default="E1")
@@ -75,8 +77,11 @@ def main() -> int:
     ap.add_argument("--pgn", default=str(repo / "data/greedy_h2h.pgn"))
     args = ap.parse_args()
 
-    e1 = NNUEEvalServer(args.server, args.eval1)
-    e2 = NNUEEvalServer(args.server, args.eval2)
+    server1 = args.server1 or args.server
+    server2 = args.server2 or args.server
+
+    e1 = NNUEEvalServer(server1, args.eval1)
+    e2 = NNUEEvalServer(server2, args.eval2)
 
     wins = draws = losses = 0  # from e1's perspective
     pgn_path = Path(args.pgn)

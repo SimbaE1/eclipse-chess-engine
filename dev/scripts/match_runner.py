@@ -149,6 +149,30 @@ class UCIEngine:
             return None
         return parts[1] if parts[1] != "(none)" else None
 
+    def get_move_tc(self, fen: str, moves_so_far: list[str],
+                     wtime_ms: int, btime_ms: int, winc_ms: int, binc_ms: int,
+                     ) -> tuple[Optional[str], float]:
+        """Real-clock move: sends go wtime/btime/winc/binc and returns
+        (bestmove, elapsed_seconds) so the caller can debit a wall clock."""
+        if moves_so_far:
+            self.send(f"position fen {fen} moves {' '.join(moves_so_far)}")
+        else:
+            self.send(f"position fen {fen}")
+        self.send(f"go wtime {wtime_ms} btime {btime_ms} winc {winc_ms} binc {binc_ms}")
+        t0 = time.time()
+        # Generous grace period over the side-to-move's own clock; the engine
+        # is expected to self-regulate within wtime/btime, this just guards
+        # against a hung process.
+        budget_s = max(wtime_ms, btime_ms) / 1000.0 + 15
+        resp = self.read_until("bestmove", timeout=budget_s)
+        elapsed = time.time() - t0
+        if resp is None:
+            return None, elapsed
+        parts = resp.split()
+        if len(parts) < 2:
+            return None, elapsed
+        return (parts[1] if parts[1] != "(none)" else None), elapsed
+
     def quit(self):
         try:
             self.send("quit")
@@ -238,9 +262,17 @@ def play_game(
     opening_moves: list[str],
     movetime_ms: int,
     max_moves: int = 250,
+    tc: Optional[tuple[int, int]] = None,
 ) -> GameResult:
-    """Play one game. Engine1=White for this call; caller flips sides."""
+    """Play one game. Engine1=White for this call; caller flips sides.
+
+    If tc=(base_ms, inc_ms) is given, both engines play under a real
+    Fischer clock (go wtime/btime/winc/binc) instead of a fixed movetime;
+    running out of time is a loss, same as checkmate.
+    """
     board = chess.Board()
+    clocks = [tc[0], tc[0]] if tc else None  # [white_ms, black_ms]
+    inc_ms = tc[1] if tc else 0
     # Apply opening moves
     for uci in opening_moves:
         try:
@@ -272,7 +304,20 @@ def play_game(
         engine_idx = 0 if board.turn == chess.WHITE else 1
         eng = engines[engine_idx]
 
-        mv_uci = eng.get_move(start_fen, moves_so_far, movetime_ms)
+        if clocks is not None:
+            mv_uci, elapsed_s = eng.get_move_tc(
+                start_fen, moves_so_far,
+                wtime_ms=clocks[0], btime_ms=clocks[1],
+                winc_ms=inc_ms, binc_ms=inc_ms,
+            )
+            clocks[engine_idx] -= int(elapsed_s * 1000)
+            if clocks[engine_idx] <= 0:
+                winner = "e2" if engine_idx == 0 else "e1"
+                return GameResult(winner=winner, termination="time-forfeit",
+                                  moves_played=move_count)
+            clocks[engine_idx] += inc_ms
+        else:
+            mv_uci = eng.get_move(start_fen, moves_so_far, movetime_ms)
         if mv_uci is None or mv_uci == "0000":
             # Null move: check if the board state explains it (no legal moves).
             if board.is_checkmate():
@@ -368,12 +413,16 @@ def run_match(
     out_pgn: Optional[str] = None,
     label_e1: str = "E1",
     label_e2: str = "E2",
+    tc: Optional[tuple[int, int]] = None,
 ) -> MatchStats:
     stats = MatchStats()
     pgn_lines = []
 
     print(f"\n=== Match: {label_e1} vs {label_e2} ===")
-    print(f"    {n_games} games, {movetime_ms}ms/move")
+    if tc:
+        print(f"    {n_games} games, {tc[0]/1000:.0f}s+{tc[1]/1000:.0f}s/move")
+    else:
+        print(f"    {n_games} games, {movetime_ms}ms/move")
 
     for g in range(n_games):
         opening_idx = g % len(OPENINGS)
@@ -389,7 +438,7 @@ def run_match(
             e1_is_white = False
 
         try:
-            result = play_game(white_eng, black_eng, opening_moves, movetime_ms)
+            result = play_game(white_eng, black_eng, opening_moves, movetime_ms, tc=tc)
         except Exception as exc:
             print(f"  Game {g+1}: ERROR — {exc}")
             stats.errors += 1
@@ -501,10 +550,16 @@ def cmd_head_to_head(args):
     e2.uci_init(eval_file=args.eval2, hash_mb=args.hash,
                 threads=args.threads, ab_threads=args.ab_threads)
 
+    tc = None
+    if args.tc:
+        base_s, inc_s = args.tc.split("+")
+        tc = (int(float(base_s) * 1000), int(float(inc_s) * 1000))
+
     stats = run_match(e1, e2, args.games, args.movetime,
                       out_pgn=args.out,
                       label_e1=e1.name_hint,
-                      label_e2=e2.name_hint)
+                      label_e2=e2.name_hint,
+                      tc=tc)
 
     e1.quit()
     e2.quit()
@@ -638,6 +693,9 @@ def main():
     p_h2h.add_argument("--label1", default=None)
     p_h2h.add_argument("--label2", default=None)
     p_h2h.add_argument("--movetime", type=int, default=100)
+    p_h2h.add_argument("--tc", default=None,
+                        help="Real clock 'base+inc' in seconds, e.g. '10+15'. "
+                             "Overrides --movetime when set.")
     p_h2h.add_argument("--games", type=int, default=200)
     p_h2h.add_argument("--out", default=None)
     p_h2h.add_argument("--hash", type=int, default=32)
