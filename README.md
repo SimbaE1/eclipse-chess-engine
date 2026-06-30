@@ -13,7 +13,7 @@ Lichess bot.
 > — challenge it to a rated or casual game.
 > *(Runs 8 threads on an iMac Pro, 5-piece Syzygy, ponder + PGO.)*
 
-> **Status:** v0.9.2 — a fully playable late proof-of-concept. UCI, multi-threaded
+> **Status:** v1.0.0 — The first complete version of Eclipse without any of the ponder hangs, etc, that plays at ~2100-2200 elo. UCI, multi-threaded
 > search, pondering, and Syzygy tablebases all work. Strength is still climbing as
 > the network improves.
 
@@ -62,7 +62,7 @@ cmake --build build -j
 # -> build/src/eclipse
 
 # 4. download the neural net into data/
-gh release download v0.9.0 --pattern '*.nnue' -D data/
+gh release download v1.0.0 --pattern '*.nnue' -D data/
 mv data/eclipse_*.nnue data/eclipse.nnue
 ```
 
