@@ -53,6 +53,8 @@ jobs:
           fi
 
           BLOB=$(git hash-object -w assets/lichess_latest_game.svg)
-          TREE=$(printf '100644 blob %s\tassets/lichess_latest_game.svg\n' "$BLOB" | git mktree)
-          COMMIT=$(git commit-tree "$TREE" -m "chore: auto-generated assets (CI)")
+          # mktree can't take paths with slashes — build the tree hierarchy manually.
+          ASSETS_TREE=$(printf '100644 blob %s\tlichess_latest_game.svg\n' "$BLOB" | git mktree)
+          ROOT_TREE=$(printf '040000 tree %s\tassets\n' "$ASSETS_TREE" | git mktree)
+          COMMIT=$(git commit-tree "$ROOT_TREE" -m "chore: auto-generated assets (CI)")
           git push --force origin "$COMMIT:refs/heads/assets"
