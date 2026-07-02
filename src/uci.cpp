@@ -35,6 +35,10 @@ SearchInfo  g_search_info;
 // True once the user sets AbThreads explicitly, after which the Threads
 // handler stops auto-deriving the AB-thread count from the total.
 static bool g_ab_threads_explicit = false;
+// Whether the current session is a Chess960 game. Affects move notation:
+// castling moves are output as king-to-rook ("e1h1") instead of king-to-
+// destination ("e1g1"), and parsed accordingly.
+static bool g_chess960 = false;
 // Large stack: the search runs negamax/qsearch (recursive) directly on this
 // thread, which would overflow the default secondary-thread stack. See
 // thread_util.hpp.
@@ -57,6 +61,14 @@ std::vector<std::string> tokenize(const std::string& s) {
 
 // Convert "e2e4" / "e7e8q" to the matching legal move, or MoveNone if no such
 // move exists from `pos`.
+//
+// Castling encoding depends on the mode:
+//   Standard (UCI_Chess960=false): input is king-to-destination ("e1g1"/"e1c1").
+//     Internally castling is encoded as king-to-rook, so we detect when the
+//     input squares match a standard castling destination and find the matching
+//     legal castling move instead.
+//   Chess960 (UCI_Chess960=true): input is king-to-rook ("e1h1"/"e1a1").
+//     This matches the internal encoding directly.
 Move parse_move(const std::string& s, Position& pos) {
     if (s.size() < 4) return MoveNone;
     const Square from = square_from_string(s.substr(0, 2).c_str());
@@ -77,7 +89,22 @@ Move parse_move(const std::string& s, Position& pos) {
     MoveList legal;
     generate_legal_moves(pos, legal);
     for (const Move m : legal) {
-        if (m.from() != from || m.to() != to) continue;
+        if (m.from() != from) continue;
+        if (m.type() == Move::Castling) {
+            // In Chess960 mode the GUI sends king-to-rook, matching the internal
+            // encoding (m.to() == rook square). In standard mode the GUI sends
+            // king-to-destination; translate: kingside → G-file, queenside → C-file.
+            Square effective_to;
+            if (g_chess960) {
+                effective_to = m.to();  // rook square, matches input directly
+            } else {
+                const bool kingside = (file_of(m.to()) > file_of(from));
+                effective_to = make_square(kingside ? FileG : FileC, rank_of(from));
+            }
+            if (effective_to != to) continue;
+        } else {
+            if (m.to() != to) continue;
+        }
         if (m.type() == Move::Promotion) {
             if (m.promotion_piece() != promo) continue;
         } else if (promo != NoPieceType) {
@@ -105,6 +132,7 @@ void cmd_uci() {
               << "option name SelectQMargin type string default 0.02\n"
               << "option name Ponder type check default true\n"
               << "option name UCI_Ponder type check default true\n"
+              << "option name UCI_Chess960 type check default false\n"
               << "option name SyzygyPath type string default <empty>\n"
               << "uciok" << std::endl;
 }
@@ -185,6 +213,9 @@ void cmd_setoption(const std::vector<std::string>& tok) {
         if (end != value.c_str() && f >= 0.0f && f < 2.0f) mcts::g_select_q_margin = f;
     } else if (name == "SyzygyPath") {
         syzygy::init(value);
+    } else if (name == "UCI_Chess960") {
+        g_chess960 = (value == "true");
+        set_chess960_mode(g_chess960);
     }
     // UCI_Ponder is a capability advertisement; no runtime state to set.
     // Unknown options are silently ignored per UCI convention.

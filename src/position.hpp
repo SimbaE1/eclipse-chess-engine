@@ -60,6 +60,14 @@ public:
     int             fullmove_number () const noexcept { return fullmove_number_; }
     std::uint64_t   key             () const noexcept { return key_; }
 
+    // Returns the initial square of the rook associated with the given castling
+    // right (WhiteKingside, WhiteQueenside, BlackKingside, BlackQueenside).
+    // Only valid for single-bit CastlingRights values. Returns SquareNone if
+    // that right has no rook recorded (e.g. right was never granted).
+    Square castling_rook_sq(CastlingRights cr) const noexcept {
+        return castling_rook_sq_[static_cast<int>(cr)];
+    }
+
     Square king_square(Color c) const noexcept {
         return lsb(by_piece_[make_piece(c, King)]);
     }
@@ -147,6 +155,17 @@ private:
     int             halfmove_clock_   = 0;
     int             fullmove_number_  = 1;
     std::uint64_t   key_              = 0;
+
+    // Indexed by CastlingRights bitmask value (1/2/4/8). Stores the INITIAL
+    // rook square for each right; set once in set_from_fen and never mutated
+    // during play. Used by movegen and do_move/undo_move to handle Chess960
+    // positions where rooks may not start on A/H files.
+    Square castling_rook_sq_[CastlingRightsNB] = {};
+
+    // Per-position castling-rights revocation table. Like the old compile-time
+    // kCastlingRevoke table but built from the actual initial king/rook squares,
+    // so Chess960 positions revoke rights correctly. Built once in set_from_fen.
+    CastlingRights castling_revoke_[SquareNB] = {};
 
     // Incrementally-maintained NNUE accumulator. Refreshed in set_from_fen,
     // updated in do_move, restored from StateInfo in undo_move. `mutable` so

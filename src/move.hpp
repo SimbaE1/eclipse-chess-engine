@@ -112,4 +112,9 @@ struct MoveList {
 std::string square_to_string(Square s);
 Square      square_from_string(const char* s);
 
+// When true, castling moves are output as king-to-rook (Chess960 UCI format).
+// When false (default), castling moves are output as king-to-destination (e1g1/e1c1).
+void set_chess960_mode(bool v) noexcept;
+bool get_chess960_mode() noexcept;
+
 }  // namespace eclipse

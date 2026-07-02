@@ -126,12 +126,11 @@ void generate_piece_moves(const Position& pos, MoveList& out, Bitboard target) {
 template <Color Us>
 void generate_king_moves(const Position& pos, MoveList& out) {
     constexpr Color Them = Us == White ? Black : White;
-    constexpr Square KingHome      = Us == White ? E1 : E8;
-    constexpr Square KingSideTo    = Us == White ? G1 : G8;
-    constexpr Square KingSideMid   = Us == White ? F1 : F8;
-    constexpr Square QueenSideTo   = Us == White ? C1 : C8;
-    constexpr Square QueenSideMid  = Us == White ? D1 : D8;
-    constexpr Square QueenSideKnt  = Us == White ? B1 : B8;
+    constexpr Rank  HomeRank       = Us == White ? Rank1 : Rank8;
+    constexpr Square KingSideDest  = Us == White ? G1 : G8;
+    constexpr Square QueenSideDest = Us == White ? C1 : C8;
+    constexpr Square KingSideRookDest  = Us == White ? F1 : F8;
+    constexpr Square QueenSideRookDest = Us == White ? D1 : D8;
     constexpr CastlingRights KingSide  = Us == White ? WhiteKingside  : BlackKingside;
     constexpr CastlingRights QueenSide = Us == White ? WhiteQueenside : BlackQueenside;
 
@@ -144,29 +143,73 @@ void generate_king_moves(const Position& pos, MoveList& out) {
         out.push(Move(king_sq, to));
     }
 
+    // Castling is only possible from the home rank.
+    if (rank_of(king_sq) != HomeRank) return;
+
     const Bitboard occ = pos.occupied();
 
-    // Castling: rights present, path empty, king not in/through/into check.
+    // Build a bitboard of all squares between two squares on the same rank
+    // (exclusive of endpoints). Works for any pair of squares on the same rank
+    // because consecutive files within a rank are consecutive in the Square enum.
+    auto between_excl = [](Square a, Square b) -> Bitboard {
+        if (a == b) return Bitboard(0);
+        if (a > b) { Square t = a; a = b; b = t; }
+        Bitboard bb = 0;
+        for (Square s = Square(a + 1); s < b; s = Square(s + 1))
+            bb |= square_bb(s);
+        return bb;
+    };
+    // Inclusive ray: all squares from a to b on the same rank (both included).
+    auto ray_incl = [](Square a, Square b) -> Bitboard {
+        if (a > b) { Square t = a; a = b; b = t; }
+        Bitboard bb = 0;
+        for (Square s = a; s <= b; s = Square(s + 1))
+            bb |= square_bb(s);
+        return bb;
+    };
+
+    // Castling: rights present, path empty (excluding king and castling rook
+    // themselves), king not in/through/into check. Encoded as king-to-rook (KxR).
     if (pos.castling_rights() & KingSide) {
-        const Bitboard between = square_bb(KingSideMid) | square_bb(KingSideTo);
-        if (!(occ & between)
-            && !pos.is_square_attacked(KingHome,    Them)
-            && !pos.is_square_attacked(KingSideMid, Them)
-            && !pos.is_square_attacked(KingSideTo,  Them)) {
-            out.push(Move::make_castling(KingHome, KingSideTo));
+        const Square rook_sq = pos.castling_rook_sq(KingSide);
+        if (rook_sq != SquareNone) {
+            // Squares that must be vacant: union of king's travel path and rook's
+            // travel path, minus the squares occupied by the king and rook themselves
+            // (they are part of the move, not blockers).
+            const Bitboard castlers     = square_bb(king_sq) | square_bb(rook_sq);
+            const Bitboard must_empty   = (ray_incl(king_sq, KingSideDest)
+                                         | ray_incl(rook_sq, KingSideRookDest)) & ~castlers;
+            const Bitboard king_path    = ray_incl(king_sq, KingSideDest);
+            const Bitboard occ_excl     = occ & ~castlers;
+            if (!(occ_excl & must_empty)) {
+                bool safe = true;
+                Bitboard path = king_path;
+                while (path) {
+                    if (pos.is_square_attacked(pop_lsb(path), Them)) { safe = false; break; }
+                }
+                if (safe) out.push(Move::make_castling(king_sq, rook_sq));
+            }
         }
     }
     if (pos.castling_rights() & QueenSide) {
-        const Bitboard between = square_bb(QueenSideMid)
-                               | square_bb(QueenSideTo)
-                               | square_bb(QueenSideKnt);
-        if (!(occ & between)
-            && !pos.is_square_attacked(KingHome,     Them)
-            && !pos.is_square_attacked(QueenSideMid, Them)
-            && !pos.is_square_attacked(QueenSideTo,  Them)) {
-            out.push(Move::make_castling(KingHome, QueenSideTo));
+        const Square rook_sq = pos.castling_rook_sq(QueenSide);
+        if (rook_sq != SquareNone) {
+            const Bitboard castlers     = square_bb(king_sq) | square_bb(rook_sq);
+            const Bitboard must_empty   = (ray_incl(king_sq, QueenSideDest)
+                                         | ray_incl(rook_sq, QueenSideRookDest)) & ~castlers;
+            const Bitboard king_path    = ray_incl(king_sq, QueenSideDest);
+            const Bitboard occ_excl     = occ & ~castlers;
+            if (!(occ_excl & must_empty)) {
+                bool safe = true;
+                Bitboard path = king_path;
+                while (path) {
+                    if (pos.is_square_attacked(pop_lsb(path), Them)) { safe = false; break; }
+                }
+                if (safe) out.push(Move::make_castling(king_sq, rook_sq));
+            }
         }
     }
+    (void)between_excl;  // used only in future; suppress warning
 }
 
 template <Color Us>
