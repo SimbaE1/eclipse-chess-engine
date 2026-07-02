@@ -25,7 +25,7 @@ Lichess bot.
 [![Lichess Rapid](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Flichess.org%2Fapi%2Fuser%2FEclipseBOT&query=%24.perfs.rapid.rating&label=rapid&color=5b8a3a&logo=lichess&logoColor=white&style=flat-square)](https://lichess.org/@/EclipseBOT/perf/rapid)
 
 <a href="https://lichess.org/@/EclipseBOT">
-  <img src="assets/lichess_latest_game.svg" alt="EclipseBOT's latest Lichess game" width="360">
+  <img src="https://raw.githubusercontent.com/SimbaE1/eclipse-chess-engine/assets/assets/lichess_latest_game.svg" alt="EclipseBOT's latest Lichess game" width="360">
 </a>
 <!-- LICHESS:END -->
 

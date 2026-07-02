@@ -33,14 +33,25 @@ jobs:
       - name: Render latest-game card
         run: python dev/scripts/gen_lichess_card.py
 
-      - name: Commit if changed
+      - name: Push to assets branch (force, no main history noise)
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Save the freshly rendered SVG before switching branches.
+          cp assets/lichess_latest_game.svg /tmp/lichess_latest_game.svg
+
+          # Switch to the orphan assets branch (single ever-amended commit).
+          # Force-pushing it keeps main's history clean.
+          git fetch origin assets
+          git checkout assets
+
+          cp /tmp/lichess_latest_game.svg assets/lichess_latest_game.svg
           git add assets/lichess_latest_game.svg
+
           if git diff --cached --quiet; then
             echo "No new game — card unchanged."
           else
-            git commit -m "chore(readme): refresh Lichess latest-game card [skip ci]"
-            git push
+            git commit --amend --no-edit
+            git push --force origin assets
           fi
