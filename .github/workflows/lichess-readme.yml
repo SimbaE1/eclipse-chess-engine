@@ -38,20 +38,21 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Save the freshly rendered SVG before switching branches.
-          cp assets/lichess_latest_game.svg /tmp/lichess_latest_game.svg
-
-          # Switch to the orphan assets branch (single ever-amended commit).
-          # Force-pushing it keeps main's history clean.
+          # Push the SVG directly to the assets branch using git plumbing —
+          # no branch switch needed, works with shallow clones. The assets
+          # branch always holds a single root commit (force-pushed each time),
+          # so main's history stays completely clean.
           git fetch origin assets
-          git checkout assets
 
-          cp /tmp/lichess_latest_game.svg assets/lichess_latest_game.svg
-          git add assets/lichess_latest_game.svg
+          REMOTE_BLOB=$(git ls-tree origin/assets assets/lichess_latest_game.svg 2>/dev/null | awk '{print $3}')
+          LOCAL_BLOB=$(git hash-object assets/lichess_latest_game.svg)
 
-          if git diff --cached --quiet; then
+          if [ "$REMOTE_BLOB" = "$LOCAL_BLOB" ]; then
             echo "No new game — card unchanged."
-          else
-            git commit --amend --no-edit
-            git push --force origin assets
+            exit 0
           fi
+
+          BLOB=$(git hash-object -w assets/lichess_latest_game.svg)
+          TREE=$(printf '100644 blob %s\tassets/lichess_latest_game.svg\n' "$BLOB" | git mktree)
+          COMMIT=$(git commit-tree "$TREE" -m "chore: auto-generated assets (CI)")
+          git push --force origin "$COMMIT:refs/heads/assets"
