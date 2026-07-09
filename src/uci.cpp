@@ -29,6 +29,13 @@ constexpr const char* kEngineName    = "Eclipse";
 constexpr const char* kEngineVersion = "1.0.0";
 constexpr const char* kEngineAuthor  = "SimbaE11";
 
+// Machine-specific defaults for this build/install: loaded at startup so the
+// engine plays at full strength (net + tablebases) with zero setoption calls,
+// while still honouring an explicit EvalFile/SyzygyPath from the GUI (the
+// setoption handler below just overwrites whatever loaded here).
+constexpr const char* kDefaultEvalFile   = "/Users/ezra/eclipse-chess-engine/data/eclipse.nnue";
+constexpr const char* kDefaultSyzygyPath = "/Users/ezra/syzygy";
+
 Position    g_pos;
 SearchInfo  g_search_info;
 
@@ -118,9 +125,9 @@ Move parse_move(const std::string& s, Position& pos) {
 void cmd_uci() {
     std::cout << "id name " << kEngineName << ' ' << kEngineVersion << '\n'
               << "id author " << kEngineAuthor << '\n'
-              << "option name EvalFile type string default <empty>\n"
+              << "option name EvalFile type string default " << kDefaultEvalFile << '\n'
               << "option name PolicyFile type string default <empty>\n"
-              << "option name Threads type spin default 1 min 1 max 128\n"
+              << "option name Threads type spin default 4 min 1 max 128\n"
               << "option name Hash type spin default 256 min 1 max 65536\n"
               << "option name MctsHash type spin default 64 min 1 max 65536\n"
               << "option name OverrideMargin type spin default 50 min 0 max 1000\n"
@@ -133,7 +140,7 @@ void cmd_uci() {
               << "option name Ponder type check default true\n"
               << "option name UCI_Ponder type check default true\n"
               << "option name UCI_Chess960 type check default false\n"
-              << "option name SyzygyPath type string default <empty>\n"
+              << "option name SyzygyPath type string default " << kDefaultSyzygyPath << '\n'
               << "uciok" << std::endl;
 }
 
@@ -330,6 +337,21 @@ void cmd_go(const std::vector<std::string>& tok) {
         }
     }
 
+    // `go movetime T`: bind the hard-deadline machinery, exactly like the
+    // clock branch below. Without this, hard_limit_ms stays 0, so search()'s
+    // reconciliation phases (AB cross-check ~150ms, tactic traces, validation,
+    // extensions) run UNCLAMPED on top of the main phase — a movetime-150 move
+    // was measured at 400ms+, which forfeits any GUI/match game played with
+    // per-move time (that is how every game of the first SPRT smoke test was
+    // lost). Soft target 4/5 of T leaves the last fifth, still inside the
+    // deadline, for reconciliation; time_up()'s absolute-deadline check makes
+    // the total spend land at ~T regardless of which phases run.
+    if (!have_tc && limits.time_ms > 0 && !limits.infinite && !limits.ponder) {
+        limits.hard_limit_ms   = limits.time_ms;
+        limits.extra_budget_ms = limits.time_ms / 5;
+        limits.time_ms        -= limits.time_ms / 5;
+    }
+
     if (have_tc && limits.time_ms == 0 && !limits.infinite) {
         const bool   white  = (g_pos.side_to_move() == White);
         const int    remain = white ? wtime : btime;
@@ -472,6 +494,13 @@ void loop() {
     zobrist::init();
     init_attacks();
     g_pos = Position::startpos();
+
+    // Load this machine's defaults so the engine is at full strength before
+    // any setoption arrives (a GUI that never touches EvalFile/SyzygyPath
+    // would otherwise search net-less/TB-less). A later explicit setoption
+    // still wins -- both loaders just overwrite whatever loaded here.
+    nnue::load(kDefaultEvalFile);
+    syzygy::init(kDefaultSyzygyPath);
 
     std::string line;
     while (std::getline(std::cin, line)) {
