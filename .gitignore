@@ -35,3 +35,4 @@ data/*
 .accuracy_cache.json
 data/books/
 !data/blindspot_g10.epd
+dev/sprt_runs/
