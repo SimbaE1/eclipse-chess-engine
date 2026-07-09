@@ -18,4 +18,12 @@ void generate_pseudo_legal_moves(const Position& pos, MoveList& out);
 // pseudo-legal check pass.
 void generate_legal_moves(Position& pos, MoveList& out);
 
+// Tactical moves only: captures, en passant, and ALL promotions (quiet push
+// promotions included — they change material like a capture does). Same
+// pseudo-legal / legal split as above. qsearch's main loop wants exactly this
+// set; generating it directly skips the per-quiet-move do/undo legality check
+// that dominates generate_legal_moves' cost.
+void generate_pseudo_legal_captures(const Position& pos, MoveList& out);
+void generate_legal_captures(Position& pos, MoveList& out);
+
 }  // namespace eclipse

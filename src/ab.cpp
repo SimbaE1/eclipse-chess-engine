@@ -73,10 +73,35 @@ struct SearchCtx {
     std::int32_t capture_history[2][7][7][64]{};
 
     // Continuation history: bonus for a quiet move that caused a beta cutoff
-    // right after a specific previous move. Indexed by destination squares
-    // [color][prev_move.to()][this_move.to()] -- same square-only granularity
-    // as the plain history table, just conditioned on what just happened.
-    std::int32_t cont_history[2][64][64]{};
+    // right after a specific previous move. Indexed at piece-to granularity on
+    // both sides — [color][prev_piece][prev_to][piece][to] — which separates
+    // e.g. "Nf3 after ...e5" from "Bf3 after ...Qe5" (the old square-only
+    // table conflated them). 6.4 MB, so it lives on the heap: SearchCtx sits
+    // on thread stacks that also carry the deep negamax recursion.
+    std::vector<std::int32_t> cont_history =
+        std::vector<std::int32_t>(2 * 7 * 64 * 7 * 64, 0);
+
+    static std::size_t cont_hist_idx(Color c, PieceType prev_pt, Square prev_to,
+                                     PieceType pt, Square to) noexcept {
+        return ((((static_cast<std::size_t>(c) * 7
+                 + static_cast<std::size_t>(prev_pt)) * 64
+                 + static_cast<std::size_t>(prev_to)) * 7
+                 + static_cast<std::size_t>(pt)) * 64)
+                 + static_cast<std::size_t>(to);
+    }
+    std::int32_t& cont_hist(Color c, PieceType prev_pt, Square prev_to,
+                            PieceType pt, Square to) noexcept {
+        return cont_history[cont_hist_idx(c, prev_pt, prev_to, pt, to)];
+    }
+    std::int32_t cont_hist(Color c, PieceType prev_pt, Square prev_to,
+                           PieceType pt, Square to) const noexcept {
+        return cont_history[cont_hist_idx(c, prev_pt, prev_to, pt, to)];
+    }
+
+    // Static eval per ply along the current search path, for the "improving"
+    // heuristic (is our eval better than two plies ago?). kInfinite = no eval
+    // recorded at that ply (node was in check).
+    std::array<Score, kMaxSearchPly + 1> eval_stack{};
 
     // Zobrist key path from the search root.  Populated by negamax push/pop
     // around each do_move so we can detect in-search repetitions.
@@ -114,10 +139,14 @@ struct SearchCtx {
 
     bool time_up() noexcept {
         // Cheap node-stride check before the clock read so we don't read the
-        // clock on every leaf. 4095 is one read per ~4096 leaves; at 1M nps
-        // that's still ~250 reads/sec — plenty of resolution for a budget
-        // measured in milliseconds.
-        if ((nodes & 0xFFFu) != 0) return false;
+        // clock on every leaf. The stride must be sized for the REAL nps: with
+        // NNUE eval per node this search runs ~40k nps, so the old 4096-node
+        // stride meant one clock read per ~100ms — every AB phase could blow
+        // through its budget (and the move's hard deadline) by that much,
+        // which is exactly what flagged sub-300ms movetime games. 256 nodes
+        // ≈ 6ms resolution at 40k nps; a steady_clock read is ~20ns, so even
+        // at 1M nps the overhead is invisible.
+        if ((nodes & 0xFFu) != 0) return false;
         if (stop && stop->load(std::memory_order_relaxed)) return true;
         if (ext_stop && ext_stop->load(std::memory_order_relaxed)) return true;
         if (budget_ms <= 0) return false;
@@ -141,7 +170,9 @@ struct SearchCtx {
 // then countermove, then history.
 int order_score(const Position& pos, Move m, int ply, const SearchCtx& ctx,
                 Move prev_move = MoveNone) {
-    const Piece     vict_p = pos.piece_on(m.to());
+    // Castling is encoded king-to-rook, so piece_on(m.to()) sees our own rook;
+    // without this guard it would be scored as a rook capture. It's a quiet move.
+    const Piece     vict_p = m.type() == Move::Castling ? NoPiece : pos.piece_on(m.to());
     const Piece     aggr_p = pos.piece_on(m.from());
     const PieceType vict   = type_of(vict_p);
     const PieceType aggr   = type_of(aggr_p);
@@ -170,7 +201,9 @@ int order_score(const Position& pos, Move m, int ply, const SearchCtx& ctx,
         }
         s = ctx.history[pos.side_to_move()][m.from()][m.to()];
         if (prev_move != MoveNone) {
-            s += ctx.cont_history[pos.side_to_move()][prev_move.to()][m.to()];
+            s += ctx.cont_hist(pos.side_to_move(),
+                               type_of(pos.piece_on(prev_move.to())), prev_move.to(),
+                               type_of(pos.piece_on(m.from())), m.to());
         }
     }
     return s;
@@ -184,17 +217,13 @@ inline void update_history(std::int32_t& entry, int bonus) {
     entry += static_cast<std::int32_t>(bonus) - entry * std::abs(bonus) / kHistMax;
 }
 
-// Captures + en-passants only. For check evasions in qsearch we fall back
-// to full legal generation; otherwise we'd risk hanging into a mate.
+// Captures/promotions/en-passants only, generated directly (movegen's
+// tactical generator) instead of generating every legal move and filtering —
+// the per-quiet-move do/undo legality check was most of qsearch's movegen
+// cost. For check evasions in qsearch we still use full legal generation;
+// otherwise we'd risk hanging into a mate.
 void generate_captures(Position& pos, MoveList& out) {
-    MoveList all;
-    generate_legal_moves(pos, all);
-    for (const Move m : all) {
-        const bool is_cap = pos.piece_on(m.to()) != NoPiece
-                         || m.type() == Move::EnPassant
-                         || m.type() == Move::Promotion;
-        if (is_cap) out.push(m);
-    }
+    generate_legal_captures(pos, out);
 }
 
 Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
@@ -212,27 +241,52 @@ Score qsearch(Position& pos, Score alpha, Score beta, int ply, SearchCtx& ctx) {
     // Fifty-move rule: no pawn move or capture in 100 half-moves → draw.
     if (pos.halfmove_clock() >= 100) return kDraw;
 
+    // TT probe. qsearch entries are stored at depth 0 and every stored entry
+    // has depth >= 0, so any hit is deep enough to cut here. Same generation
+    // filter as negamax so find_tactic_node's depth-by-depth sweep stays
+    // honest; the stored move is used for ordering either way.
+    const Score alpha_orig = alpha;
+    TTEntry tt_entry;
+    Move    tt_move = MoveNone;
+    if (g_tt.probe(pos.key(), tt_entry) &&
+        (!ctx.gen_filter || tt_entry.generation == ctx.cutoff_gen)) {
+        tt_move = tt_entry.move;
+        const Score s = tt_entry.score_from_tt(tt_entry.score, ply);
+        if (tt_entry.flag == TT_EXACT) return s;
+        if (tt_entry.flag == TT_LOWERBOUND && s >= beta)  return s;
+        if (tt_entry.flag == TT_UPPERBOUND && s <= alpha) return s;
+    }
+
+    const bool in_check = pos.in_check();
+
     // Stand-pat: assume we can do nothing and accept the static eval. The
     // search then only considers moves that BEAT the stand-pat — i.e.
     // captures that improve our position. This is what makes qsearch
-    // tactically focused without exploding.
-    const Score stand_pat = evaluate(pos);
-    if (stand_pat >= beta) return beta;
-    if (stand_pat > alpha) alpha = stand_pat;
+    // tactically focused without exploding. Not available in check: every
+    // evasion must be searched, and "doing nothing" isn't an option.
+    Score stand_pat = -kInfinite;
+    if (!in_check) {
+        stand_pat = evaluate(pos);
+        if (stand_pat >= beta) return beta;
+        if (stand_pat > alpha) alpha = stand_pat;
+    }
 
     MoveList caps;
-    if (pos.in_check()) {
+    if (in_check) {
         // In check we MUST move; consider all legal evasions so we don't
         // miss a quiet block / king move that escapes mate.
         generate_legal_moves(pos, caps);
+        // No evasions at all: checkmate, scored shallowest-first like negamax.
+        if (caps.size == 0) return -static_cast<Score>(kMateScore - ply);
     } else {
         generate_captures(pos, caps);
     }
 
-    // Sort by MVV-LVA (descending order_score).
+    // Sort by MVV-LVA (descending order_score); TT move first.
     std::array<int, 256> scores{};
     for (int i = 0; i < caps.size; ++i) {
-        scores[static_cast<std::size_t>(i)] = order_score(pos, caps[i], ply, ctx);
+        scores[static_cast<std::size_t>(i)] = (caps[i] == tt_move)
+            ? 3'000'000 : order_score(pos, caps[i], ply, ctx);
     }
     for (int i = 1; i < caps.size; ++i) {
         for (int j = i; j > 0 && scores[static_cast<std::size_t>(j)] > scores[static_cast<std::size_t>(j - 1)]; --j) {
@@ -241,9 +295,11 @@ Score qsearch(Position& pos, Score alpha, Score beta, int ply, SearchCtx& ctx) {
         }
     }
 
+    Score best      = stand_pat;  // -kInfinite when in check: must find a move
+    Move  best_move = MoveNone;
     for (int i = 0; i < caps.size; ++i) {
         const Move m = caps[static_cast<std::size_t>(i)];
-        if (!pos.in_check()) {
+        if (!in_check) {
             // SEE pruning: skip losing captures.
             if (!see_ge(pos, m, 0)) continue;
             // Delta pruning: if even capturing the victim can't raise alpha,
@@ -260,10 +316,19 @@ Score qsearch(Position& pos, Score alpha, Score beta, int ply, SearchCtx& ctx) {
         const Score s = -qsearch(pos, -beta, -alpha, ply + 1, ctx);
         pos.undo_move(m, st);
         if (ctx.aborted) return 0;
-        if (s >= beta) return beta;
+        if (s > best) { best = s; best_move = m; }
         if (s > alpha) alpha = s;
+        if (alpha >= beta) break;
     }
-    return alpha;
+
+    // Store at depth 0: never evicts a real (depth >= 1) negamax entry for
+    // the same position, but saves re-running qsearch on transpositions.
+    const TTFlag flag = (best >= beta)       ? TT_LOWERBOUND
+                      : (best > alpha_orig)  ? TT_EXACT
+                                             : TT_UPPERBOUND;
+    g_tt.store(pos.key(), best_move, best, 0, flag, ply);
+
+    return best >= beta ? beta : best;
 }
 
 Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
@@ -343,6 +408,12 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
     // Cache in_check once: used by every pruning guard and move-loop check below.
     const bool in_check = pos.in_check();
 
+    // PV nodes are searched with an open window; every zero-window probe has
+    // beta == alpha+1. The speculative prunes below (RFP, null move, probcut,
+    // futility, LMP, SEE quiet pruning) are only sound as fail-high/fail-low
+    // guesses, so they run on non-PV nodes only; the PV gets the honest search.
+    const bool is_pv = (beta - alpha) > 1;
+
     // Lazy static eval: skipped for in-check positions where no pruning fires.
     Score static_eval = 0;
     if (!in_check) {
@@ -358,13 +429,32 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
         }
     }
 
+    // Improving: is this node's eval better than the same side's eval two
+    // plies up the path? A falling eval means fail-lows are more likely, so
+    // pruning thresholds tighten (more pruning); a rising one loosens them.
+    // In-check plies record no eval (kInfinite sentinel) and count as not
+    // improving; with no usable history, default to improving (prune less).
+    ctx.eval_stack[static_cast<std::size_t>(ply)] = in_check ? kInfinite : static_eval;
+    bool improving = false;
+    if (!in_check) {
+        if (ply >= 2 && ctx.eval_stack[static_cast<std::size_t>(ply - 2)] != kInfinite)
+            improving = static_eval > ctx.eval_stack[static_cast<std::size_t>(ply - 2)];
+        else if (ply >= 4 && ctx.eval_stack[static_cast<std::size_t>(ply - 4)] != kInfinite)
+            improving = static_eval > ctx.eval_stack[static_cast<std::size_t>(ply - 4)];
+        else
+            improving = true;
+    }
+
     // Reverse Futility Pruning (RFP): also known as Static Null Move Pruning.
-    if (!in_check && depth <= 6 && static_eval >= beta + 120 * depth) {
+    // An improving eval discounts one depth from the margin — the fail-high
+    // guess is more trustworthy when the trend is with us.
+    if (!is_pv && !in_check && depth <= 6 &&
+        static_eval >= beta + 120 * (depth - (improving ? 1 : 0))) {
         return static_eval;
     }
 
     // Null-move pruning.
-    if (!in_check && depth >= 3 && static_eval >= beta) {
+    if (!is_pv && !in_check && depth >= 3 && static_eval >= beta) {
         const Color us         = pos.side_to_move();
         const Bitboard minors  = pos.pieces(us, Knight) | pos.pieces(us, Bishop);
         const Bitboard majors  = pos.pieces(us, Rook)   | pos.pieces(us, Queen);
@@ -385,7 +475,7 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
     // a generous beta threshold via a shallow search. If so, cut immediately.
     // The SEE filter skips captures unlikely to reach probcut_beta, keeping
     // the overhead small relative to the pruning benefit.
-    if (!in_check && depth >= 5 && excluded == MoveNone
+    if (!is_pv && !in_check && depth >= 5 && excluded == MoveNone
         && std::abs(beta) < kMateInMaxPly) {
         const Score probcut_beta  = beta + 180;
         const int   probcut_depth = depth - 4;
@@ -470,24 +560,32 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
     // are still searched).
     static constexpr Score kFutilityMargin[4] = {0, 150, 300, 500};
     const bool can_futility_prune =
-        !in_check
+        !is_pv
+        && !in_check
         && depth <= 3
         && excluded == MoveNone
         && alpha > -kMateInMaxPly && alpha < kMateInMaxPly
         && static_eval + kFutilityMargin[depth] <= alpha;
 
-    // LMP: at depth 1-2, after trying N quiet moves, skip the rest.
+    // LMP: at depth 1-2, after trying N quiet moves, skip the rest. A falling
+    // eval (not improving) halves the budget — late quiets are even less
+    // likely to rescue a deteriorating position.
     static constexpr int kLmpCount[3] = {0, 8, 15};
     const bool can_lmp =
-        !in_check
+        !is_pv
+        && !in_check
         && depth <= 2
         && excluded == MoveNone
         && alpha > -kMateInMaxPly && alpha < kMateInMaxPly;
+    const int lmp_limit = (depth <= 2) ? (improving ? kLmpCount[depth]
+                                                    : kLmpCount[depth] / 2)
+                                       : 0;
     int quiet_tried = 0;
 
     // SEE pruning for quiet moves at low depth.
     const bool can_see_prune_quiet =
-        !in_check
+        !is_pv
+        && !in_check
         && depth <= 4
         && excluded == MoveNone
         && alpha > -kMateInMaxPly;
@@ -517,20 +615,26 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
         const Move m = moves[idx];
         if (m == excluded) continue;
 
-        const bool is_quiet = pos.piece_on(m.to()) == NoPiece
-                           && m.type() != Move::EnPassant
-                           && m.type() != Move::Promotion;
+        // Castling reads as "occupied destination" (king-to-rook encoding)
+        // but is a quiet move, not a rook capture.
+        const bool is_quiet = m.type() == Move::Castling
+                           || (pos.piece_on(m.to()) == NoPiece
+                               && m.type() != Move::EnPassant
+                               && m.type() != Move::Promotion);
 
         // Futility pruning: skip quiet moves that can't raise alpha.
         if (can_futility_prune && i > 0 && is_quiet) continue;
 
         // LMP: once we've tried enough quiet moves at low depth, stop.
         if (can_lmp && is_quiet) {
-            if (quiet_tried >= kLmpCount[depth]) continue;
+            if (quiet_tried >= lmp_limit) continue;
         }
         if (is_quiet) {
             // SEE quiet pruning: skip quiet moves with very bad static exchange.
-            if (can_see_prune_quiet && i > 0 && !see_ge(pos, m, -50 * depth)) continue;
+            // Castling excluded: SEE reads its king-to-rook encoding as a
+            // capture of our own rook and returns nonsense.
+            if (can_see_prune_quiet && i > 0 && m.type() != Move::Castling &&
+                !see_ge(pos, m, -50 * depth)) continue;
 
             ++quiet_tried;
             if (quiets_tried_count < 64)
@@ -538,6 +642,11 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
         }
 
         const Color mover = pos.side_to_move();
+        // Piece types for the piece-to continuation history, read BEFORE
+        // do_move mutates the board (the LMR block below runs after it).
+        const PieceType moved_pt = type_of(pos.piece_on(m.from()));
+        const PieceType prev_pt  = prev_move != MoveNone
+            ? type_of(pos.piece_on(prev_move.to())) : NoPieceType;
         StateInfo st;
         const std::uint64_t parent_key = pos.key();
         pos.do_move(m, st);
@@ -567,9 +676,13 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
                 reduction -= hist_val / (kHistMax / 2);  // ±1 at ±½·kHistMax
 
                 if (prev_move != MoveNone) {
-                    const int cont_val = ctx.cont_history[mover][prev_move.to()][m.to()];
+                    const int cont_val = ctx.cont_hist(mover, prev_pt, prev_move.to(),
+                                                       moved_pt, m.to());
                     reduction -= cont_val / (kHistMax / 2);
                 }
+
+                // The PV deserves a fuller look: reduce one ply less there.
+                if (is_pv) reduction -= 1;
 
                 reduction = std::clamp(reduction, 0, depth - 1);
             }
@@ -604,7 +717,8 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
                 }
                 update_history(ctx.history[us][m.from()][m.to()], bonus);
                 if (prev_move != MoveNone) {
-                    update_history(ctx.cont_history[us][prev_move.to()][m.to()], bonus);
+                    update_history(ctx.cont_hist(us, prev_pt, prev_move.to(),
+                                                 moved_pt, m.to()), bonus);
                 }
 
                 // History malus: penalize all quiets searched before the cutoff move.
@@ -613,7 +727,11 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
                     const Move qm = quiets_tried[static_cast<std::size_t>(j)];
                     update_history(ctx.history[us][qm.from()][qm.to()], malus);
                     if (prev_move != MoveNone) {
-                        update_history(ctx.cont_history[us][prev_move.to()][qm.to()], malus);
+                        // pos is restored after undo_move, so qm's mover is
+                        // back on its from-square.
+                        update_history(ctx.cont_hist(us, prev_pt, prev_move.to(),
+                                                     type_of(pos.piece_on(qm.from())),
+                                                     qm.to()), malus);
                     }
                 }
 
@@ -730,7 +848,10 @@ Result find_best_move(Position& pos, int max_depth, std::int64_t time_budget_ms,
         SearchCtx ctx{start, time_budget_ms};
         ctx.ext_stop = ext_stop;
         ctx.ponder_hit_ms = ponder_hit_ms;
-        return id_search(pos, max_depth, ctx, 1);
+        Result r = id_search(pos, max_depth, ctx, 1);
+        r.elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::now() - start).count();
+        return r;
     }
 
     // Lazy SMP: workers share the global TT (lockless -- probe's key check
@@ -769,6 +890,8 @@ Result find_best_move(Position& pos, int max_depth, std::int64_t time_budget_ms,
     Result r = results[0];
     for (int i = 1; i < num_threads; ++i)
         r.nodes += results[static_cast<std::size_t>(i)].nodes;
+    r.elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - start).count();
     return r;
 }
 

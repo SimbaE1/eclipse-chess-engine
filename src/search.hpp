@@ -23,8 +23,9 @@ struct SearchInfo {
     std::atomic<bool> stop{false};
 
     // Worker count for multi-threaded MCTS. Set by the UCI Threads option,
-    // hard-clamped to [1, 128]. 1 keeps the single-threaded code path.
-    int               threads = 1;
+    // hard-clamped to [1, 128]. Defaults to 4 for this build/machine; 1 keeps
+    // the single-threaded code path for callers that explicitly ask for it.
+    int               threads = 4;
 
     // AB-vs-MCTS override threshold in cp. AB only overrides the played move
     // when its evaluation is at least this many cp above MCTS's. 150 (one

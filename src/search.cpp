@@ -132,10 +132,11 @@ bool eval_unsettled(const std::vector<Score>& ds) {
 }
 
 void log_ab_outcome(const ab::Result& ab, Move mcts_move, Score mcts_cp, const char* tag) {
+    const auto ab_nps = ab.nodes * 1000 / std::max<std::int64_t>(1, ab.elapsed_ms);
     std::cout << "info string AB " << tag
               << ": mcts " << mcts_move.to_uci() << " " << mcts_cp << "cp"
               << " vs ab " << ab.move.to_uci()    << " " << ab.score << "cp"
-              << " (d=" << ab.reached_d << ", nodes=" << ab.nodes << ")"
+              << " (d=" << ab.reached_d << ", nodes=" << ab.nodes << ", nps=" << ab_nps << ")"
               << std::endl;
 }
 }  // namespace
@@ -366,6 +367,21 @@ Move search(Position& pos, SearchInfo& info) {
     mcts::MCTS mcts_search(pos, info);
     mcts_search.run();
 
+    // Stats for MCTS's OWN phase, kept separate from AB's (printed below once
+    // AB completes) so the two searchers' depth/nodes/nps are never conflated
+    // -- they run concurrently (parallel_ab) or over different slices
+    // (sequential), so a single combined number would be meaningless.
+    if (!info.silent) {
+        const auto mcts_elapsed_ms = std::max<std::int64_t>(1,
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - info.start_time).count());
+        const auto mcts_nodes = info.nodes_searched.load(std::memory_order_relaxed);
+        std::cout << "info string MCTS stats: depth=" << mcts_search.reached_depth()
+                  << " nodes=" << mcts_nodes
+                  << " nps=" << (mcts_nodes * 1000 / mcts_elapsed_ms)
+                  << std::endl;
+    }
+
     // ----- AB phase (completion) -----
     if (parallel_ab) {
         ab_thread.join();
@@ -550,12 +566,15 @@ Move search(Position& pos, SearchInfo& info) {
             ab_result.move != info.best_move &&
             (ab_views_mcts_move_as_bad || ab_has_better_alternative);
 
+        const auto ab_nps = ab_result.nodes * 1000 /
+            std::max<std::int64_t>(1, ab_result.elapsed_ms);
         std::cout << "info string AB cross-check: mcts " << info.best_move.to_uci()
                   << " " << info.best_score << "cp"
                   << " (ab's view " << ab_view_of_mcts_move << "cp)"
                   << "  ab's own pick " << ab_result.move.to_uci()
                   << " " << ab_result.score << "cp"
-                  << " (d=" << ab_result.reached_d << ", nodes=" << ab_result.nodes << ")"
+                  << " (d=" << ab_result.reached_d << ", nodes=" << ab_result.nodes
+                  << ", nps=" << ab_nps << ")"
                   << std::endl;
 
         if (!ab_disagrees) {

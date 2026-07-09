@@ -17,6 +17,7 @@ struct Result {
     Score score      = 0;            // from root side-to-move's perspective
     int   reached_d  = 0;            // depth actually completed
     std::int64_t nodes = 0;
+    std::int64_t elapsed_ms = 0;     // wall time spent in find_best_move (for nps)
     // Root score at each completed depth (depth_scores[i] == score after
     // depth i+1), root side-to-move perspective. Lets callers see whether the
     // eval is still drifting with depth -- a move that looks fine shallow but

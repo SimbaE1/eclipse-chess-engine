@@ -212,6 +212,99 @@ void generate_king_moves(const Position& pos, MoveList& out) {
     (void)between_excl;  // used only in future; suppress warning
 }
 
+// Tactical subset of generate_pawn_moves: captures, en passant, and all
+// promotions (push promotions included, mirroring what qsearch treats as
+// tactical). Kept structurally parallel to generate_pawn_moves above so the
+// two stay easy to diff.
+template <Color Us>
+void generate_pawn_captures(const Position& pos, MoveList& out) {
+    constexpr Color Them = Us == White ? Black : White;
+    constexpr Direction Up      = Us == White ? North     : South;
+    constexpr Direction UpLeft  = Us == White ? NorthWest : SouthEast;
+    constexpr Direction UpRight = Us == White ? NorthEast : SouthWest;
+    constexpr Bitboard  PromoSourceRank = Us == White ? rank_bb(Rank7) : rank_bb(Rank2);
+
+    const Bitboard pawns        = pos.pieces(Us, Pawn);
+    const Bitboard pawns_promo  = pawns &  PromoSourceRank;
+    const Bitboard pawns_no_pr  = pawns & ~PromoSourceRank;
+    const Bitboard empty        = ~pos.occupied();
+    // Enemy king excluded as a capture target — see generate_pawn_moves.
+    const Bitboard enemy        = pos.pieces(Them) & ~pos.pieces(Them, King);
+
+    // Captures (no promotion).
+    {
+        Bitboard lcap = shift<UpLeft>(pawns_no_pr)  & enemy;
+        while (lcap) {
+            const Square to   = pop_lsb(lcap);
+            const Square from = Square(static_cast<int>(to) - UpLeft);
+            out.push(Move(from, to));
+        }
+        Bitboard rcap = shift<UpRight>(pawns_no_pr) & enemy;
+        while (rcap) {
+            const Square to   = pop_lsb(rcap);
+            const Square from = Square(static_cast<int>(to) - UpRight);
+            out.push(Move(from, to));
+        }
+    }
+
+    // Promotions: push + both captures.
+    if (pawns_promo) {
+        auto emit_promos = [&](Square from, Square to) {
+            out.push(Move::make_promotion(from, to, Queen));
+            out.push(Move::make_promotion(from, to, Rook));
+            out.push(Move::make_promotion(from, to, Bishop));
+            out.push(Move::make_promotion(from, to, Knight));
+        };
+
+        Bitboard push_pr = shift<Up>(pawns_promo) & empty;
+        while (push_pr) {
+            const Square to   = pop_lsb(push_pr);
+            const Square from = Square(static_cast<int>(to) - Up);
+            emit_promos(from, to);
+        }
+        Bitboard lcap_pr = shift<UpLeft>(pawns_promo)  & enemy;
+        while (lcap_pr) {
+            const Square to   = pop_lsb(lcap_pr);
+            const Square from = Square(static_cast<int>(to) - UpLeft);
+            emit_promos(from, to);
+        }
+        Bitboard rcap_pr = shift<UpRight>(pawns_promo) & enemy;
+        while (rcap_pr) {
+            const Square to   = pop_lsb(rcap_pr);
+            const Square from = Square(static_cast<int>(to) - UpRight);
+            emit_promos(from, to);
+        }
+    }
+
+    // En passant.
+    if (pos.ep_square() != SquareNone) {
+        const Square ep = pos.ep_square();
+        Bitboard attackers = pawn_attacks(Them, ep) & pawns;
+        while (attackers) {
+            const Square from = pop_lsb(attackers);
+            out.push(Move::make_en_passant(from, ep));
+        }
+    }
+}
+
+template <Color Us>
+void generate_all_captures(const Position& pos, MoveList& out) {
+    constexpr Color Them = Us == White ? Black : White;
+    const Bitboard target = pos.pieces(Them) & ~pos.pieces(Them, King);
+    generate_pawn_captures<Us>(pos, out);
+    generate_piece_moves<Knight>(pos, out, target);
+    generate_piece_moves<Bishop>(pos, out, target);
+    generate_piece_moves<Rook>  (pos, out, target);
+    generate_piece_moves<Queen> (pos, out, target);
+    // King captures only; castling is never a capture.
+    const Square king_sq = pos.king_square(Us);
+    Bitboard king_caps = king_attacks(king_sq) & target;
+    while (king_caps) {
+        const Square to = pop_lsb(king_caps);
+        out.push(Move(king_sq, to));
+    }
+}
+
 template <Color Us>
 void generate_all(const Position& pos, MoveList& out) {
     constexpr Color Them = Us == White ? Black : White;
@@ -235,27 +328,42 @@ void generate_pseudo_legal_moves(const Position& pos, MoveList& out) {
         generate_all<Black>(pos, out);
 }
 
-void generate_legal_moves(Position& pos, MoveList& out) {
-    MoveList pseudo;
-    generate_pseudo_legal_moves(pos, pseudo);
+void generate_pseudo_legal_captures(const Position& pos, MoveList& out) {
+    if (pos.side_to_move() == White)
+        generate_all_captures<White>(pos, out);
+    else
+        generate_all_captures<Black>(pos, out);
+}
 
+namespace {
+
+// Shared legality filter: replays each pseudo-legal move (accumulator updates
+// skipped — legality is pure board geometry) and keeps those that leave our
+// king safe.
+void filter_legal(Position& pos, const MoveList& pseudo, MoveList& out) {
     StateInfo st;
     for (const Move m : pseudo) {
-        // Legality only inspects board geometry (king safety), so skip the NNUE
-        // accumulator entirely: no snapshot, no incremental FT update, no
-        // restore. Without this, every pseudo-legal move would do/undo three
-        // 4 KB accumulator memcpys plus a full feature-transformer update — the
-        // dominant cost of node expansion, all of it discarded.
         pos.do_move(m, st, /*snapshot_acc=*/false, /*update_acc=*/false);
-        // After do_move, side_to_move has flipped. Our king is the king of
-        // the side that just moved; it must not be attacked by the side now
-        // on the move.
         const Color   us       = ~pos.side_to_move();
         const Square  king_sq  = pos.king_square(us);
         const bool    legal    = !pos.is_square_attacked(king_sq, ~us);
         pos.undo_move(m, st, /*restore_acc=*/false);
         if (legal) out.push(m);
     }
+}
+
+}  // namespace
+
+void generate_legal_captures(Position& pos, MoveList& out) {
+    MoveList pseudo;
+    generate_pseudo_legal_captures(pos, pseudo);
+    filter_legal(pos, pseudo, out);
+}
+
+void generate_legal_moves(Position& pos, MoveList& out) {
+    MoveList pseudo;
+    generate_pseudo_legal_moves(pos, pseudo);
+    filter_legal(pos, pseudo, out);
 }
 
 }  // namespace eclipse

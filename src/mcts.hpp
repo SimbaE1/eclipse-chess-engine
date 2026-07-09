@@ -229,6 +229,9 @@ public:
     // Returns the most-visited reply to `best_move` in the current tree.
     // Must be called before save_to_cache() (which nulls the root).
     Move get_ponder_move_after(Move best_move) const;
+    // Deepest ply actually visited this run() call. For search.cpp's
+    // end-of-phase MCTS stats line (kept separate from AB's own depth/nodes/nps).
+    int reached_depth() const { return max_depth_seen.load(std::memory_order_relaxed); }
 
     // ---- Tactic-node seeding (used by search.cpp's AB-validation step) ----
     //
