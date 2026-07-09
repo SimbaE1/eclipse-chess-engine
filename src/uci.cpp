@@ -330,6 +330,15 @@ void cmd_go(const std::vector<std::string>& tok) {
         }
     }
 
+    // go movetime: bind the hard-deadline machinery (backported timing fix,
+    // identical to main's c0a9b42, so SPRT baselines differ from main by
+    // search changes only -- never by time-loss behaviour).
+    if (!have_tc && limits.time_ms > 0 && !limits.infinite && !limits.ponder) {
+        limits.hard_limit_ms   = limits.time_ms;
+        limits.extra_budget_ms = limits.time_ms / 5;
+        limits.time_ms        -= limits.time_ms / 5;
+    }
+
     if (have_tc && limits.time_ms == 0 && !limits.infinite) {
         const bool   white  = (g_pos.side_to_move() == White);
         const int    remain = white ? wtime : btime;

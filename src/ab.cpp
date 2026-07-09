@@ -117,7 +117,7 @@ struct SearchCtx {
         // clock on every leaf. 4095 is one read per ~4096 leaves; at 1M nps
         // that's still ~250 reads/sec — plenty of resolution for a budget
         // measured in milliseconds.
-        if ((nodes & 0xFFFu) != 0) return false;
+        if ((nodes & 0xFFu) != 0) return false;
         if (stop && stop->load(std::memory_order_relaxed)) return true;
         if (ext_stop && ext_stop->load(std::memory_order_relaxed)) return true;
         if (budget_ms <= 0) return false;
