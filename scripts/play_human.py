@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -53,8 +54,10 @@ def read_until(p, token: str):
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--engine", default="./build/src/eclipse",
-                        help="path to engine binary (default: ./build/src/eclipse)")
+    parser.add_argument("--engine", default="eclipse",
+                        help="engine binary: a bare name is looked up on PATH "
+                             "(default: 'eclipse', the PGO build symlinked into "
+                             "/usr/local/bin), or pass a path to use a specific build")
     parser.add_argument("--nnue", default="data/eclipse.nnue")
     parser.add_argument("--policy", default="data/policy.onnx")
     parser.add_argument("--engine-time-ms", type=int, default=5000,
@@ -73,9 +76,16 @@ def main():
                         help="transposition table size in MB")
     args = parser.parse_args()
 
-    eng_path = Path(args.engine).resolve()
-    if not eng_path.exists():
-        sys.exit(f"engine not found at {eng_path}. Build first: cmake --build build")
+    if os.sep in args.engine:
+        eng_path = Path(args.engine).resolve()
+        if not eng_path.exists():
+            sys.exit(f"engine not found at {eng_path}. Build first: cmake --build build")
+    else:
+        found = shutil.which(args.engine)
+        if found is None:
+            sys.exit(f"engine '{args.engine}' not found on PATH. "
+                     f"Build first (cmake --build build) or pass --engine <path>")
+        eng_path = Path(found).resolve()
 
     nnue = Path(args.nnue).resolve()
     policy = Path(args.policy).resolve()
