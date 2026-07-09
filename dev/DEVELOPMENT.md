@@ -37,9 +37,13 @@ see [`SETUP.md`](../SETUP.md); for training data + GPU training see
   `src/search.cpp`); leaf evals are batched (`nnue::evaluate_batch`) and nodes
   come from a per-thread pooled allocator; Syzygy tablebase probing at root and
   interior (`src/syzygy.cpp`).
-- **Time mgmt:** MLH-divided budget in `cmd_go` (`src/uci.cpp`). Note the fixed
-  ~120 ms per-move floor documented there — ultra-bullet (increment < floor)
-  can flag; 5+3 and slower are safe.
+- **Time mgmt:** MLH-divided budget in `cmd_go` (`src/uci.cpp`), enforced as a
+  single absolute deadline across every search phase for both clock and
+  movetime searches. The old ~120 ms per-move floor is gone (2026-07-08: the
+  AB clock-check stride and the unclamped `go movetime` phases were the bulk
+  of it) — measured overshoot at movetime 50–300 is within ±5 ms without the
+  ONNX policy net loaded; the root policy probe still adds its inference cost
+  per move when `PolicyFile` is set.
 
 ### Search tunables (UCI options)
 
