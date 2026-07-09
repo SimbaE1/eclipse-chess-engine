@@ -12,12 +12,16 @@
 #   dev/scripts/sprt_run.sh <new_binary> <old_binary> [options]
 #
 # Options (defaults tuned for the 8-core dev iMac):
-#   -t TC        time control          (default 20+0.2 -- increment must stay
-#                                       above the ~120ms/move floor, see uci.cpp)
+#   -t TC        time control          (default 20+0.2)
 #   -0 ELO0      H0: gain <= this      (default 0)
 #   -1 ELO1      H1: gain >= this      (default 5)
 #   -g GAMES     max games             (default 2000)
 #   -c CONC      concurrent games      (default 4)
+#   -T THREADS   MCTS threads/engine   (default 1; sequential AB. 2+ with
+#                                       -A 1 runs AB in PARALLEL like the
+#                                       production bot -- budget ~cores /
+#                                       (THREADS+ABTHREADS) for -c)
+#   -A ABTHREADS AB threads/engine     (default 1)
 #   -n NNUE      value net             (default data/eclipse.nnue)
 #   -x "ARGS"    extra setoptions for BOTH engines, cutechess option.X=Y syntax
 #   -s           smoke test: 4 games at st=0.15, no SPRT (verifies wiring)
@@ -35,6 +39,8 @@ ELO0=0
 ELO1=5
 MAXGAMES=2000
 CONC=4
+THREADS=1
+ABTHREADS=1
 NNUE="$REPO/data/eclipse.nnue"
 BOOK="$REPO/data/books/UHO_Lichess_4852_v1.epd"
 EXTRA=""
@@ -45,13 +51,15 @@ usage() { sed -n '2,30p' "$0"; exit 1; }
 [[ $# -lt 2 ]] && usage
 NEW="$1"; OLD="$2"; shift 2
 
-while getopts "t:0:1:g:c:n:x:s" opt; do
+while getopts "t:0:1:g:c:T:A:n:x:s" opt; do
     case $opt in
         t) TC="$OPTARG" ;;
         0) ELO0="$OPTARG" ;;
         1) ELO1="$OPTARG" ;;
         g) MAXGAMES="$OPTARG" ;;
         c) CONC="$OPTARG" ;;
+        T) THREADS="$OPTARG" ;;
+        A) ABTHREADS="$OPTARG" ;;
         n) NNUE="$OPTARG" ;;
         x) EXTRA="$OPTARG" ;;
         s) SMOKE=1 ;;
@@ -68,15 +76,16 @@ done
 OUT="$REPO/dev/sprt_runs/$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$OUT"
 
-# Both sides get identical settings; only the binary differs. Threads=1 +
-# AbThreads=1 exercises the full MCTS+AB hybrid in sequential mode, one core
-# per engine, so CONC games fit the machine. TT state resets via ucinewgame.
+# Both sides get identical settings; only the binary differs. The default
+# Threads=1 + AbThreads=1 exercises the full MCTS+AB hybrid in sequential
+# mode (one core per engine); -T 2 -A 1 switches to the production-style
+# parallel topology (dedicated AB thread alongside MCTS).
 COMMON_OPTS=(
     proto=uci
     tc="$TC"
     timemargin=100
-    option.Threads=1
-    option.AbThreads=1
+    option.Threads="$THREADS"
+    option.AbThreads="$ABTHREADS"
     option.Hash=128
     option.MctsHash=64
     option.EvalFile="$NNUE"
