@@ -44,16 +44,27 @@ int see(const Position& pos, Move m) noexcept {
     }
 
     Bitboard occ = pos.occupied();
-    Bitboard attackers = pos.attackers_to(to, occ);
-    
+
     // Side to move just played `m`, so they "lose" the piece that moved.
     int d = 0;
     Color stm = pos.side_to_move();
     PieceType active_piece = type_of(pos.piece_on(from));
 
-    // Remove the moving piece from occupancy and update attackers.
+    // Remove the moving piece from occupancy. En passant captures a pawn that
+    // is NOT on `to` but one rank behind it; remove that pawn too so x-ray
+    // attackers along the rank/file (the classic ep discovered attack) show up.
     occ ^= (1ULL << from);
-    attackers = pos.attackers_to(to, occ);
+    if (m.type() == Move::EnPassant) {
+        const Square ep_cap = static_cast<Square>(
+            static_cast<int>(to) + (stm == White ? -8 : 8));
+        occ ^= (1ULL << ep_cap);
+    }
+    // Declare + compute attackers, masked by occ. attackers_to() masks by the
+    // piece bitboards, NOT occ, so a piece already removed from occ (the mover,
+    // the ep-captured pawn, or an attacker consumed later in the loop) would
+    // otherwise reappear — knights/pawns/king always, sliders via the reopened
+    // ray — and be re-selected as a phantom recapture. `& occ` drops them.
+    Bitboard attackers = pos.attackers_to(to, occ) & occ;
 
     while (true) {
         d++;
@@ -70,8 +81,10 @@ int see(const Position& pos, Move m) noexcept {
         active_piece = type_of(pos.piece_on(next_from));
         occ ^= (1ULL << next_from);
         
-        // Refresh attackers to account for X-rays.
-        attackers = pos.attackers_to(to, occ);
+        // Refresh attackers for X-rays, masked by occ so the piece just
+        // consumed (removed from occ above) drops out instead of being
+        // re-selected — see the note at the first recompute above.
+        attackers = pos.attackers_to(to, occ) & occ;
         
         if (d >= 31) break; // Safety cap
     }
