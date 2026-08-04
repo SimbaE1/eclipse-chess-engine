@@ -6,9 +6,9 @@
   "kernel_type": "notebook",
   "is_private": true,
   "enable_gpu": true,
+  "machine_shape": "NvidiaTeslaT4",
   "enable_tpu": false,
   "enable_internet": true,
-  "machine_shape": "NvidiaTeslaT4",
   "dataset_sources": [
     "simbae11/eclipse-chunks-a"
   ],
