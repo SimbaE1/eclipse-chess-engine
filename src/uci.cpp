@@ -42,6 +42,9 @@ SearchInfo  g_search_info;
 // True once the user sets AbThreads explicitly, after which the Threads
 // handler stops auto-deriving the AB-thread count from the total.
 static bool g_ab_threads_explicit = false;
+// How many of OUR own moves the remaining clock is budgeted to cover; the
+// divisor in the soft-time formula. See the allocation block in cmd_go.
+static int  g_move_horizon = 25;
 // Whether the current session is a Chess960 game. Affects move notation:
 // castling moves are output as king-to-rook ("e1h1") instead of king-to-
 // destination ("e1g1"), and parsed accordingly.
@@ -130,8 +133,10 @@ void cmd_uci() {
               << "option name Threads type spin default 4 min 1 max 128\n"
               << "option name Hash type spin default 256 min 1 max 65536\n"
               << "option name MctsHash type spin default 64 min 1 max 65536\n"
+              << "option name MctsTreeMB type spin default 512 min 16 max 65536\n"
               << "option name OverrideMargin type spin default 50 min 0 max 1000\n"
               << "option name AbThreads type spin default 1 min 0 max 128\n"
+              << "option name MoveHorizon type spin default 25 min 10 max 80\n"
               << "option name Cpuct type string default 1.70\n"
               << "option name FpuOffset type string default 0.20\n"
               << "option name PolicyDepth type spin default 2 min -1 max 64\n"
@@ -187,17 +192,27 @@ void cmd_setoption(const std::vector<std::string>& tok) {
         // 6 MCTS, etc. Only applied while the user hasn't set AbThreads
         // explicitly; an explicit AbThreads always wins regardless of order.
         if (!g_ab_threads_explicit)
-            g_search_info.ab_threads = std::max(1, g_search_info.threads / 4);
+            // A quarter of the pool, rounded UP: with Threads 6 the old
+            // truncating divide handed AB a single thread, and any odd core
+            // count silently under-funded the verifier.
+            g_search_info.ab_threads = std::max(1, (g_search_info.threads + 3) / 4);
     } else if (name == "Hash") {
         g_tt.resize(std::atoi(value.c_str()));
     } else if (name == "MctsHash") {
         mcts::g_mcts_tt.resize(static_cast<std::size_t>(std::atoi(value.c_str())));
+    } else if (name == "MctsTreeMB") {
+        // Caps the MCTS node pool. Distinct from MctsHash, which sizes the MCTS
+        // transposition table, not the tree; before this option existed nothing
+        // bounded the tree at all.
+        mcts::set_node_budget_mb(std::atoi(value.c_str()));
     } else if (name == "OverrideMargin") {
         g_search_info.override_margin = std::atoi(value.c_str());
     } else if (name == "AbThreads") {
         const int n = std::atoi(value.c_str());
         g_search_info.ab_threads = std::clamp(n, 0, 128);
         g_ab_threads_explicit = true;  // pin it; stop deriving from Threads
+    } else if (name == "MoveHorizon") {
+        g_move_horizon = std::clamp(std::atoi(value.c_str()), 10, 80);
     } else if (name == "Cpuct") {
         char* end = nullptr;
         const float f = std::strtof(value.c_str(), &end);
@@ -305,7 +320,7 @@ void cmd_go(const std::vector<std::string>& tok) {
     // Time-control parsing keeps wtime/btime/winc/binc and decides how much
     // we may spend based on side_to_move. The /30 + 0.8*inc formula is a
     // placeholder - real time management lands later.
-    int  movestogo = 30;
+    int  movestogo = 0;   // 0 == not supplied (sudden death / increment-only)
     int  wtime = 0, btime = 0, winc = 0, binc = 0;
     bool have_tc = false;
 
@@ -357,29 +372,32 @@ void cmd_go(const std::vector<std::string>& tok) {
         const int    remain = white ? wtime : btime;
         const int    inc    = white ? winc  : binc;
 
-        // MLH-driven time allocation. The Lc0 net's moves-left head estimates
-        // how many half-moves remain in the game; we halve it (we only spend
-        // on every other ply) and use it instead of the static movestogo
-        // divisor. Clamp [5, 60] so a bad MLH prediction can't blow up our
-        // budget - 5 keeps us from burning all time on a sharp tactic, 60
-        // keeps us from starving the next move in a long endgame.
-        const auto root = policy::get_root_info(g_pos);
-        const int  mlh_our_moves = static_cast<int>(root.mlh_plies / 2.0f);
-        // Floor of 40 (was 20, was 8, was 5): never plan to spend more than
-        // ~1/40 of the clock on a routine move. The floor matters when the MLH
-        // head UNDER-predicts how long the game will last: it then reports few
-        // moves remaining, the divisor collapses to the floor, and we budget
-        // that fraction of the clock EVERY move.
+        // Move horizon: how many of OUR moves the remaining clock must cover.
+        //
+        // This used to be driven by the Lc0 moves-left head via
+        // policy::get_root_info(). That head has never been live in a shipped
+        // build: PolicyFile defaults to <empty>, so cmd_setoption returns early,
+        // the ONNX session stays null, and get_root_info() returns its default
+        // 60 plies immediately. mlh_our_moves was therefore ALWAYS 30 and the
+        // clamp pinned the divisor to its floor of 40 on every move of every
+        // game — the "MLH-driven allocation" was inert and what actually shipped
+        // was a fixed /40.
         //
         // The soft budget remain/D + 0.8*inc drives the clock to an equilibrium
-        // of D*0.2*inc, where each move spends exactly the increment and the
-        // clock holds flat. Higher D => smaller per-move spend (faster play) AND
-        // a higher resting clock (more safety). D=8 => 12.5%/move, bled to flag
-        // (2026-06-18 vs SF lvl5). D=20 => ~5%/move, rests at only 60s @ +15s.
-        // D=40 => ~2.5%/move and rests at ~120s @ +15s: noticeably faster moves
-        // and a comfortable cushion, while an accurate (larger) MLH estimate can
-        // still spend a bit more early. Upper clamp 60 caps the richest case.
-        const int  divisor = std::clamp(mlh_our_moves, 40, 60);
+        // at remain = 0.2*D*inc, where each move spends exactly the increment
+        // and the clock holds flat. Higher D => faster moves and a higher
+        // resting clock. D=8 bled to a flag (2026-06-18 vs SF lvl5); D=40 is
+        // safe but leaves roughly a third of a sudden-death clock unspent (over
+        // 40 own moves it uses 1-(39/40)^40 = 64%), which is pure lost depth at
+        // the rapid/classical controls this engine is tuned for. D=25 uses ~80%
+        // over the same 40 moves and still leaves a tail. Exposed as a UCI spin
+        // so SPRT can sweep it without a rebuild.
+        //
+        // `movestogo`, when the GUI supplies it, is not an estimate — it is
+        // exactly how many moves must fit before the next time control, so it
+        // caps the horizon. It was parsed and then thrown away before.
+        int divisor = std::clamp(g_move_horizon, 10, 80);
+        if (movestogo > 0) divisor = std::min(divisor, movestogo);
 
         limits.time_ms = remain / divisor + inc * 4 / 5;
 
@@ -398,10 +416,23 @@ void cmd_go(const std::vector<std::string>& tok) {
         // sustainable rate, so keep the pure remain/divisor policy. The low-clock
         // equilibrium (clock resting at ~0.2*divisor*inc, spending exactly the
         // increment) sits below this cap, so the no-flag behaviour is unchanged.
+        //
+        // 2026-08-11: the cap is now clock-AWARE rather than flat. A flat
+        // 1.5*inc stops the opening being front-loaded, but it also means a
+        // banked classical clock can never be spent — in 30+20 with 25 minutes
+        // on the board a routine move was still capped at 30 s, so the engine
+        // simply never used the time it had. Cap instead at 1.5*inc plus a share
+        // of the genuinely banked time: the clock ABOVE the equilibrium the soft
+        // budget settles at (0.2*D*inc). Below equilibrium the banked term is
+        // zero and this degrades to exactly the old flat cap, so the low-clock
+        // no-flag behaviour is unchanged.
         constexpr int kEarlySoftIncMultNum = 3;  // 3/2 = 1.5x the increment
         constexpr int kEarlySoftIncMultDen = 2;
         if (inc > 0) {
-            const int early_soft_cap = inc * kEarlySoftIncMultNum / kEarlySoftIncMultDen;
+            const int equilibrium    = divisor * inc / 5;          // 0.2 * D * inc
+            const int banked         = std::max(0, remain - equilibrium);
+            const int early_soft_cap = inc * kEarlySoftIncMultNum / kEarlySoftIncMultDen
+                                     + banked / divisor;
             if (limits.time_ms > early_soft_cap) limits.time_ms = early_soft_cap;
         }
 
@@ -501,6 +532,9 @@ void loop() {
     // still wins -- both loaders just overwrite whatever loaded here.
     nnue::load(kDefaultEvalFile);
     syzygy::init(kDefaultSyzygyPath);
+    // Same reasoning: the node pool is unbounded until a budget is set, so a
+    // GUI that never sends MctsTreeMB must still get the advertised default.
+    mcts::set_node_budget_mb(512);
 
     std::string line;
     while (std::getline(std::cin, line)) {
@@ -510,7 +544,7 @@ void loop() {
 
         if      (cmd == "uci")        cmd_uci();
         else if (cmd == "isready")    cmd_isready();
-        else if (cmd == "ucinewgame") { join_search_thread(); g_pos = Position::startpos(); g_tt.clear(); mcts::g_mcts_tt.clear(); }
+        else if (cmd == "ucinewgame") { join_search_thread(); g_pos = Position::startpos(); g_tt.clear(); mcts::g_mcts_tt.clear(); mcts::clear_tree_cache(); }
         else if (cmd == "setoption")  { join_search_thread(); cmd_setoption(tok); }
         else if (cmd == "position")   { join_search_thread(); cmd_position(tok); }
         else if (cmd == "go")         cmd_go(tok);
