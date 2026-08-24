@@ -53,9 +53,16 @@ struct Result {
 // it only for a worker launched at `go ponder` (the parallel verifier); a search
 // started after the hit should leave it null and use the plain start-relative
 // budget.
+// `max_budget_ms`, when greater than `time_budget_ms`, permits a search-driven
+// extension: iterative deepening raises its own budget toward this ceiling
+// whenever a completed depth changes the root move or drops the score, i.e.
+// when the position is still telling us something. 0 (the default) disables it.
+// Pass only time that is genuinely free — the caller must still own the hard
+// deadline.
 Result find_best_move(Position& pos, int max_depth, std::int64_t time_budget_ms,
                       int num_threads = 1, const std::atomic<bool>* stop = nullptr,
-                      const std::atomic<std::int64_t>* ponder_hit_ms = nullptr);
+                      const std::atomic<std::int64_t>* ponder_hit_ms = nullptr,
+                      std::int64_t max_budget_ms = 0);
 
 // Scores one specific move with an iterative-deepening full-window search,
 // from `pos`'s side-to-move perspective (same convention as Result::score).
