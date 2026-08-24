@@ -43,11 +43,23 @@ import numpy as np
 MAGIC               = 0xECCC0003
 VERSION             = 1
 FT_IN_FEATURES      = 45056          # HalfKAv2: 64 * 64 * 11
-FT_OUT              = 2048           # keep in sync with kFtOutSize in src/nnue.hpp
-L1_IN               = 2 * FT_OUT     # 4096 (concat of both perspectives)
+# Layer widths. These are DEFAULTS for `init`; `from-torch` overrides them from
+# the checkpoint's own tensor shapes (see set_dims), so the converter follows the
+# net it is handed instead of silently asserting against a stale architecture.
+# The engine still has to agree: kFtOutSize in src/accumulator.hpp and
+# kL1OutSize / kL2OutSize in src/nnue.hpp must equal what gets written here, or
+# the loader rejects the file with a shape mismatch.
+FT_OUT              = 2048           # keep in sync with kFtOutSize in src/accumulator.hpp
+L1_IN               = 2 * FT_OUT     # concat of both perspectives
 L1_OUT              = 1024
 L2_OUT              = 256
 L3_OUT              = 1
+
+
+def set_dims(ft_out: int, l1_out: int, l2_out: int) -> None:
+    """Point the module's shape checks at a specific architecture."""
+    global FT_OUT, L1_IN, L1_OUT, L2_OUT
+    FT_OUT, L1_IN, L1_OUT, L2_OUT = ft_out, 2 * ft_out, l1_out, l2_out
 
 # Quantization scales - must match the C++ side exactly.
 FT_QUANT            = 127            # FT activation scale (kFtQuant)
@@ -211,12 +223,23 @@ def make_from_torch(state_dict_path: Path):
                            f"available keys: {sorted(sd.keys())}")
         return sd[name].detach().cpu().numpy().astype(np.float32)
 
-    return dict(
+    params = dict(
         ft_w_fp=get("ft.weight"), ft_b_fp=get("ft.bias"),
         l1_w_fp=get("l1.weight"), l1_b_fp=get("l1.bias"),
         l2_w_fp=get("l2.weight"), l2_b_fp=get("l2.bias"),
         l3_w_fp=get("l3.weight"), l3_b_fp=get("l3.bias"),
     )
+    # Take the architecture from the checkpoint rather than from this file's
+    # constants. Re-architecting the net used to mean editing three places in
+    # lockstep (notebook, this script, the C++ headers) and getting an assert
+    # here when you forgot one; now only the C++ side has to be kept honest,
+    # and the loader enforces that at runtime.
+    set_dims(ft_out=params["ft_w_fp"].shape[0],
+             l1_out=params["l1_w_fp"].shape[0],
+             l2_out=params["l2_w_fp"].shape[0])
+    print(f"checkpoint architecture: {FT_IN_FEATURES} -> {FT_OUT}x2 -> "
+          f"{L1_OUT} -> {L2_OUT} -> {L3_OUT}")
+    return params
 
 
 def main():
@@ -234,7 +257,12 @@ def main():
     p_torch = sub.add_parser("from-torch", help="convert a PyTorch state_dict (.pt)")
     p_torch.add_argument("--state-dict", type=Path, required=True)
     p_torch.add_argument("--out", type=Path, required=True)
-    p_torch.add_argument("--output-cp-per-unit", type=float, default=410.0)
+    # Default 300, not 410: it must equal the trainer's `cp_scale`, and the
+    # current pipeline trains on sigmoid(cp/300). Getting this wrong silently
+    # rescales every eval the engine produces.
+    p_torch.add_argument("--output-cp-per-unit", type=float, default=300.0,
+                         help="centipawns per real-unit of L3 output; must match "
+                              "TRAIN_CFG['cp_scale'] used to train the checkpoint.")
 
     args = p.parse_args()
 

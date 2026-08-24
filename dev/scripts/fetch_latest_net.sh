@@ -2,17 +2,23 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Download the latest training checkpoint from Kaggle and pack it into a .nnue.
 #
-# Pulls halfkav2.pt (+ resume_state.pt) from the eclipse-checkpoint dataset,
-# reports which epoch/chunk it is, and converts it to data/eclipse.nnue with
-# output_cp_per_unit=300 -- the scale the current notebook trains at. Passing
-# 300 explicitly matters: convert_halfkav2_nnue.py still defaults to 410, so a
-# bare conversion would miscalibrate every win-prob/MCTS-Q value at load time.
+# Pulls halfkav2.pt (+ resume_state.pt) from the checkpoint dataset, reports
+# which epoch/chunk it is, and converts it to data/eclipse.nnue with
+# output_cp_per_unit=300 -- the scale the current notebook trains at. (That is
+# also convert_halfkav2_nnue.py's default now, but it is passed explicitly here
+# so the scale stays visible: get it wrong and every win-prob/MCTS-Q value is
+# silently miscalibrated at load time.)
 #
-# Auth: set KAGGLE_API_TOKEN in the environment (Bearer token, no kaggle.json
-# needed). The token is intentionally NOT stored in this repo.
+# The layer widths come from the checkpoint itself, so this works for both the
+# deployed 2048x2 net and the 1024x2-16-32 retrain.
 #
-#   export KAGGLE_API_TOKEN=KGAT_xxxxxxxx
+# Auth: set KAGGLE_API_KEY in the environment (Bearer token, no kaggle.json
+# needed). KAGGLE_API_TOKEN is accepted as the older name. The token itself is
+# intentionally NOT stored in this repo.
+#
+#   export KAGGLE_API_KEY=KGAT_xxxxxxxx
 #   scripts/fetch_latest_net.sh                 # -> data/eclipse.nnue (cp=300)
+#   scripts/fetch_latest_net.sh --dataset simbae11/eclipse-checkpoint-sf16
 #   scripts/fetch_latest_net.sh --out data/eclipse_v8.nnue --keep-pt
 set -euo pipefail
 
@@ -32,7 +38,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-: "${KAGGLE_API_TOKEN:?set KAGGLE_API_TOKEN in the environment (see script header)}"
+# The Kaggle CLI reads KAGGLE_API_TOKEN, but the notebook Secret is named
+# KAGGLE_API_KEY; accept either so one exported variable works everywhere.
+export KAGGLE_API_TOKEN="${KAGGLE_API_KEY:-${KAGGLE_API_TOKEN:-}}"
+: "${KAGGLE_API_TOKEN:?set KAGGLE_API_KEY in the environment (see script header)}"
 command -v kaggle >/dev/null || { echo "kaggle CLI not found (pip install kaggle)" >&2; exit 1; }
 
 TMP="$(mktemp -d)"

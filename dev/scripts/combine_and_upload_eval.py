@@ -24,7 +24,9 @@ from pathlib import Path
 
 REPO    = Path(__file__).parent.parent
 DATA    = REPO / "data"
-TOKEN   = os.environ["KAGGLE_API_TOKEN"]
+# KAGGLE_API_KEY is the canonical name (it is what the notebook Secret is
+# called); KAGGLE_API_TOKEN is the older name and still honoured.
+TOKEN   = os.environ.get("KAGGLE_API_KEY") or os.environ["KAGGLE_API_TOKEN"]
 DATASET = "simbae11/eclipse-partial"
 
 COMBINED = DATA / "eval_combined.txt"

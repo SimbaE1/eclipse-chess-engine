@@ -8,9 +8,9 @@
   "enable_gpu": true,
   "enable_tpu": false,
   "enable_internet": true,
+  "machine_shape": "NvidiaTeslaT4",
   "dataset_sources": [
-    "simbae11/eclipse-chunks-a",
-    "simbae11/eclipse-checkpoint"
+    "simbae11/eclipse-chunks-a"
   ],
   "kernel_sources": [],
   "competition_sources": [],
