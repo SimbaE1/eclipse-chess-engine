@@ -35,7 +35,7 @@ Lichess bot.
 
 | Component | What it does |
 |---|---|
-| **NNUE value net** | HalfKAv2 architecture (`45056 → 1024×2 → 512 → 128 → 1`), int8/int16 quantized with an incremental accumulator and AVX-512 / AVX2 / NEON SIMD. This is Eclipse's "judgement." |
+| **NNUE value net** | HalfKAv2 architecture (`45056 → 2048×2 → 1024 → 256 → 1`), int8/int16 quantized with an incremental accumulator and AVX-512 / AVX2 / NEON SIMD. This is Eclipse's "judgement." |
 | **MCTS search** | Multi-threaded PUCT tree search explores the most promising lines — the source of its human-like, plan-oriented play. |
 | **Alpha-beta verifier** | A classical tactical search runs alongside MCTS; when it spots a tactic the tree missed, it corrects the move choice. Neural intuition, tactical safety net. |
 | **Syzygy tablebases** | Optional; when the board is small enough, Eclipse plays endgames perfectly. |

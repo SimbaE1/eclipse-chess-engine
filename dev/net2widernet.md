@@ -1,4 +1,25 @@
-# net2widernet — Kaggle launch runbook
+# net2widernet — Kaggle launch runbook (HISTORICAL)
+
+> ## ⚠️ Superseded — do not follow this to launch a run
+>
+> This documents the **net2widernet** run that produced the currently deployed
+> `2048x2 -> 1024 -> 256 -> 1` net, and it is kept only as a record of that
+> lineage and of the Kaggle mechanics that were verified the hard way (§1, §4
+> and §6 are still accurate about Kaggle itself).
+>
+> The widen turned out to be a mistake worth naming: it is *function-preserving*,
+> so it bought a ~4× slower copy of exactly the same evaluation function
+> (36.5 µs per `nnue::evaluate()`, against 0.2–0.5 µs for comparable engines,
+> with the feature-transformer output only ~1.2% nonzero). The current plan
+> retrains **from scratch** at the Stockfish-modern shape
+> `45056 -> 1024x2 -> 16 -> 32 -> 1`, and the `NET2WIDER` code has been removed
+> from the notebook. **Use `dev/KAGGLE.md` for the live procedure.**
+>
+> Two things below are stale everywhere they appear: the notebook Secret is now
+> named **`KAGGLE_API_KEY`** (`KAGGLE_API_TOKEN` is still accepted as a
+> fallback), and the checkpoint dataset for the retrain is
+> `simbae11/eclipse-checkpoint-sf16` — `simbae11/eclipse-checkpoint` holds the
+> deployed wide net and must not be overwritten.
 
 The exact, verified procedure to push the datasets + notebook to Kaggle and
 kick off the **net2widernet** training run (function-preserving 2× widen of the
@@ -6,10 +27,10 @@ deployed net). Written for the **GPU quota reset (5 PM today)** — everything t
 can be done before the reset is already done; at 5 PM you run **one command**.
 
 > ⚠️ **Never commit the Kaggle token.** This repo is public. The token lives only
-> in your shell as `$KAGGLE_API_TOKEN` (and as a Kaggle *Secret* in the notebook).
+> in your shell as `$KAGGLE_API_KEY` (and as a Kaggle *Secret* in the notebook).
 > Every command below assumes you have exported it first:
 > ```bash
-> export KAGGLE_API_TOKEN=<your KGAT_… token>
+> export KAGGLE_API_KEY=<your KGAT_… token>
 > ```
 
 ---

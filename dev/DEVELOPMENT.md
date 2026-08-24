@@ -156,18 +156,25 @@ One command downloads the newest checkpoint and packs it with the correct
 scale:
 
 ```bash
-export KAGGLE_API_TOKEN=KGAT_xxxxxxxx        # Bearer token, not stored in repo
+export KAGGLE_API_KEY=KGAT_xxxxxxxx          # Bearer token, not stored in repo
 dev/scripts/fetch_latest_net.sh                  # -> data/eclipse.nnue (cp=300), verified
 ```
 
 It reports the checkpoint's epoch/chunk, converts `halfkav2.pt` with
 `--output-cp-per-unit 300`, and verifies the value landed in the file header.
 
-> **⚠ The cp_scale=300 gotcha.** The notebook trains at `cp_scale=300`, but
-> `convert_halfkav2_nnue.py` still **defaults to 410**. A bare conversion bakes
-> 410 into the `.nnue`, and the engine reads that field at load time for every
-> win-prob and MCTS-Q conversion — silently miscalibrating the net. Always pass
-> `--output-cp-per-unit 300` (which `fetch_latest_net.sh` does for you).
+> **The cp_scale field.** The notebook trains at `cp_scale=300`, and
+> `convert_halfkav2_nnue.py from-torch` now defaults to 300 to match (it used to
+> default to 410, which silently miscalibrated every win-prob and MCTS-Q
+> conversion, since the engine reads that field out of the file header at load
+> time). If you ever change `TRAIN_CFG['cp_scale']`, change the converter default
+> with it or pass `--output-cp-per-unit` explicitly.
+>
+> The converter reads the **layer widths** from the checkpoint's own tensor
+> shapes, so it handles both the deployed `2048x2 -> 1024 -> 256` net and the
+> `1024x2 -> 16 -> 32` retrain without a flag. The engine is the half that does
+> *not* adapt — see "Switching the engine to a new architecture" in
+> `dev/KAGGLE.md`.
 
 ### 3. Test the candidate vs the current net
 
