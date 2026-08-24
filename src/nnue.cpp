@@ -33,9 +33,9 @@ namespace {
 //   uint32  magic            (kMagic; bumped to 0xECCC0003 for HalfKAv2)
 //   uint32  version          (kVersion)
 //   uint32  ft_in_features   (must equal kFtNumFeatures = 45056)
-//   uint32  ft_out           (must equal kFtOutSize = 1024, per perspective)
-//   uint32  l1_out           (must equal kL1OutSize = 512)
-//   uint32  l2_out           (must equal kL2OutSize = 128)
+//   uint32  ft_out           (must equal kFtOutSize, per perspective)
+//   uint32  l1_out           (must equal kL1OutSize)
+//   uint32  l2_out           (must equal kL2OutSize)
 //   uint32  l3_out           (must equal kL3OutSize = 1)
 //   float   output_cp_per_unit   - centipawns per real-unit of L3 output;
 //                                  see kOutputCpDivisor explanation below
@@ -424,12 +424,38 @@ namespace {
 // is unaligned; the throughput cost of loadu vs load is zero on Haswell+ when
 // the address actually is aligned, which it usually is once kIn ≥ 32.
 template <int kIn, int kOut>
+inline void affine_clipped_relu_scalar(const std::uint8_t* in,
+                                       const std::int8_t*  w,
+                                       const std::int32_t* b,
+                                       std::uint8_t*       out) noexcept {
+    for (int o = 0; o < kOut; ++o) {
+        std::int32_t sum = b[o];
+        const std::int8_t* wo = w + o * kIn;
+        for (int i = 0; i < kIn; ++i) {
+            sum += static_cast<std::int32_t>(wo[i]) * static_cast<std::int32_t>(in[i]);
+        }
+        sum >>= kWeightShift;
+        if (sum < 0)         sum = 0;
+        if (sum > kFtQuant)  sum = kFtQuant;
+        out[o] = static_cast<std::uint8_t>(sum);
+    }
+}
+
+// Each SIMD path below needs kIn to be a whole number of vectors. Stockfish-shape
+// nets put a very narrow L2/L3 after the FT (e.g. 16 -> 32 -> 1), where kIn is
+// smaller than one AVX-512 vector and there is nothing to vectorise anyway. Rather
+// than static_assert those shapes out of existence, dispatch them to the scalar
+// core: the layer is a few hundred multiply-adds and never shows up in a profile.
+template <int kIn, int kOut>
 void affine_clipped_relu(const std::uint8_t* in,
                          const std::int8_t*  w,        // [kOut, kIn]
                          const std::int32_t* b,        // [kOut]
                          std::uint8_t*       out) noexcept {
 #if defined(__AVX512BW__) && !defined(ECLIPSE_NO_AVX512)
-    static_assert(kIn % 64 == 0, "AVX512 affine_clipped_relu: kIn must be a multiple of 64");
+    if constexpr (kIn % 64 != 0) {
+        affine_clipped_relu_scalar<kIn, kOut>(in, w, b, out);
+        return;
+    } else {
     const __m512i ones16 = _mm512_set1_epi16(1);
     for (int o = 0; o < kOut; ++o) {
         const std::int8_t* wo = w + o * kIn;
@@ -446,8 +472,12 @@ void affine_clipped_relu(const std::uint8_t* in,
         if (sum > kFtQuant)  sum = kFtQuant;
         out[o] = static_cast<std::uint8_t>(sum);
     }
+    }
 #elif defined(__AVX2__)
-    static_assert(kIn % 32 == 0, "AVX2 affine_clipped_relu: kIn must be a multiple of 32");
+    if constexpr (kIn % 32 != 0) {
+        affine_clipped_relu_scalar<kIn, kOut>(in, w, b, out);
+        return;
+    } else {
     const __m256i ones16 = _mm256_set1_epi16(1);
     for (int o = 0; o < kOut; ++o) {
         const std::int8_t* wo = w + o * kIn;
@@ -476,39 +506,49 @@ void affine_clipped_relu(const std::uint8_t* in,
         if (sum > kFtQuant)  sum = kFtQuant;
         out[o] = static_cast<std::uint8_t>(sum);
     }
+    }
 #elif defined(__ARM_NEON)
-    static_assert(kIn % 16 == 0, "NEON affine_clipped_relu: kIn must be a multiple of 16");
+    if constexpr (kIn % 32 != 0) {
+        affine_clipped_relu_scalar<kIn, kOut>(in, w, b, out);
+        return;
+    } else {
     for (int o = 0; o < kOut; ++o) {
         const std::int8_t* wo = w + o * kIn;
-        int32x4_t acc = vdupq_n_s32(0);
-        for (int i = 0; i < kIn; i += 16) {
-            // 16 uint8 → 16 int16 (in fits in int8 since values ≤ 127), then
-            // signed multiply-accumulate against int8 weights via widening.
-            const int8x16_t x = vreinterpretq_s8_u8(vld1q_u8(in + i));
-            const int8x16_t y = vld1q_s8(wo + i);
-            const int16x8_t lo = vmull_s8(vget_low_s8(x),  vget_low_s8(y));   // 8× i16
-            const int16x8_t hi = vmull_s8(vget_high_s8(x), vget_high_s8(y));  // 8× i16
-            acc = vpadalq_s16(acc, lo);
-            acc = vpadalq_s16(acc, hi);
+        // Two independent accumulators: the widening chain below is
+        // latency-bound, not throughput-bound, and a single acc serialises the
+        // whole row on one dependency chain.
+        int32x4_t acc0 = vdupq_n_s32(0);
+        int32x4_t acc1 = vdupq_n_s32(0);
+        for (int i = 0; i < kIn; i += 32) {
+            // Inputs are uint8 in [0, kFtQuant=127], so reinterpreting them as
+            // int8 is exact — every lane is non-negative.
+            const int8x16_t x0 = vreinterpretq_s8_u8(vld1q_u8(in + i));
+            const int8x16_t x1 = vreinterpretq_s8_u8(vld1q_u8(in + i + 16));
+            const int8x16_t y0 = vld1q_s8(wo + i);
+            const int8x16_t y1 = vld1q_s8(wo + i + 16);
+#if defined(__ARM_FEATURE_DOTPROD)
+            // SDOT: 16 int8 products reduced into 4 int32 lanes in ONE
+            // instruction, replacing the 4-instruction vmull/vmull/vpadal/vpadal
+            // sequence below. Available on every ARMv8.2+ core (Apple M-series,
+            // Neoverse, recent Cortex-A); -march=native enables it.
+            acc0 = vdotq_s32(acc0, x0, y0);
+            acc1 = vdotq_s32(acc1, x1, y1);
+#else
+            acc0 = vpadalq_s16(acc0, vmull_s8(vget_low_s8(x0),  vget_low_s8(y0)));
+            acc0 = vpadalq_s16(acc0, vmull_s8(vget_high_s8(x0), vget_high_s8(y0)));
+            acc1 = vpadalq_s16(acc1, vmull_s8(vget_low_s8(x1),  vget_low_s8(y1)));
+            acc1 = vpadalq_s16(acc1, vmull_s8(vget_high_s8(x1), vget_high_s8(y1)));
+#endif
         }
-        std::int32_t sum = b[o] + vaddvq_s32(acc);
+        std::int32_t sum = b[o] + vaddvq_s32(vaddq_s32(acc0, acc1));
         sum >>= kWeightShift;
         if (sum < 0)         sum = 0;
         if (sum > kFtQuant)  sum = kFtQuant;
         out[o] = static_cast<std::uint8_t>(sum);
+    }
     }
 #else
-    for (int o = 0; o < kOut; ++o) {
-        std::int32_t sum = b[o];
-        const std::int8_t* wo = w + o * kIn;
-        for (int i = 0; i < kIn; ++i) {
-            sum += static_cast<std::int32_t>(wo[i]) * static_cast<std::int32_t>(in[i]);
-        }
-        sum >>= kWeightShift;
-        if (sum < 0)         sum = 0;
-        if (sum > kFtQuant)  sum = kFtQuant;
-        out[o] = static_cast<std::uint8_t>(sum);
-    }
+    affine_clipped_relu_scalar<kIn, kOut>(in, w, b, out);
 #endif
 }
 
@@ -525,7 +565,9 @@ void affine_clipped_relu_sparse(const std::uint8_t* in,
                                 const std::int32_t* b,
                                 std::uint8_t*       out) noexcept {
 #if defined(__AVX2__)
-    static_assert(kOut % 32 == 0, "sparse affine: kOut must be a multiple of 32");
+    // 16, not 32: a Stockfish-shape net puts a very narrow layer straight after
+    // the FT (kOut = 16), and that shape must still compile on x86.
+    static_assert(kOut % 16 == 0, "sparse affine: kOut must be a multiple of 16");
     static_assert(kIn  % 32 == 0, "sparse affine: kIn must be a multiple of 32");
 
     alignas(64) std::int32_t acc[kOut];
@@ -544,25 +586,65 @@ void affine_clipped_relu_sparse(const std::uint8_t* in,
             mask &= mask - 1;
             const __m256i vv = _mm256_set1_epi32(in[i]);
             const std::int8_t* wc = w_col + static_cast<std::size_t>(i) * kOut;
-            for (int o = 0; o < kOut; o += 32) {
-                const __m256i w8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(wc + o));
-                const __m128i lo = _mm256_castsi256_si128(w8);
-                const __m128i hi = _mm256_extracti128_si256(w8, 1);
-                const __m256i w0 = _mm256_cvtepi8_epi32(lo);
-                const __m256i w1 = _mm256_cvtepi8_epi32(_mm_srli_si128(lo, 8));
-                const __m256i w2 = _mm256_cvtepi8_epi32(hi);
-                const __m256i w3 = _mm256_cvtepi8_epi32(_mm_srli_si128(hi, 8));
+            for (int o = 0; o < kOut; o += 16) {
+                const __m128i w8 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(wc + o));
+                const __m256i w0 = _mm256_cvtepi8_epi32(w8);
+                const __m256i w1 = _mm256_cvtepi8_epi32(_mm_srli_si128(w8, 8));
                 __m256i* ap = reinterpret_cast<__m256i*>(acc + o);
                 _mm256_store_si256(ap + 0, _mm256_add_epi32(_mm256_load_si256(ap + 0), _mm256_mullo_epi32(w0, vv)));
                 _mm256_store_si256(ap + 1, _mm256_add_epi32(_mm256_load_si256(ap + 1), _mm256_mullo_epi32(w1, vv)));
-                _mm256_store_si256(ap + 2, _mm256_add_epi32(_mm256_load_si256(ap + 2), _mm256_mullo_epi32(w2, vv)));
-                _mm256_store_si256(ap + 3, _mm256_add_epi32(_mm256_load_si256(ap + 3), _mm256_mullo_epi32(w3, vv)));
             }
         }
     }
 
     // Post-shift and clamp to uint8 [0, kFtQuant]. Only kOut elements, dwarfed
     // by the sparse accumulation above, so kept scalar for obvious correctness.
+    for (int o = 0; o < kOut; ++o) {
+        std::int32_t s = acc[o] >> kWeightShift;
+        if (s < 0)        s = 0;
+        if (s > kFtQuant) s = kFtQuant;
+        out[o] = static_cast<std::uint8_t>(s);
+    }
+#elif defined(__ARM_NEON)
+    static_assert(kOut % 16 == 0, "NEON sparse affine: kOut must be a multiple of 16");
+    static_assert(kIn  % 8  == 0, "NEON sparse affine: kIn must be a multiple of 8");
+
+    alignas(64) std::int32_t acc[kOut];
+    for (int o = 0; o < kOut; ++o) acc[o] = b[o];
+
+    // Nonzero scan. NEON has no movemask, so instead of testing 4096 bytes one
+    // at a time (what the old scalar fallback did, and it ran on every eval on
+    // ARM), read the activations 8 bytes at a time as a uint64 and skip whole
+    // words at once. At the ~1-2% density these nets show, almost every word is
+    // zero and costs a single load-and-branch; a nonzero word is walked with
+    // ctz. `in` is alignas(64) at every call site, so the aliasing load is
+    // aligned.
+    const auto* in64 = reinterpret_cast<const std::uint64_t*>(in);
+    for (int blk = 0; blk < kIn / 8; ++blk) {
+        std::uint64_t bits = in64[blk];
+        while (bits) {
+            const int lane = __builtin_ctzll(bits) / 8;   // index of lowest nonzero byte
+            bits &= ~(0xFFULL << (lane * 8));
+            const int i = blk * 8 + lane;
+
+            const int32x4_t vv = vdupq_n_s32(in[i]);
+            const std::int8_t* wc = w_col + static_cast<std::size_t>(i) * kOut;
+            for (int o = 0; o < kOut; o += 16) {
+                const int8x16_t w8  = vld1q_s8(wc + o);
+                const int16x8_t wlo = vmovl_s8(vget_low_s8(w8));
+                const int16x8_t whi = vmovl_s8(vget_high_s8(w8));
+                vst1q_s32(acc + o + 0,
+                          vmlaq_s32(vld1q_s32(acc + o + 0),  vmovl_s16(vget_low_s16(wlo)),  vv));
+                vst1q_s32(acc + o + 4,
+                          vmlaq_s32(vld1q_s32(acc + o + 4),  vmovl_s16(vget_high_s16(wlo)), vv));
+                vst1q_s32(acc + o + 8,
+                          vmlaq_s32(vld1q_s32(acc + o + 8),  vmovl_s16(vget_low_s16(whi)),  vv));
+                vst1q_s32(acc + o + 12,
+                          vmlaq_s32(vld1q_s32(acc + o + 12), vmovl_s16(vget_high_s16(whi)), vv));
+            }
+        }
+    }
+
     for (int o = 0; o < kOut; ++o) {
         std::int32_t s = acc[o] >> kWeightShift;
         if (s < 0)        s = 0;
@@ -595,6 +677,14 @@ void affine_clipped_relu_batch(const std::uint8_t* in,
                                const std::int32_t* b,
                                std::uint8_t*       out,
                                int                 batch_size) noexcept {
+    // A Stockfish-shape net's L2 has kIn = 16, narrower than one AVX-512 vector
+    // and not a whole AVX2 vector either. Nothing to gain from the reuse trick at
+    // that size, so hand those shapes to the single-element path.
+    if constexpr (kIn % 64 != 0) {
+        for (int e = 0; e < batch_size; ++e)
+            affine_clipped_relu<kIn, kOut>(in + e * kIn, w, b, out + e * kOut);
+        return;
+    } else {
     const __m256i ones16 = _mm256_set1_epi16(1);
 
     auto hsum = [](const __m256i& acc) -> std::int32_t {
@@ -708,8 +798,140 @@ void affine_clipped_relu_batch(const std::uint8_t* in,
             affine_clipped_relu<kIn, 1>(in + b_idx * kIn, wo, b + o, out + b_idx * kOut + o);
         }
     }
+    }
+}
+#elif defined(__ARM_NEON)
+// NEON batched affine. Same idea as the AVX2 version above and same reason it
+// exists: the weight row (kIn bytes) streams from L2 while the activations stay
+// hot in L1d, so reusing each loaded weight vector across several batch
+// elements is what makes batching worth anything. Without this, ARM fell
+// through to a per-element affine_clipped_relu and evaluate_batch was measurably
+// NO faster than calling evaluate() in a loop (36.8 us at batch 1 vs 37.2 us at
+// batch 16) — the batch API existed but bought nothing on this platform.
+template <int kIn, int kOut>
+void affine_clipped_relu_batch(const std::uint8_t* in,
+                               const std::int8_t*  w,
+                               const std::int32_t* b,
+                               std::uint8_t*       out,
+                               int                 batch_size) noexcept {
+    // See the AVX2 note: narrow Stockfish-shape L2 layers fall through to the
+    // single-element path rather than being static_asserted out.
+    if constexpr (kIn % 16 != 0) {
+        for (int e = 0; e < batch_size; ++e)
+            affine_clipped_relu<kIn, kOut>(in + e * kIn, w, b, out + e * kOut);
+        return;
+    } else {
+
+    for (int o = 0; o < kOut; ++o) {
+        const std::int8_t* wo = w + o * kIn;
+
+        auto finalize = [&](int batch_offset, int32x4_t acc) {
+            std::int32_t sum = b[o] + vaddvq_s32(acc);
+            sum >>= kWeightShift;
+            if (sum < 0)        sum = 0;
+            if (sum > kFtQuant) sum = kFtQuant;
+            out[batch_offset * kOut + o] = static_cast<std::uint8_t>(sum);
+        };
+
+        // 4 batch elements per loaded weight vector: 4 accumulators + 4 inputs
+        // + 1 weight vector = 9 of NEON's 32 v-registers, leaving the compiler
+        // room to software-pipeline the loads.
+        int b_idx = 0;
+        for (; b_idx <= batch_size - 4; b_idx += 4) {
+            int32x4_t a0 = vdupq_n_s32(0), a1 = vdupq_n_s32(0);
+            int32x4_t a2 = vdupq_n_s32(0), a3 = vdupq_n_s32(0);
+            const std::uint8_t* ib = in + b_idx * kIn;
+            for (int i = 0; i < kIn; i += 16) {
+                const int8x16_t wv = vld1q_s8(wo + i);
+                const int8x16_t x0 = vreinterpretq_s8_u8(vld1q_u8(ib + 0 * kIn + i));
+                const int8x16_t x1 = vreinterpretq_s8_u8(vld1q_u8(ib + 1 * kIn + i));
+                const int8x16_t x2 = vreinterpretq_s8_u8(vld1q_u8(ib + 2 * kIn + i));
+                const int8x16_t x3 = vreinterpretq_s8_u8(vld1q_u8(ib + 3 * kIn + i));
+#if defined(__ARM_FEATURE_DOTPROD)
+                a0 = vdotq_s32(a0, x0, wv);
+                a1 = vdotq_s32(a1, x1, wv);
+                a2 = vdotq_s32(a2, x2, wv);
+                a3 = vdotq_s32(a3, x3, wv);
+#else
+                a0 = vpadalq_s16(a0, vmull_s8(vget_low_s8(x0),  vget_low_s8(wv)));
+                a0 = vpadalq_s16(a0, vmull_s8(vget_high_s8(x0), vget_high_s8(wv)));
+                a1 = vpadalq_s16(a1, vmull_s8(vget_low_s8(x1),  vget_low_s8(wv)));
+                a1 = vpadalq_s16(a1, vmull_s8(vget_high_s8(x1), vget_high_s8(wv)));
+                a2 = vpadalq_s16(a2, vmull_s8(vget_low_s8(x2),  vget_low_s8(wv)));
+                a2 = vpadalq_s16(a2, vmull_s8(vget_high_s8(x2), vget_high_s8(wv)));
+                a3 = vpadalq_s16(a3, vmull_s8(vget_low_s8(x3),  vget_low_s8(wv)));
+                a3 = vpadalq_s16(a3, vmull_s8(vget_high_s8(x3), vget_high_s8(wv)));
+#endif
+            }
+            finalize(b_idx + 0, a0);
+            finalize(b_idx + 1, a1);
+            finalize(b_idx + 2, a2);
+            finalize(b_idx + 3, a3);
+        }
+
+        // 1-wide remainder.
+        for (; b_idx < batch_size; ++b_idx) {
+            affine_clipped_relu<kIn, 1>(in + b_idx * kIn, wo, b + o, out + b_idx * kOut + o);
+        }
+    }
+    }
 }
 #endif
+
+// FT concat + clipped ReLU: [acc_us, acc_them] -> uint8[kL1InSize].
+//
+// Per int16 lane: clamp into [0, kFtQuant=127] and pack into uint8. Hoisted out
+// of evaluate()/evaluate_batch(), which each carried their own copy of the AVX2
+// version and their own scalar `#else` — so on NEON both ran 4096 branchy
+// scalar clamps per eval, one of the two places ARM was silently paying a
+// several-microsecond tax that x86 was not.
+inline void ft_concat_clip(const Accumulator& acc, std::size_t us, std::size_t them,
+                           std::uint8_t* out) noexcept {
+#if defined(__AVX2__)
+    const __m256i clamp_hi = _mm256_set1_epi16(static_cast<std::int16_t>(kFtQuant));
+    // packus_epi16(a, b) produces lanes [a_lo, b_lo, a_hi, b_hi] in 64-bit
+    // chunks; this permute restores [a_lo, a_hi, b_lo, b_hi] so 32 contiguous
+    // int16 inputs map to 32 contiguous uint8 outputs in their original order.
+    const __m256i perm = _mm256_setr_epi32(0, 1, 4, 5, 2, 3, 6, 7);
+    for (int half = 0; half < 2; ++half) {
+        const std::int16_t* acc_ptr = acc.v[(half == 0) ? us : them].data();
+        std::uint8_t*       out_ptr = out + half * kFtOutSize;
+        for (int i = 0; i < kFtOutSize; i += 32) {
+            __m256i a = _mm256_load_si256(reinterpret_cast<const __m256i*>(acc_ptr + i));
+            __m256i b = _mm256_load_si256(reinterpret_cast<const __m256i*>(acc_ptr + i + 16));
+            a = _mm256_min_epi16(a, clamp_hi);
+            b = _mm256_min_epi16(b, clamp_hi);
+            // packus also saturates negatives to 0, so no explicit max needed.
+            __m256i packed = _mm256_packus_epi16(a, b);
+            packed = _mm256_permutevar8x32_epi32(packed, perm);
+            _mm256_store_si256(reinterpret_cast<__m256i*>(out_ptr + i), packed);
+        }
+    }
+#elif defined(__ARM_NEON)
+    static_assert(kFtOutSize % 16 == 0, "NEON ft_concat_clip: kFtOutSize must be a multiple of 16");
+    const int16x8_t clamp_hi = vdupq_n_s16(static_cast<std::int16_t>(kFtQuant));
+    for (int half = 0; half < 2; ++half) {
+        const std::int16_t* acc_ptr = acc.v[(half == 0) ? us : them].data();
+        std::uint8_t*       out_ptr = out + half * kFtOutSize;
+        for (int i = 0; i < kFtOutSize; i += 16) {
+            // vqmovun_s16 is the NEON analogue of packus: saturating narrow from
+            // signed 16 to unsigned 8, so negatives clamp to 0 for free. The
+            // vminq caps at 127 first (the narrow would otherwise cap at 255).
+            const int16x8_t a = vminq_s16(vld1q_s16(acc_ptr + i),     clamp_hi);
+            const int16x8_t b = vminq_s16(vld1q_s16(acc_ptr + i + 8), clamp_hi);
+            vst1q_u8(out_ptr + i, vcombine_u8(vqmovun_s16(a), vqmovun_s16(b)));
+        }
+    }
+#else
+    for (int i = 0; i < kFtOutSize; ++i) {
+        const std::size_t ui = static_cast<std::size_t>(i);
+        out[ui]              = static_cast<std::uint8_t>(
+            std::clamp<std::int32_t>(acc.v[us][ui],   0, kFtQuant));
+        out[ui + kFtOutSize] = static_cast<std::uint8_t>(
+            std::clamp<std::int32_t>(acc.v[them][ui], 0, kFtQuant));
+    }
+#endif
+}
 
 }  // namespace
 
@@ -734,51 +956,8 @@ Score evaluate(const Position& pos) noexcept {
     const std::size_t us   = (stm == White) ? 0u : 1u;
     const std::size_t them = us ^ 1u;
 
-    // FT concat + clipped ReLU: [acc_us, acc_them] -> uint8[2048].
-    //
-    // Per int16 lane: clamp into [0, kFtQuant=127] and pack into uint8. On
-    // AVX2 packus_epi16 handles both the upper saturation (>127 -> 127) and
-    // the lower (signed negatives -> 0) for free in one instruction per 16
-    // lanes, vs the scalar form which needs branchy clamp+cast per lane.
-    // Called once per evaluate() so it's not the dominant cost, but at 36
-    // NNUE evals per MCTS expansion it adds up.
     alignas(64) std::uint8_t ft_out[kL1InSize];
-#if defined(__AVX2__)
-    {
-        const __m256i clamp_hi = _mm256_set1_epi16(static_cast<std::int16_t>(kFtQuant));
-        // Process 32 int16 lanes (= 32 uint8 outputs) per iteration.
-        // packus_epi16 takes two __m256i of int16, returns __m256i of
-        // uint8 with cross-lane interleaving, so unpack_perm with the
-        // permute below restores [0..15, 16..31] order.
-        // packus_epi16(a, b) produces lanes [a_lo, b_lo, a_hi, b_hi] in
-        // 64-bit chunks. We want [a_lo, a_hi, b_lo, b_hi] so the 32
-        // contiguous int16 input values map to 32 contiguous uint8 outputs
-        // in their original order.
-        const __m256i perm = _mm256_setr_epi32(0, 1, 4, 5, 2, 3, 6, 7);
-        for (int half = 0; half < 2; ++half) {
-            const std::size_t persp = (half == 0) ? us : them;
-            const std::int16_t* acc_ptr = acc.v[persp].data();
-            std::uint8_t*       out_ptr = ft_out + half * kFtOutSize;
-            for (int i = 0; i < kFtOutSize; i += 32) {
-                __m256i a = _mm256_load_si256(reinterpret_cast<const __m256i*>(acc_ptr + i));
-                __m256i b = _mm256_load_si256(reinterpret_cast<const __m256i*>(acc_ptr + i + 16));
-                a = _mm256_min_epi16(a, clamp_hi);
-                b = _mm256_min_epi16(b, clamp_hi);
-                // packus also saturates negatives to 0, so no explicit max needed.
-                __m256i packed = _mm256_packus_epi16(a, b);
-                packed = _mm256_permutevar8x32_epi32(packed, perm);
-                _mm256_store_si256(reinterpret_cast<__m256i*>(out_ptr + i), packed);
-            }
-        }
-    }
-#else
-    for (std::size_t i = 0; i < kFtOutSize; ++i) {
-        const std::int16_t a = acc.v[us][i];
-        const std::int16_t b = acc.v[them][i];
-        ft_out[i]              = static_cast<std::uint8_t>(std::clamp<std::int32_t>(a, 0, kFtQuant));
-        ft_out[i + kFtOutSize] = static_cast<std::uint8_t>(std::clamp<std::int32_t>(b, 0, kFtQuant));
-    }
-#endif
+    ft_concat_clip(acc, us, them, ft_out);
 
     alignas(64) std::uint8_t l1_out[kL1OutSize];
     affine_clipped_relu_sparse<kL1InSize, kL1OutSize>(ft_out, g_l1_w_col.data(), g_l1_b.data(), l1_out);
@@ -821,47 +1000,11 @@ void evaluate_batch(const Accumulator* accs, const Color* stms, Score* scores, i
     assert(batch_size <= kMaxBatch && "NNUE batch exceeds kMaxBatch; increase it or split the batch");
     const int n = std::min(batch_size, kMaxBatch);
 
-    // 1. Feature Transformer (Accumulator -> FT_out). Same packus_epi16
-    //    SIMD as evaluate(), applied per batch element.
-#if defined(__AVX2__)
-    {
-        const __m256i clamp_hi = _mm256_set1_epi16(static_cast<std::int16_t>(kFtQuant));
-        const __m256i perm     = _mm256_setr_epi32(0, 1, 4, 5, 2, 3, 6, 7);
-        for (int b = 0; b < n; ++b) {
-            const Accumulator& acc = accs[b];
-            const Color       stm  = stms[b];
-            const std::size_t us   = (stm == White) ? 0u : 1u;
-            const std::size_t them = us ^ 1u;
-            std::uint8_t* ft_out = &ft_scratch[b * kL1InSize];
-            for (int half = 0; half < 2; ++half) {
-                const std::size_t persp = (half == 0) ? us : them;
-                const std::int16_t* acc_ptr = acc.v[persp].data();
-                std::uint8_t*       out_ptr = ft_out + half * kFtOutSize;
-                for (int i = 0; i < kFtOutSize; i += 32) {
-                    __m256i a = _mm256_load_si256(reinterpret_cast<const __m256i*>(acc_ptr + i));
-                    __m256i e = _mm256_load_si256(reinterpret_cast<const __m256i*>(acc_ptr + i + 16));
-                    a = _mm256_min_epi16(a, clamp_hi);
-                    e = _mm256_min_epi16(e, clamp_hi);
-                    __m256i packed = _mm256_packus_epi16(a, e);
-                    packed = _mm256_permutevar8x32_epi32(packed, perm);
-                    _mm256_store_si256(reinterpret_cast<__m256i*>(out_ptr + i), packed);
-                }
-            }
-        }
-    }
-#else
+    // 1. Feature Transformer (Accumulator -> FT_out), per batch element.
     for (int b = 0; b < n; ++b) {
-        const Accumulator& acc = accs[b];
-        const Color       stm  = stms[b];
-        const std::size_t us   = (stm == White) ? 0u : 1u;
-        const std::size_t them = us ^ 1u;
-        std::uint8_t* ft_out = &ft_scratch[b * kL1InSize];
-        for (std::size_t i = 0; i < kFtOutSize; ++i) {
-            ft_out[i]              = static_cast<std::uint8_t>(std::clamp<std::int32_t>(acc.v[us][i], 0, kFtQuant));
-            ft_out[i + kFtOutSize] = static_cast<std::uint8_t>(std::clamp<std::int32_t>(acc.v[them][i], 0, kFtQuant));
-        }
+        const std::size_t us   = (stms[b] == White) ? 0u : 1u;
+        ft_concat_clip(accs[b], us, us ^ 1u, &ft_scratch[b * kL1InSize]);
     }
-#endif
 
     // 2. Batched L1 Layer (sparse: FT output is ~98% zeros, so the dense dot
     // is wasteful — accumulate input-stationary over the few nonzero inputs).
@@ -871,7 +1014,7 @@ void evaluate_batch(const Accumulator* accs, const Color* stms, Score* scores, i
     }
 
     // 3. Batched L2 Layer
-#if defined(__AVX2__)
+#if defined(__AVX2__) || defined(__ARM_NEON)
     affine_clipped_relu_batch<kL1OutSize, kL2OutSize>(l1_scratch, g_l2_w.data(), g_l2_b.data(), l2_scratch, n);
 #else
     for (int b = 0; b < n; ++b) {
