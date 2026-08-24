@@ -134,6 +134,12 @@ struct SearchCtx {
     // ponder-aware; this makes AB match it). Holds steady_clock-epoch ms.
     const std::atomic<std::int64_t>* ponder_hit_ms = nullptr;
 
+    // Ceiling that id_search may raise `budget_ms` to when the root is still
+    // unsettled (best move flipping, or the score falling). 0 disables the
+    // extension entirely, which is what every caller that has no spare clock
+    // (score_move, find_tactic_node, the reconciliation pass) passes.
+    std::int64_t max_budget_ms = 0;
+
     SearchCtx(Clock::time_point s, std::int64_t b)
         : start(s), budget_ms(b), nodes(0), aborted(false) {}
 
@@ -230,6 +236,26 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
               Move& out_best, SearchCtx& ctx, Move excluded = MoveNone,
               Move prev_move = MoveNone);
 
+// Surface the best-scoring remaining move into slot `i`, on demand.
+//
+// Every move loop below used to fully insertion-sort its list up front, which
+// is O(n^2) in a 30-40 move position and is wasted whenever the node cuts
+// early — and with decent ordering most nodes cut inside the first few moves.
+// Selecting lazily costs one linear scan per move actually searched, so a node
+// that cuts on move 1 pays n comparisons instead of ~n^2/2, and a node that
+// searches everything pays the same total as before.
+inline void pick_next_best(MoveList& moves, std::array<int, 256>& scores, int i) {
+    int best = i;
+    for (int j = i + 1; j < moves.size; ++j) {
+        if (scores[static_cast<std::size_t>(j)] > scores[static_cast<std::size_t>(best)])
+            best = j;
+    }
+    if (best != i) {
+        std::swap(scores[static_cast<std::size_t>(i)], scores[static_cast<std::size_t>(best)]);
+        std::swap(moves [static_cast<std::size_t>(i)], moves [static_cast<std::size_t>(best)]);
+    }
+}
+
 Score qsearch(Position& pos, Score alpha, Score beta, int ply, SearchCtx& ctx) {
     if (ctx.aborted) return 0;
     ++ctx.nodes;
@@ -282,22 +308,18 @@ Score qsearch(Position& pos, Score alpha, Score beta, int ply, SearchCtx& ctx) {
         generate_captures(pos, caps);
     }
 
-    // Sort by MVV-LVA (descending order_score); TT move first.
+    // Score by MVV-LVA (TT move first); the best remaining move is surfaced
+    // lazily by pick_next_best inside the loop below.
     std::array<int, 256> scores{};
     for (int i = 0; i < caps.size; ++i) {
         scores[static_cast<std::size_t>(i)] = (caps[i] == tt_move)
             ? 3'000'000 : order_score(pos, caps[i], ply, ctx);
     }
-    for (int i = 1; i < caps.size; ++i) {
-        for (int j = i; j > 0 && scores[static_cast<std::size_t>(j)] > scores[static_cast<std::size_t>(j - 1)]; --j) {
-            std::swap(scores[static_cast<std::size_t>(j)], scores[static_cast<std::size_t>(j - 1)]);
-            std::swap(caps[static_cast<std::size_t>(j)],   caps[static_cast<std::size_t>(j - 1)]);
-        }
-    }
 
     Score best      = stand_pat;  // -kInfinite when in check: must find a move
     Move  best_move = MoveNone;
     for (int i = 0; i < caps.size; ++i) {
+        pick_next_best(caps, scores, i);
         const Move m = caps[static_cast<std::size_t>(i)];
         if (!in_check) {
             // SEE pruning: skip losing captures.
@@ -485,13 +507,8 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
         std::array<int, 256> pc_scores{};
         for (int i = 0; i < pc_caps.size; ++i)
             pc_scores[static_cast<std::size_t>(i)] = order_score(pos, pc_caps[i], ply, ctx);
-        for (int i = 1; i < pc_caps.size; ++i)
-            for (int j = i; j > 0 && pc_scores[static_cast<std::size_t>(j)] >
-                                      pc_scores[static_cast<std::size_t>(j - 1)]; --j) {
-                std::swap(pc_scores[static_cast<std::size_t>(j)],   pc_scores[static_cast<std::size_t>(j - 1)]);
-                std::swap(pc_caps  [static_cast<std::size_t>(j)],   pc_caps  [static_cast<std::size_t>(j - 1)]);
-            }
         for (int i = 0; i < pc_caps.size && !ctx.aborted; ++i) {
+            pick_next_best(pc_caps, pc_scores, i);
             const Move m = pc_caps[static_cast<std::size_t>(i)];
             if (!see_ge(pos, m, probcut_beta - static_eval)) continue;
             StateInfo st;
@@ -597,12 +614,6 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
         if (moves[idx] == tt_move) scores[idx] = 3'000'000;
         else                       scores[idx] = order_score(pos, moves[idx], ply, ctx, prev_move);
     }
-    for (int i = 1; i < moves.size; ++i) {
-        for (int j = i; j > 0 && scores[static_cast<std::size_t>(j)] > scores[static_cast<std::size_t>(j - 1)]; --j) {
-            std::swap(scores[static_cast<std::size_t>(j)], scores[static_cast<std::size_t>(j - 1)]);
-            std::swap(moves[static_cast<std::size_t>(j)],  moves[static_cast<std::size_t>(j - 1)]);
-        }
-    }
 
     // Track quiet moves searched so we can apply history malus on beta cutoffs.
     std::array<Move, 64> quiets_tried{};
@@ -611,6 +622,7 @@ Score negamax(Position& pos, int depth, Score alpha, Score beta, int ply,
     Score best = -kInfinite;
     Move  best_move = MoveNone;
     for (int i = 0; i < moves.size; ++i) {
+        pick_next_best(moves, scores, i);
         const std::size_t idx = static_cast<std::size_t>(i);
         const Move m = moves[idx];
         if (m == excluded) continue;
@@ -796,10 +808,17 @@ std::vector<Move> extract_pv_from_tt(Position pos, int max_len) {
 // different subtrees instead of duplicating the main line. Best move from each
 // completed depth is preserved even if the next depth aborts, so the caller
 // always sees a sane move.
-static Result id_search(Position& pos, int max_depth, SearchCtx& ctx, int start_depth) {
+static Result id_search(Position& pos, int max_depth, SearchCtx& ctx, int start_depth,
+                        int skip_size = 1, int skip_phase = 0) {
     Result r;
     Score last_score = 0;
+    const std::int64_t base_budget = ctx.budget_ms;
     for (int d = start_depth; d <= max_depth; ++d) {
+        // Lazy-SMP desync: a helper skips the depths its (size, phase) pair
+        // masks off, so it walks a genuinely different depth sequence from
+        // every other helper instead of re-searching the same tree.
+        if (skip_size > 1 && (((d + skip_phase) / skip_size) % 2) != 0) continue;
+
         Move best_at_d;
         Score s;
 
@@ -813,7 +832,7 @@ static Result id_search(Position& pos, int max_depth, SearchCtx& ctx, int start_
             // high, widen exponentially (50→200→800→full) so we recover from
             // a real eval shift in 2-3 re-searches rather than 8+ linear
             // ones.
-            Score delta = 50;
+            Score delta = 15;
             Score alpha = std::max(-kInfinite, last_score - delta);
             Score beta  = std::min( kInfinite, last_score + delta);
             while (true) {
@@ -827,6 +846,23 @@ static Result id_search(Position& pos, int max_depth, SearchCtx& ctx, int start_
         }
 
         if (ctx.aborted) break;
+
+        // Search-driven time extension. A depth that changes the root move, or
+        // that drops the score, is a depth that has just told us the previous
+        // answer was wrong — and the next one is disproportionately likely to
+        // move it again. Spending a fixed slice of the clock on every move
+        // regardless of whether the root is settled is the single largest
+        // avoidable loss in a long time control: quiet positions get time they
+        // cannot use, and the one critical position per game gets the same
+        // amount as the rest. Each unsettled iteration buys another half of the
+        // base budget, clamped to whatever the caller says is genuinely spare.
+        if (ctx.max_budget_ms > ctx.budget_ms && r.reached_d > 0) {
+            const bool changed = (best_at_d != r.move);
+            const bool falling = (s < last_score - 30);
+            if (changed || falling)
+                ctx.budget_ms = std::min(ctx.max_budget_ms, ctx.budget_ms + base_budget / 2);
+        }
+
         r.move      = best_at_d;
         r.score     = s;
         r.reached_d = d;
@@ -839,7 +875,8 @@ static Result id_search(Position& pos, int max_depth, SearchCtx& ctx, int start_
 
 Result find_best_move(Position& pos, int max_depth, std::int64_t time_budget_ms,
                       int num_threads, const std::atomic<bool>* ext_stop,
-                      const std::atomic<std::int64_t>* ponder_hit_ms) {
+                      const std::atomic<std::int64_t>* ponder_hit_ms,
+                      std::int64_t max_budget_ms) {
     init_search_tables();
     num_threads = std::max(1, num_threads);
     const auto start = Clock::now();
@@ -848,6 +885,7 @@ Result find_best_move(Position& pos, int max_depth, std::int64_t time_budget_ms,
         SearchCtx ctx{start, time_budget_ms};
         ctx.ext_stop = ext_stop;
         ctx.ponder_hit_ms = ponder_hit_ms;
+        ctx.max_budget_ms = max_budget_ms;
         Result r = id_search(pos, max_depth, ctx, 1);
         r.elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             Clock::now() - start).count();
@@ -874,11 +912,29 @@ Result find_best_move(Position& pos, int max_depth, std::int64_t time_budget_ms,
         ctx.stop = &stop;
         ctx.ext_stop = ext_stop;
         ctx.ponder_hit_ms = ponder_hit_ms;
-        // Main (id 0) runs every depth so its depth_scores trajectory is the
-        // clean per-depth sequence the caller's instability check relies on;
-        // helpers start a ply ahead to desync.
-        const int start_depth = (id == 0) ? 1 : (1 + (id % 2));
-        results[static_cast<std::size_t>(id)] = id_search(p, max_depth, ctx, start_depth);
+        ctx.max_budget_ms = max_budget_ms;
+        // Main (id 0) runs every depth, unskipped, so its depth_scores
+        // trajectory is the clean per-depth sequence the caller's instability
+        // check relies on.
+        //
+        // Helpers desync via a skip pattern rather than a start-depth offset.
+        // The old scheme was `start_depth = 1 + (id % 2)`, i.e. only TWO
+        // distinct schedules no matter how many threads ran: 7 helpers searched
+        // 4 copies of one sequence and 3 of another, and every one of them
+        // re-converged onto the same depth ladder after its first iteration.
+        // Measured cost of that redundancy: 3.35x the nodes for +1 depth going
+        // from 1 thread to 7. The (size, phase) pairs below give each helper a
+        // distinct set of depths to skip, so they spread across the ladder and
+        // fill the shared TT with subtrees the main worker has not reached.
+        static constexpr int kSkipSize[20]  = {1, 1, 2, 2, 2, 3, 3, 3, 3, 3,
+                                               3, 3, 3, 3, 3, 3, 3, 3, 3, 3};
+        static constexpr int kSkipPhase[20] = {0, 1, 0, 1, 3, 0, 2, 4, 6, 0,
+                                               2, 4, 6, 8, 10, 12, 14, 16, 18, 20};
+        const int slot       = (id - 1) % 20;
+        const int skip_size  = (id == 0) ? 1 : kSkipSize[slot];
+        const int skip_phase = (id == 0) ? 0 : kSkipPhase[slot];
+        results[static_cast<std::size_t>(id)] = id_search(p, max_depth, ctx, 1,
+                                                          skip_size, skip_phase);
         if (id == 0) stop.store(true, std::memory_order_relaxed);  // main done -> halt helpers
     };
 
@@ -952,7 +1008,7 @@ TacticNode find_tactic_node(Position& pos, int max_depth, std::int64_t time_budg
         if (d <= 4) {
             s = negamax(pos, d, -kInfinite, kInfinite, 0, best_at_d, ctx, MoveNone);
         } else {
-            Score delta = 50;
+            Score delta = 15;
             Score alpha = std::max(-kInfinite, last_score - delta);
             Score beta  = std::min( kInfinite, last_score + delta);
             while (true) {

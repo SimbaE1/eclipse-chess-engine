@@ -20,7 +20,10 @@ namespace eclipse {
 namespace {
 // Depth ceiling on the AB verifier. Pegged high enough that the time
 // budget is the binding constraint in any realistic position.
-constexpr int kAbMaxDepth = 32;
+// Iteration ceiling for every AB entry point. 32 was reachable in a long
+// classical think and silently capped the search; the real bound is the time
+// budget, so keep this above anything the clock can pay for.
+constexpr int kAbMaxDepth = 64;
 
 // Sequential-mode AB budget: only used when Threads=1, so AB runs AFTER
 // MCTS on the same thread. Set to 1/4 of the move so AB gets the same
@@ -347,8 +350,26 @@ Move search(Position& pos, SearchInfo& info) {
         // start-relative budget.
         const std::atomic<std::int64_t>* ab_ponder =
             info.limits.ponder ? &info.ponderhit_at_ms : nullptr;
-        ab_thread = BigThread([&ab_result, &ab_pos, main_phase_time, ab_phase_threads, ab_stop, ab_ponder]() {
-            ab_result = ab::find_best_move(ab_pos, kAbMaxDepth, main_phase_time, ab_phase_threads, ab_stop, ab_ponder);
+
+        // Let AB deepen past its slice when the root is still unsettled (see
+        // ab::find_best_move's max_budget_ms). This is the MCTS-preserving way
+        // to spend a critical position's extra time: MCTS still ends at
+        // main_phase_time and still picks the move, but adjust_root_q() runs
+        // after the join below, so a firmer AB verdict feeds the selector
+        // rather than replacing it. Bounded by half the clock slack and by the
+        // hard deadline less the validation slice, so a delayed join can't eat
+        // the phases that follow. Only when a hard limit exists — with
+        // go infinite / go depth there is no deadline to clamp against.
+        std::int64_t ab_max_budget = 0;
+        if (info.limits.hard_limit_ms > 0) {
+            const std::int64_t ceiling = info.ms_until_hard_deadline() - validation_budget;
+            ab_max_budget = std::min(main_phase_time + info.limits.extra_budget_ms / 2, ceiling);
+            if (ab_max_budget <= main_phase_time) ab_max_budget = 0;
+        }
+        ab_thread = BigThread([&ab_result, &ab_pos, main_phase_time, ab_phase_threads, ab_stop,
+                               ab_ponder, ab_max_budget]() {
+            ab_result = ab::find_best_move(ab_pos, kAbMaxDepth, main_phase_time, ab_phase_threads,
+                                           ab_stop, ab_ponder, ab_max_budget);
         });
     } else if (total_time_ms > 0 && info.ab_threads > 0) {
         // Sequential mode: reserve 1/4 of the move for the post-MCTS AB run
