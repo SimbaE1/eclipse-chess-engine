@@ -36,3 +36,6 @@ data/*
 data/books/
 !data/blindspot_g10.epd
 dev/sprt_runs/
+
+# SPRT baseline worktrees built by dev/scripts/sprt_queue.sh
+.sprt-work/
