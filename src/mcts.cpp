@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <iomanip>
 #include <iostream>
 #include <thread>
@@ -19,6 +20,26 @@
 #include "thread_util.hpp"
 
 namespace eclipse::mcts {
+
+// Centipawns -> Q. The single definition of the mapping between the engine's
+// two score spaces; every seeding path must go through it. tanh is what keeps
+// Q inside [-1, 1] for decisive scores -- a plain divide does not, and a Q
+// outside that range corrupts both the PUCT comparison at the seeded node and
+// the running average of every ancestor it backs up through.
+float cp_to_q(Score s) noexcept {
+    return std::tanh(static_cast<float>(s) / nnue::output_cp_per_unit());
+}
+
+// Q -> centipawns, for UCI reporting. Without this inverse, scores are printed
+// in compressed space and saturate at output_cp_per_unit (300cp), so a totally
+// won position reports +3.00 forever and resign/draw adjudication in a match
+// harness never fires. atanh diverges at |q| = 1, so clamp just inside it and
+// let genuinely saturated evaluations report a large-but-finite score.
+Score q_to_cp(float q) noexcept {
+    constexpr float kMaxQ = 0.999999f;   // atanh(0.999999) ~= 7.25 -> ~2175cp
+    return static_cast<Score>(nnue::output_cp_per_unit() *
+                              std::atanh(std::clamp(q, -kMaxQ, kMaxQ)));
+}
 
 // ---------------------------------------------------------------------------
 // Node pool
@@ -49,6 +70,7 @@ public:
     Node* alloc() {
         Mag& mag = magazine();
         if (mag.count == 0) refill(mag);
+        live_.fetch_add(1, std::memory_order_relaxed);
         return mag.slots[--mag.count];
     }
 
@@ -63,6 +85,7 @@ public:
     // global free list in one O(1) locked operation per kMagBatch nodes,
     // matching alloc()'s refill() granularity.
     void free(Node* n) noexcept {
+        live_.fetch_sub(1, std::memory_order_relaxed);
         FreeMag& fm = free_magazine();
         next_of(n) = fm.head;
         fm.head = n;
@@ -159,11 +182,35 @@ private:
         void* raw = ::operator new(kSlab * sizeof(Node),
                                    std::align_val_t{alignof(Node)});
         slabs_.push_back(raw);
+        reserved_bytes_.fetch_add(kSlab * sizeof(Node), std::memory_order_relaxed);
         slab_base_ = static_cast<std::byte*>(raw);
         slab_used_ = 0;
     }
 
 public:
+    // Budget, in live nodes. Checked by the expansion path, not by alloc():
+    // refusing an allocation mid-expansion would leave a node with a partial
+    // children vector, whereas declining to expand at all just leaves a normal
+    // unexpanded leaf that the search keeps revisiting and re-evaluating.
+    //
+    // The counter is `live_`, not the slab high-water mark, deliberately. Slabs
+    // are never returned to the OS, so a high-water test would latch: once a
+    // long search touched the cap, every later search would refuse to expand
+    // even though teardown had recycled the whole tree onto the free list.
+    void set_budget_nodes(std::size_t n) noexcept {
+        limit_.store(n, std::memory_order_relaxed);
+    }
+    bool at_capacity() const noexcept {
+        return live_.load(std::memory_order_relaxed) >=
+               limit_.load(std::memory_order_relaxed);
+    }
+    std::size_t live() const noexcept {
+        return live_.load(std::memory_order_relaxed);
+    }
+    std::size_t reserved_bytes() const noexcept {
+        return reserved_bytes_.load(std::memory_order_relaxed);
+    }
+
     static NodePool& instance() {
         // Deliberately leaked: thread_local magazine destructors can run during
         // process-exit static teardown and call drain() on the pool. A normal
@@ -180,6 +227,10 @@ private:
     std::byte*          slab_base_ = nullptr;     // current bump slab
     std::size_t         slab_used_ = kSlab;       // forces a slab alloc on first use
     std::vector<void*>  slabs_;  // owned raw storage; freed at process exit
+
+    std::atomic<std::size_t> live_{0};
+    std::atomic<std::size_t> reserved_bytes_{0};
+    std::atomic<std::size_t> limit_{~std::size_t{0}};  // set by set_node_budget_mb
 };
 
 }  // namespace
@@ -194,6 +245,25 @@ void NodeDeleter::operator()(Node* n) const noexcept {
     n->~Node();
     NodePool::instance().free(n);
 }
+
+namespace {
+int g_node_budget_mb = 512;   // see set_node_budget_mb / the UCI MctsTreeMB option
+}
+
+void set_node_budget_mb(int mb) {
+    if (mb < 1) mb = 1;
+    g_node_budget_mb = mb;
+    NodePool::instance().set_budget_nodes(
+        (static_cast<std::size_t>(mb) * 1024u * 1024u) / sizeof(Node));
+}
+
+int         node_budget_mb()               { return g_node_budget_mb; }
+bool        node_pool_at_capacity() noexcept { return NodePool::instance().at_capacity(); }
+std::size_t node_pool_live() noexcept        { return NodePool::instance().live(); }
+std::size_t node_pool_reserved_bytes() noexcept {
+    return NodePool::instance().reserved_bytes();
+}
+std::size_t node_size_bytes() noexcept       { return sizeof(Node); }
 
 // ---------------------------------------------------------------------------
 // MCTSTable implementation
@@ -275,6 +345,16 @@ inline constexpr int kMaxPathLen   = 256;
 // try_find_subtree(). Guarded by single-threaded UCI dispatch.
 static NodePtr                   s_cached_root;
 static std::unique_ptr<Position> s_cached_pos;
+
+// Drop the carried-over tree at `ucinewgame`. try_find_subtree() would reject
+// it anyway (the key won't match a fresh game's root), but until it was dropped
+// the whole previous game's tree stayed live in the pool across the boundary --
+// so in a match every game started already holding the last game's high-water
+// mark. Freeing here returns those nodes to the free list for reuse.
+void clear_tree_cache() {
+    s_cached_root.reset();
+    s_cached_pos.reset();
+}
 
 // Walk the cached tree up to 2 plies to find the subtree rooted at `target`.
 // Returns the matching node (with parent nulled) or nullptr.
@@ -500,9 +580,17 @@ void MCTS::adjust_root_q(Move m, Score s) {
     for (auto& child : root->children) {
         if (child->move == m) {
             // Convert centipawns back to Q-value [-1, 1].
-            // Score s is from our perspective. Child Q is from opponent's.
-            // So we want child Q to be -s / 400.
-            const float target_q = -static_cast<float>(s) / nnue::output_cp_per_unit();
+            // Score s is from our perspective. Child Q is from opponent's,
+            // hence the negation.
+            //
+            // This must use the same tanh mapping as every other cp->Q site
+            // (evaluate_node here, seed_q in ab.cpp). A raw divide is unbounded:
+            // a decisive AB score seeds |Q| >> 1, which then backs up into every
+            // ancestor and swamps the PUCT comparison against siblings. That bug
+            // shipped -- the 2026-08-10 match printed +10.04 and +3.88 at the
+            // root, both reverting a move later as the inflated W washed out
+            // under further visits.
+            const float target_q = -cp_to_q(s);
             const auto n = child->N.load(std::memory_order_relaxed);
             if (n > 0) {
                 // Adjust W such that W/N = target_q
@@ -545,7 +633,7 @@ Move MCTS::get_best_move() {
         }
     }
     if (best_child) {
-        search_info.best_score = static_cast<Score>(-best_child->Q() * nnue::output_cp_per_unit());
+        search_info.best_score = q_to_cp(-best_child->Q());
         log_search_summary(*best_child, best_child->N.load(std::memory_order_relaxed));
         return best_child->move;
     }
@@ -632,7 +720,7 @@ void MCTS::worker_loop() {
                               << " nodes " << seen
                               << " nps "  << (seen * 1000 / elapsed_ms)
                               << " time " << elapsed_ms
-                              << " score cp " << static_cast<int>(-snap.slots[0].q * nnue::output_cp_per_unit())
+                              << " score cp " << q_to_cp(-snap.slots[0].q)
                               << " pv "   << snap.slots[0].m.to_uci()
                               << std::endl;
                     // Diagnostic line: top-3 root children with N / Q / prior.
@@ -646,6 +734,17 @@ void MCTS::worker_loop() {
                                   << " P=" << std::fixed << std::setprecision(3) << e.p;
                     }
                     std::cout << std::endl;
+
+                    // Tree memory. Without this the pool was invisible: the
+                    // only advertised memory knobs are Hash and MctsHash, and
+                    // neither one sizes the node pool.
+                    const auto live = node_pool_live();
+                    std::cout << "info string tree: " << live << " nodes, "
+                              << ((live * node_size_bytes()) >> 20) << " MiB live, "
+                              << (node_pool_reserved_bytes() >> 20) << " MiB reserved, "
+                              << "budget " << node_budget_mb() << " MiB"
+                              << (node_pool_at_capacity() ? " [AT CAPACITY]" : "")
+                              << std::endl;
                 }
             }
         }
@@ -772,7 +871,8 @@ int MCTS::iterate_batch(int batch_size) {
         } else {
             {
                 std::unique_lock<Spinlock> lock(node->expand_mutex);
-                if (!node->is_expanded.load(std::memory_order_acquire) && !node->is_terminal) {
+                if (!node->is_expanded.load(std::memory_order_acquire) &&
+                    !node->is_terminal && !node_pool_at_capacity()) {
                     // depth of the leaf being expanded: root is path index 0.
                     expand_under_lock(node, pos, path_len - 1);
                 }
@@ -822,7 +922,7 @@ int MCTS::iterate_batch(int batch_size) {
         float value;
         if (leaf.needs_eval) {
             const Score s = batch_scores[static_cast<std::size_t>(leaf.eval_idx)];
-            value = std::tanh(static_cast<float>(s) / nnue::output_cp_per_unit());
+            value = cp_to_q(s);
         } else {
             value = leaf.value;
         }
@@ -1040,7 +1140,7 @@ void MCTS::expand_under_lock(Node* node, Position& pos, int depth) {
 
 float MCTS::evaluate_node(const Position& pos) {
     const Score s = evaluate(pos);
-    return std::tanh(static_cast<float>(s) / nnue::output_cp_per_unit());
+    return cp_to_q(s);
 }
 
 }  // namespace eclipse::mcts

@@ -90,6 +90,22 @@ using NodePtr = std::unique_ptr<Node, NodeDeleter>;
 // Construct a pooled Node. Drop-in replacement for std::make_unique<Node>.
 NodePtr make_node(Move m, Node* parent, float prior) noexcept;
 
+// ---- Node-pool budget -----------------------------------------------------
+// Nothing else bounds MCTS memory: `Hash` sizes the AB TT and `MctsHash` sizes
+// the MCTS TT, but the tree itself just grows for as long as the search has
+// time, and slab storage is never handed back to the OS. Over a long game the
+// high-water mark accumulates -- a 600+15 game was observed at 3.07 GB RSS
+// against a 320 MB configured budget, on a 16 GB machine running two engines.
+// The budget below caps live nodes; expansion stops (the search keeps refining
+// the tree it has) once the cap is hit, so RSS plateaus instead of climbing.
+void        clear_tree_cache();   // drop the cross-move tree carried at ucinewgame
+void        set_node_budget_mb(int mb);
+int         node_budget_mb();
+bool        node_pool_at_capacity() noexcept;
+std::size_t node_pool_live() noexcept;        // nodes currently allocated
+std::size_t node_pool_reserved_bytes() noexcept;  // slab bytes held from the OS
+std::size_t node_size_bytes() noexcept;
+
 // One-byte spinlock used to serialize node expansion. Replaces a per-Node
 // std::mutex (64 B on macOS) — every Node carries one, so shrinking it to a
 // single byte nearly halves Node's footprint and packs the hot fields (N/W/P
