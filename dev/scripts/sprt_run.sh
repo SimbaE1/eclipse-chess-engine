@@ -50,7 +50,18 @@ CONC=4
 THREADS=1
 ABTHREADS=1
 NNUE="$REPO/data/eclipse.nnue"
-BOOK="$REPO/data/books/UHO_Lichess_4852_v1.epd"
+# Overridable, and falls back to whatever book this checkout actually has.
+# The hardcoded UHO_Lichess_4852_v1.epd is not in the repo and is not on the
+# dev box; every run had to be launched with the name edited in by hand or it
+# died at the `-f "$BOOK"` guard below before playing a game.
+BOOK="${BOOK:-}"
+if [[ -z "$BOOK" ]]; then
+    for cand in "$REPO/data/books/UHO_Lichess_4852_v1.epd" \
+                "$REPO/data/books/UHO_4060_v2.epd"; do
+        [[ -f "$cand" ]] && { BOOK="$cand"; break; }
+    done
+    BOOK="${BOOK:-$REPO/data/books/UHO_Lichess_4852_v1.epd}"
+fi
 # Overridable: the deployment box does not necessarily keep tablebases where the
 # dev iMac does, and a wrong path silently drops Syzygy adjudication (the
 # ADJUDICATE array below strips those two entries when the directory is absent)
@@ -195,6 +206,7 @@ OLD_OPTS=($OLD_EXTRA)
 echo "SPRT: $NEW vs $OLD"
 echo "  tc=$TC elo0=$ELO0 elo1=$ELO1 max_games=$MAXGAMES conc=$CONC"
 echo "  threads=$THREADS abthreads=$ABTHREADS treemb=$TREEMB"
+echo "  book=$BOOK"
 [[ -n "$NEW_EXTRA" ]] && echo "  new-only: $NEW_EXTRA"
 [[ -n "$OLD_EXTRA" ]] && echo "  old-only: $OLD_EXTRA"
 echo "  out=$OUT"
