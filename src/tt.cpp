@@ -37,8 +37,9 @@ constexpr int kClusterSize = 4;
 //   [16:32)  score      (int16)
 //   [32:40)  depth + 128 (uint8, so qsearch's negative depths survive)
 //   [40:42)  bound flag
-//   [42:48)  generation (0-63)
-//   [48:64)  reserved (static eval will live here)
+//   [42:48)  unused
+//   [48:56)  generation (0-255)
+//   [56:64)  reserved (static eval will live here)
 static_assert(sizeof(Move) == 2, "TT packing assumes a 16-bit Move");
 
 std::uint64_t pack(Move m, Score score, int depth, TTFlag flag, std::uint8_t gen) {
@@ -50,7 +51,7 @@ std::uint64_t pack(Move m, Score score, int depth, TTFlag flag, std::uint8_t gen
                 static_cast<std::int16_t>(score))) << 16)
          | (static_cast<std::uint64_t>(d8) << 32)
          | (static_cast<std::uint64_t>(flag & 0x3) << 40)
-         | (static_cast<std::uint64_t>(gen & 0x3F) << 42);
+         | (static_cast<std::uint64_t>(gen) << 48);
 }
 
 Move unpack_move(std::uint64_t data) {
@@ -63,7 +64,7 @@ Move unpack_move(std::uint64_t data) {
 Score        unpack_score(std::uint64_t d) { return static_cast<std::int16_t>((d >> 16) & 0xFFFF); }
 int          unpack_depth(std::uint64_t d) { return static_cast<int>((d >> 32) & 0xFF) - 128; }
 TTFlag       unpack_flag (std::uint64_t d) { return static_cast<TTFlag>((d >> 40) & 0x3); }
-std::uint8_t unpack_gen  (std::uint64_t d) { return static_cast<std::uint8_t>((d >> 42) & 0x3F); }
+std::uint8_t unpack_gen  (std::uint64_t d) { return static_cast<std::uint8_t>((d >> 48) & 0xFF); }
 
 }  // namespace
 
