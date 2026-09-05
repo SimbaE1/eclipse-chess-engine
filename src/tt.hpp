@@ -51,10 +51,19 @@ struct TTEntry {
 
 class TranspositionTable {
 public:
-    // Generation counter is 6 bits (packed alongside the bound flag), so it
-    // wraps at 64. new_generation() returns the already-masked value, which is
+    // Generation counter is 8 bits (its own byte in the packed word), so it
+    // wraps at 256. new_generation() returns the already-masked value, which is
     // what SearchCtx::cutoff_gen compares against.
-    static constexpr std::uint8_t kGenCycle = 64;
+    //
+    // The width matters: find_tactic_node only honours depth-cutoffs from
+    // entries carrying its own generation, so that each depth of its swing
+    // detection is genuinely depth-limited. A stale entry written exactly
+    // kGenCycle generations ago aliases onto the current value and defeats
+    // that filter. At 6 bits the cycle was 64 -- roughly 32 moves, since
+    // find_tactic_node runs about twice a move -- which is well inside the
+    // lifetime of a deep entry in a 128 MB table. 8 bits pushes it to ~128
+    // moves and costs nothing: the byte was already reserved.
+    static constexpr int kGenCycle = 256;
 
     TranspositionTable(std::size_t mb_size = 16);
     ~TranspositionTable();
