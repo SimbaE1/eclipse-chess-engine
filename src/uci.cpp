@@ -44,7 +44,15 @@ SearchInfo  g_search_info;
 static bool g_ab_threads_explicit = false;
 // How many of OUR own moves the remaining clock is budgeted to cover; the
 // divisor in the soft-time formula. See the allocation block in cmd_go.
-static int  g_move_horizon = 25;
+//
+// 40, not the 25 that 85d0265 shipped. SPRT 20260828_100032 ran 25 against 40
+// at 60+1.5 over 2153 games and accepted H0 at -8.6 +/- 11.4 Elo: 25 is not an
+// improvement, and the point estimate is negative. Reverted to the value main
+// effectively played for its whole history (the MLH head that was meant to
+// feed this was never live, so the old clamp pinned the divisor at its floor
+// of 40 every move of every game). The spin below stays, so a future horizon
+// can be swept without a rebuild.
+static int  g_move_horizon = 40;
 // Whether the current session is a Chess960 game. Affects move notation:
 // castling moves are output as king-to-rook ("e1h1") instead of king-to-
 // destination ("e1g1"), and parsed accordingly.
@@ -136,7 +144,7 @@ void cmd_uci() {
               << "option name MctsTreeMB type spin default 512 min 16 max 65536\n"
               << "option name OverrideMargin type spin default 50 min 0 max 1000\n"
               << "option name AbThreads type spin default 1 min 0 max 128\n"
-              << "option name MoveHorizon type spin default 25 min 10 max 80\n"
+              << "option name MoveHorizon type spin default 40 min 10 max 80\n"
               << "option name Cpuct type string default 1.70\n"
               << "option name FpuOffset type string default 0.20\n"
               << "option name PolicyDepth type spin default 2 min -1 max 64\n"
