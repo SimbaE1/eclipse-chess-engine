@@ -832,7 +832,7 @@ static Result id_search(Position& pos, int max_depth, SearchCtx& ctx, int start_
             // high, widen exponentially (50→200→800→full) so we recover from
             // a real eval shift in 2-3 re-searches rather than 8+ linear
             // ones.
-            Score delta = 15;
+            Score delta = 50;
             Score alpha = std::max(-kInfinite, last_score - delta);
             Score beta  = std::min( kInfinite, last_score + delta);
             while (true) {
@@ -1008,7 +1008,7 @@ TacticNode find_tactic_node(Position& pos, int max_depth, std::int64_t time_budg
         if (d <= 4) {
             s = negamax(pos, d, -kInfinite, kInfinite, 0, best_at_d, ctx, MoveNone);
         } else {
-            Score delta = 15;
+            Score delta = 50;
             Score alpha = std::max(-kInfinite, last_score - delta);
             Score beta  = std::min( kInfinite, last_score + delta);
             while (true) {
