@@ -26,7 +26,7 @@ namespace eclipse::uci {
 namespace {
 
 constexpr const char* kEngineName    = "Eclipse";
-constexpr const char* kEngineVersion = "1.0.0";
+constexpr const char* kEngineVersion = "1.1.0";
 constexpr const char* kEngineAuthor  = "SimbaE11";
 
 // Machine-specific defaults for this build/install: loaded at startup so the
