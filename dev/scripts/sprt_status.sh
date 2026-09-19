@@ -18,7 +18,10 @@ report(){
   echo "engines: $(pgrep -f 'build/src/eclipse' | wc -l | tr -d ' ') procs, load$(uptime | sed 's/.*averages*:/ /')"
   echo
   # Every leg directory, oldest first. The one with the newest log is current.
-  for d in $(ls -dt "$REPO"/dev/sprt_runs/2026*_{ab,aspiration,tt,mcts,movehorizon,see}* 2>/dev/null | tail -r); do
+  # Match any leg name: a fixed list of prefixes silently hid new legs
+  # (promoted_vs_main never showed up).
+  for d in $(ls -dt "$REPO"/dev/sprt_runs/2026*_*/ 2>/dev/null | tail -r); do
+    d="${d%/}"
     local name last score sprt started
     name=$(basename "$d")
     [[ -f "$d/log.txt" ]] || continue
