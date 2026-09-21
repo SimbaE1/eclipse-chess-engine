@@ -130,6 +130,7 @@ void cmd_uci() {
               << "option name Threads type spin default 4 min 1 max 128\n"
               << "option name Hash type spin default 256 min 1 max 65536\n"
               << "option name MctsHash type spin default 64 min 1 max 65536\n"
+              << "option name MctsTreeMB type spin default 8192 min 16 max 262144\n"
               << "option name OverrideMargin type spin default 50 min 0 max 1000\n"
               << "option name AbThreads type spin default 1 min 0 max 128\n"
               << "option name Cpuct type string default 1.70\n"
@@ -192,6 +193,11 @@ void cmd_setoption(const std::vector<std::string>& tok) {
         g_tt.resize(std::atoi(value.c_str()));
     } else if (name == "MctsHash") {
         mcts::g_mcts_tt.resize(static_cast<std::size_t>(std::atoi(value.c_str())));
+    } else if (name == "MctsTreeMB") {
+        // Caps the MCTS node pool. Distinct from MctsHash, which sizes the MCTS
+        // transposition table, not the tree; before this option existed nothing
+        // bounded the tree at all.
+        mcts::set_node_budget_mb(std::atoi(value.c_str()));
     } else if (name == "OverrideMargin") {
         g_search_info.override_margin = std::atoi(value.c_str());
     } else if (name == "AbThreads") {
@@ -501,6 +507,12 @@ void loop() {
     // still wins -- both loaders just overwrite whatever loaded here.
     nnue::load(kDefaultEvalFile);
     syzygy::init(kDefaultSyzygyPath);
+    // The node pool is unbounded until a budget is set, so a GUI that never
+    // sends MctsTreeMB must still get the advertised default. It is set high on
+    // purpose: at 512 MiB the cap starved long searches (SPRT -2.8 +/- 8.4), and
+    // its only job is to stop the tree eating the machine (48 GB observed on
+    // the lichess bot within 44 minutes).
+    mcts::set_node_budget_mb(8192);
 
     std::string line;
     while (std::getline(std::cin, line)) {
@@ -510,7 +522,7 @@ void loop() {
 
         if      (cmd == "uci")        cmd_uci();
         else if (cmd == "isready")    cmd_isready();
-        else if (cmd == "ucinewgame") { join_search_thread(); g_pos = Position::startpos(); g_tt.clear(); mcts::g_mcts_tt.clear(); }
+        else if (cmd == "ucinewgame") { join_search_thread(); g_pos = Position::startpos(); g_tt.clear(); mcts::g_mcts_tt.clear(); mcts::clear_tree_cache(); }
         else if (cmd == "setoption")  { join_search_thread(); cmd_setoption(tok); }
         else if (cmd == "position")   { join_search_thread(); cmd_position(tok); }
         else if (cmd == "go")         cmd_go(tok);
