@@ -138,6 +138,7 @@ void cmd_uci() {
               << "option name PolicyDepth type spin default 2 min -1 max 64\n"
               << "option name SelectVisitFrac type string default 0.60\n"
               << "option name SelectQMargin type string default 0.02\n"
+              << "option name AbOverrideQMargin type string default -2.0\n"
               << "option name Ponder type check default true\n"
               << "option name UCI_Ponder type check default true\n"
               << "option name UCI_Chess960 type check default false\n"
@@ -224,6 +225,13 @@ void cmd_setoption(const std::vector<std::string>& tok) {
         char* end = nullptr;
         const float f = std::strtof(value.c_str(), &end);
         if (end != value.c_str() && f >= 0.0f && f < 2.0f) mcts::g_select_q_margin = f;
+    } else if (name == "AbOverrideQMargin") {
+        // Range is the full width of the Q span in both directions, so one
+        // knob covers never-override (2.0) through always-override (-2.0)
+        // and a tuning run needs no separate builds.
+        char* end = nullptr;
+        const float f = std::strtof(value.c_str(), &end);
+        if (end != value.c_str() && f >= -2.0f && f <= 2.0f) mcts::g_ab_override_q_margin = f;
     } else if (name == "SyzygyPath") {
         syzygy::init(value);
     } else if (name == "UCI_Chess960") {

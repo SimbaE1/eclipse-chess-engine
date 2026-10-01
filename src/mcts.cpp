@@ -320,6 +320,31 @@ float g_fpu_offset = 0.20f;
 float g_select_visit_frac = 0.60f;
 float g_select_q_margin   = 0.02f;  // Q units (~6 cp); near-ties go to more visits
 
+// How much better an AB-backed move must look before it overrides the pick the
+// visit gate produced (UCI AbOverrideQMargin, Q units). adjust_root_q() rewrites
+// the W of AB's chosen root move so its Q reflects a real AB score, but never
+// its N -- so that move can never reach g_select_visit_frac * max_visits and,
+// without an override, its verdict is discarded no matter what the score says.
+// That is how a won position gets played as a draw: AB is the only searcher
+// that sees the tactic and the gate silently overrules it.
+//
+// The margin is separate from g_select_q_margin because the two comparisons
+// are not alike: that one arbitrates between two well-explored moves, this one
+// lets a move with a few thousand visits outvote one with tens of millions. A
+// wider margin keeps MCTS in charge unless AB is emphatic; 0.0 would let any
+// AB preference win, and a very large value restores the old discard-always
+// behaviour. Defaults to always-override: in the 2026-09-30 runs -2.0 beat
+// both 0.02 (44-13-11) and 0.00 (40-14-9), i.e. MCTS's Q is not useful even
+// as a tiebreak where the two searchers disagree.
+// The useful span, for tuning runs:
+//   -2.0  always take AB's move  (pure-AB selection; kAlwaysOverride) -- default
+//    0.0  take it whenever strictly better
+//    0.02 g_select_q_margin's value
+//    2.0  never take it          (the pre-fix behaviour)
+float g_ab_override_q_margin = -2.0f;
+// Q spans [-1, 1], so any margin this low makes the comparison unfailable.
+constexpr float kAlwaysOverride = -2.0f;
+
 // NNUE-informed policy priors (UCI PolicyDepth). At expansions within this many
 // plies of the root, score every child with the value net (one batched forward
 // pass) and softmax the results into priors, instead of the cheap-but-tactically
@@ -593,7 +618,12 @@ void MCTS::adjust_root_q(Move m, Score s) {
                 // Adjust W such that W/N = target_q
                 const int64_t target_w_fx = static_cast<int64_t>(target_q * n * kWScale);
                 child->W_fx.store(target_w_fx, std::memory_order_relaxed);
-                
+                // Remember it so the final visit gate lets this move compete
+                // on the value we just wrote. N is deliberately left alone --
+                // faking visits would corrupt the averaging for any further
+                // iterations on this tree (the reconciliation loop re-runs).
+                ab_adjusted_move_ = m;
+
                 std::cout << "info string MCTS adjusted " << m.to_uci() 
                           << " Q to " << std::fixed << std::setprecision(3) << target_q
                           << " based on AB score " << s << "cp" << std::endl;
@@ -612,12 +642,25 @@ Move MCTS::get_best_move() {
     const std::int32_t thresh = static_cast<std::int32_t>(
         g_select_visit_frac * static_cast<float>(max_n));
 
+    // Pass 1 -- unchanged: the best of the gate-passing children. An AB-backed
+    // move that cleared the gate on its own visits is judged here like any
+    // other, with no special treatment; only a move that FAILED the gate is
+    // held back for the override below. Keeping the two passes separate also
+    // makes the result independent of child order -- folded into one loop, an
+    // exempt move that happened to be iterated first became the incumbent
+    // without ever facing a margin.
     Node* best_child = nullptr;
+    Node* ab_child   = nullptr;  // AB's move, wherever it landed
     for (const auto& child : root->children) {
         const auto cn = child->N.load(std::memory_order_relaxed);
-        // Only "seriously explored" children compete on value; this keeps Q
-        // trustworthy and reduces to most-visited when frac is high.
-        if (cn == 0 || cn < thresh) continue;
+        if (cn == 0) continue;
+        // Record AB's move whether or not it clears the gate. It usually will
+        // not (adjust_root_q writes W, never N), but kAlwaysOverride has to
+        // mean ALWAYS -- including the case where AB's move passed the gate
+        // and then lost pass 1 to a sibling with a better sampled Q.
+        if (ab_adjusted_move_ != MoveNone && child->move == ab_adjusted_move_)
+            ab_child = child.get();
+        if (cn < thresh) continue;  // genuinely under-explored: Q untrustworthy
         if (!best_child) { best_child = child.get(); continue; }
         // Lower child Q == better for us (child Q is from the opponent's POV).
         // Prefer clearly-better value; on a near-tie prefer the more-visited.
@@ -629,6 +672,33 @@ Move MCTS::get_best_move() {
             best_child = child.get();
         }
     }
+
+    // Pass 2 -- the AB override. See g_ab_override_q_margin. Note this reads
+    // the Q that adjust_root_q() wrote, so it is AB's own score talking, not a
+    // thin MCTS sample of the same move.
+    // A margin at or below -2.0 spans the whole Q range, so the comparison can
+    // never fail: that is the "always take AB's move" end of the knob, kept as
+    // a reachable setting so a tuning run can measure pure-AB selection
+    // without a separate build.
+    const bool always_override = (g_ab_override_q_margin <= kAlwaysOverride);
+    if (ab_child && (always_override || best_child == nullptr ||
+                     ab_child->Q() < best_child->Q() - g_ab_override_q_margin)) {
+        std::cout << "info string AB override: " << ab_child->move.to_uci()
+                  << " Q=" << std::fixed << std::setprecision(3) << ab_child->Q()
+                  << " (N=" << ab_child->N.load(std::memory_order_relaxed) << ")"
+                  << " beats gate pick ";
+        if (best_child) {
+            std::cout << best_child->move.to_uci()
+                      << " Q=" << best_child->Q()
+                      << " (N=" << best_child->N.load(std::memory_order_relaxed) << ")"
+                      << " by margin " << g_ab_override_q_margin;
+        } else {
+            std::cout << "(none passed the visit gate)";
+        }
+        std::cout << std::endl;
+        best_child = ab_child;
+    }
+
     if (best_child) {
         search_info.best_score = q_to_cp(-best_child->Q());
         log_search_summary(*best_child, best_child->N.load(std::memory_order_relaxed));

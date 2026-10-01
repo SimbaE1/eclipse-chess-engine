@@ -72,6 +72,7 @@ extern float g_cpuct;        // exploration coefficient
 extern float g_fpu_offset;   // First-Play Urgency discount on parent_q for unvisited children
 extern float g_select_visit_frac;  // visit-fraction gate for value-aware final move selection
 extern float g_select_q_margin;    // Q margin below which selection prefers more visits
+extern float g_ab_override_q_margin;  // Q margin an AB-backed move must beat the gate pick by
 extern int   g_policy_depth;       // plies from root that get NNUE-scored policy priors
 
 struct Node;
@@ -295,6 +296,14 @@ private:
     std::uint64_t      value_seed_key_    = 0;
     float              value_seed_q_      = 0.0f;
     int                value_seed_visits_ = 0;
+
+    // The root move adjust_root_q() last rewrote from an AB score, if any.
+    // get_best_move()'s visit gate exempts it: the adjustment fixes W (so Q
+    // reads correctly) but never N, so an AB-found move can't accumulate the
+    // 60% of max visits the gate demands and its verdict is discarded. That
+    // is how a won position gets played as a draw -- AB is the only searcher
+    // that sees the tactic, and the gate silently overrules it.
+    Move ab_adjusted_move_ = MoveNone;
 
     Position&   root_pos;
     SearchInfo& search_info;
