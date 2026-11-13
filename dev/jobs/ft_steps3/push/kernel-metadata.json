@@ -1,0 +1,16 @@
+{
+  "id": "simbae11/eclipse-ft-steps3",
+  "title": "eclipse-ft-steps3",
+  "code_file": "steps.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "machine_shape": "NvidiaTeslaT4",
+  "enable_tpu": false,
+  "enable_internet": false,
+  "dataset_sources": ["simbae11/eclipse-chunks-quiet", "simbae11/eclipse-chunks-a"],
+  "kernel_sources": [],
+  "competition_sources": [],
+  "model_sources": []
+}

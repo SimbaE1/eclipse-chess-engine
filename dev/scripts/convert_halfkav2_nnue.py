@@ -4,7 +4,8 @@
 HalfKAv2-1024x2-512-128 weight packer for Eclipse's .nnue binary format.
 
 This script is the bridge between PyTorch training and the C++ inference path.
-It has two modes:
+It has three modes (to-torch is the inverse of from-torch, for warm-starting
+training from a deployed net whose float checkpoint is gone):
 
   init        - emit a small-magnitude initialized net for testing the loader
                 and forward-pass infrastructure end-to-end without needing real
@@ -242,6 +243,55 @@ def make_from_torch(state_dict_path: Path):
     return params
 
 
+def read_nnue_to_torch(nnue_path: Path, out_path: Path) -> None:
+    """Inverse of write_nnue_file: dequantize an Eclipse .nnue back to a float
+    state_dict in the exact layout `from-torch` (and the training notebook's
+    export_state_dict_for_quantization) uses.
+
+    For a QAT-trained net this is lossless in the sense that matters: the
+    quantized grid IS what the net was trained against, so the dequantized
+    weights are a faithful warm-start point. `from-torch` on the result
+    reproduces the original file byte-for-byte (see the round-trip check in the
+    commit that added this mode).
+    """
+    import torch
+    with nnue_path.open("rb") as f:
+        hdr = struct.unpack("<IIIIIIIf", f.read(32))
+        magic, version, n_in, ft_out, l1_out, l2_out, l3_out, cp_per_unit = hdr
+        if magic != MAGIC or version != VERSION or n_in != FT_IN_FEATURES:
+            sys.exit(f"error: {nnue_path} header {hdr[:3]} does not match "
+                     f"MAGIC/VERSION/FT_IN_FEATURES of this converter")
+        set_dims(ft_out=ft_out, l1_out=l1_out, l2_out=l2_out)
+
+        def rd(dtype, n):
+            a = np.fromfile(f, dtype=dtype, count=n)
+            if a.size != n:
+                sys.exit(f"error: {nnue_path} is truncated")
+            return a.astype(np.float32)
+
+        ft_b = rd(np.int16, FT_OUT) / FT_QUANT
+        ft_w = rd(np.int16, FT_IN_FEATURES * FT_OUT).reshape(FT_IN_FEATURES, FT_OUT).T / FT_QUANT
+        bscale = WEIGHT_SCALE * FT_QUANT
+        l1_b = rd(np.int32, L1_OUT) / bscale
+        l1_w = rd(np.int8, L1_OUT * L1_IN).reshape(L1_OUT, L1_IN) / WEIGHT_SCALE
+        l2_b = rd(np.int32, L2_OUT) / bscale
+        l2_w = rd(np.int8, L2_OUT * L1_OUT).reshape(L2_OUT, L1_OUT) / WEIGHT_SCALE
+        l3_b = rd(np.int32, L3_OUT) / bscale
+        l3_w = rd(np.int8, L3_OUT * L2_OUT).reshape(L3_OUT, L2_OUT) / WEIGHT_SCALE
+        if f.read(1):
+            sys.exit(f"error: trailing bytes in {nnue_path}; layout mismatch")
+
+    t = lambda a: torch.from_numpy(np.ascontiguousarray(a, dtype=np.float32))
+    sd = {"ft.weight": t(ft_w), "ft.bias": t(ft_b),
+          "l1.weight": t(l1_w), "l1.bias": t(l1_b),
+          "l2.weight": t(l2_w), "l2.bias": t(l2_b),
+          "l3.weight": t(l3_w), "l3.bias": t(l3_b)}
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(sd, out_path)
+    print(f"wrote {out_path}: {FT_IN_FEATURES} -> {FT_OUT}x2 -> {L1_OUT} -> "
+          f"{L2_OUT} -> {L3_OUT} (file says output_cp/unit={cp_per_unit})")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -264,8 +314,15 @@ def main():
                          help="centipawns per real-unit of L3 output; must match "
                               "TRAIN_CFG['cp_scale'] used to train the checkpoint.")
 
+    p_back = sub.add_parser("to-torch", help="dequantize a .nnue back to a float state_dict (.pt)")
+    p_back.add_argument("--nnue", type=Path, required=True)
+    p_back.add_argument("--out", type=Path, required=True)
+
     args = p.parse_args()
 
+    if args.mode == "to-torch":
+        read_nnue_to_torch(args.nnue, args.out)
+        return
     if args.mode == "init":
         params = make_init_net(seed=args.seed)
     elif args.mode == "from-torch":

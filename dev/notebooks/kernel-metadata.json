@@ -10,7 +10,7 @@
   "enable_tpu": false,
   "enable_internet": true,
   "dataset_sources": [
-    "simbae11/eclipse-chunks-a"
+    "simbae11/eclipse-chunks-quiet"
   ],
   "kernel_sources": [],
   "competition_sources": [],

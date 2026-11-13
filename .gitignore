@@ -39,3 +39,6 @@ dev/sprt_runs/
 
 # SPRT baseline worktrees built by dev/scripts/sprt_queue.sh
 .sprt-work/
+
+# Stockfish game-analysis runs (local only)
+dev/sf_analysis/

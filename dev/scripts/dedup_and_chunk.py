@@ -25,6 +25,18 @@ two improvements over scripts/preprocess_halfkav2.py's sequential chunking:
      target), and the net rarely evaluates in-check leaves at inference (search
      extends checks).
 
+  4. OPTIONAL WEIGHTS. If a line has a third field (`<fen>;<cp>;<w>`, as written
+     by build-tools/tests/data_filter), the kept record is written `w` times,
+     each copy to an independently random chunk. Weighting happens AFTER dedup
+     on purpose: duplicating before dedup would just be collapsed again.
+
+  5. LEAK-FREE HOLDOUT (--holdout-mod N). Positions whose crc32(`<board> <stm>`)
+     % N == 0 go to `val_holdout.bin` (one copy, weight ignored) and are never
+     written to a training chunk -- so no weighted copy of a held-out position
+     can leak into training. crc32 (not Python's per-process-salted hash()) so
+     every worker routes the same position the same way. The file name does not
+     match `eval_chunk_*.bin`, so the notebook never trains on it.
+
 Parsing (FEN -> HalfKAv2 feature indices), the record layout (130 bytes:
 us[32] uint16, them[32] uint16, tgt float16), and the cp_scale/max_cp filter are
 imported verbatim from preprocess_halfkav2.py, so a chunk here is bit-identical
@@ -51,6 +63,7 @@ import struct
 import subprocess
 import sys
 import time
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -150,9 +163,20 @@ def _stm_in_check(fen: str) -> bool:
     return False
 
 
+def _line_weight(bline: bytes) -> int:
+    """Optional third `;` field = integer sampling weight (default 1, clamp 1..255)."""
+    parts = bline.split(b';', 2)
+    if len(parts) < 3:
+        return 1
+    try:
+        return min(255, max(1, int(parts[2])))
+    except ValueError:
+        return 1
+
+
 # ── Pass A: build the first-occurrence keep mask ────────────────────────────
 def pass_a(path: Path, sample: int | None):
-    """Return (keep: bool[n_lines], n_lines, n_unique).
+    """Return (keep: bool[n_lines], n_lines, n_weighted_unique).
 
     A data line = non-empty, non-comment. Both passes filter identically so
     line indices align. keep[i] is True iff line i is the first sighting of its
@@ -160,6 +184,7 @@ def pass_a(path: Path, sample: int | None):
     """
     cap = sample if sample else 800_000_000
     hashes = np.empty(cap, dtype=np.uint64)
+    weights = np.ones(cap, dtype=np.uint8)
     n = 0
     t0 = time.time()
     for bline in _open_lines(path):
@@ -170,8 +195,10 @@ def pass_a(path: Path, sample: int | None):
             if sample:
                 break
             hashes = np.concatenate([hashes, np.empty(cap, dtype=np.uint64)])
+            weights = np.concatenate([weights, np.ones(cap, dtype=np.uint8)])
             cap *= 2
         hashes[n] = hash(_pos_key(s)) & 0xFFFFFFFFFFFFFFFF
+        weights[n] = _line_weight(s)
         n += 1
         if n % 50_000_000 == 0:
             print(f'  pass A: {n:,} lines  ({n/(time.time()-t0)/1e6:.1f}M/s)',
@@ -182,48 +209,72 @@ def pass_a(path: Path, sample: int | None):
     keep = np.zeros(n, dtype=bool)
     keep[first_idx] = True
     del hashes
+    n_weighted = int(weights[:n][keep].sum(dtype=np.int64))
     print(f'  pass A done: {n:,} data lines, {keep.sum():,} unique '
-          f'({100*keep.sum()/max(1,n):.1f}%) in {time.time()-t0:.0f}s', flush=True)
-    return keep, n, int(keep.sum())
+          f'({100*keep.sum()/max(1,n):.1f}%), {n_weighted:,} weighted records '
+          f'in {time.time()-t0:.0f}s', flush=True)
+    return keep, n, n_weighted
 
 
 # ── Pass B: parse kept lines, scatter to random chunk files ─────────────────
 def _parse_batch(args):
     """Worker: parse a batch of str lines -> packed record bytes (multiple of
     RECORD_SIZE), preserving order."""
-    lines, cp_scale, max_cp = args
+    lines, cp_scale, max_cp, holdout_mod = args
     recs = []
+    held = []
     n_check = 0
     for line in lines:
         if isinstance(line, (bytes, bytearray)):
             line = line.decode('utf-8', 'replace')
-        fen = line.split(';', 1)[0].strip()
+        parts = line.strip().split(';')
+        w = 1
+        if len(parts) >= 3:
+            try:
+                w = min(255, max(1, int(parts[2])))
+            except ValueError:
+                w = 1
+            line = parts[0] + ';' + parts[1]
+        fen = parts[0].strip()
         if _stm_in_check(fen):          # drop: side to move is in check
             n_check += 1
             continue
         r = _parse_line(line, cp_scale, max_cp)
         if r:
-            recs.append(r)
-    if not recs:
-        return b'', n_check
-    buf = np.empty(len(recs), dtype=RECORD_DTYPE)
-    for i, (ua, ta, wp) in enumerate(recs):
-        buf[i]['us'] = ua
-        buf[i]['them'] = ta
-        buf[i]['tgt'] = wp
-    return buf.tobytes(), n_check
+            if holdout_mod and zlib.crc32(_pos_key(fen.encode())) % holdout_mod == 0:
+                held.append(r)          # held out: one copy, never trained on
+            else:
+                recs.extend([r] * w)    # copies scatter to independent chunks
+    def _pack(rs):
+        if not rs:
+            return b''
+        buf = np.empty(len(rs), dtype=RECORD_DTYPE)
+        for i, (ua, ta, wp) in enumerate(rs):
+            buf[i]['us'] = ua
+            buf[i]['them'] = ta
+            buf[i]['tgt'] = wp
+        return buf.tobytes()
+    return _pack(recs), _pack(held), n_check
 
 
 def pass_b(path: Path, keep, n_lines, out_dir: Path, n_chunks: int,
-           cp_scale: float, max_cp: float, workers: int, seed: int):
+           cp_scale: float, max_cp: float, workers: int, seed: int,
+           holdout_mod: int = 0):
     out_dir.mkdir(parents=True, exist_ok=True)
-    paths = [out_dir / f'eval_chunk_{c:02d}.bin' for c in range(n_chunks)]
+    width = max(2, len(str(n_chunks - 1)))
+    paths = [out_dir / f'eval_chunk_{c:0{width}d}.bin' for c in range(n_chunks)]
     files = [open(p, 'wb') for p in paths]
     counts = np.zeros(n_chunks, dtype=np.int64)
     for f in files:
         f.write(MAGIC)
         f.write(struct.pack('<q', 0))          # placeholder N, fixed up at end
     rng = np.random.default_rng(seed)
+    hold_path = out_dir / 'val_holdout.bin'
+    hold_f = open(hold_path, 'wb') if holdout_mod else None
+    n_held = 0
+    if hold_f:
+        hold_f.write(MAGIC)
+        hold_f.write(struct.pack('<q', 0))
 
     BATCH = 50_000
     written = 0
@@ -242,15 +293,18 @@ def pass_b(path: Path, keep, n_lines, out_dir: Path, n_chunks: int,
             if keep[i]:
                 batch.append(bline)          # bytes; worker decodes
                 if len(batch) == BATCH:
-                    yield (batch, cp_scale, max_cp)
+                    yield (batch, cp_scale, max_cp, holdout_mod)
                     batch = []
             i += 1
         if batch:
-            yield (batch, cp_scale, max_cp)
+            yield (batch, cp_scale, max_cp, holdout_mod)
 
     with mp.Pool(workers) as pool:
-        for data, nchk in pool.imap(_parse_batch, _kept_batches(), chunksize=4):
+        for data, hdata, nchk in pool.imap(_parse_batch, _kept_batches(), chunksize=4):
             n_check += nchk
+            if hdata and hold_f:
+                hold_f.write(hdata)
+                n_held += len(hdata) // RECORD_SIZE
             if not data:
                 continue
             arr = np.frombuffer(data, dtype=RECORD_DTYPE)
@@ -269,6 +323,11 @@ def pass_b(path: Path, keep, n_lines, out_dir: Path, n_chunks: int,
         f.seek(8)
         f.write(struct.pack('<q', int(counts[c])))
         f.close()
+    if hold_f:
+        hold_f.seek(8)
+        hold_f.write(struct.pack('<q', n_held))
+        hold_f.close()
+        print(f'  holdout: {n_held:,} records -> {hold_path.name}', flush=True)
     print(f'  pass B done: {written:,} records in {time.time()-t0:.0f}s '
           f'(dropped {n_check:,} in-check)', flush=True)
     # Drop any chunk that ended up empty (keeps indices 0..K-1 contiguous & loadable).
@@ -281,7 +340,7 @@ def pass_b(path: Path, keep, n_lines, out_dir: Path, n_chunks: int,
     # Re-name to contiguous eval_chunk_NN.bin if any were dropped.
     final_paths, final_counts = [], []
     for new_idx, (p, cnt) in enumerate(kept_paths):
-        target = out_dir / f'eval_chunk_{new_idx:02d}.bin'
+        target = out_dir / f'eval_chunk_{new_idx:0{width}d}.bin'
         if p != target:
             p.rename(target)
         final_paths.append(target)
@@ -325,6 +384,9 @@ def main():
     ap.add_argument('--sample', type=int, default=None,
                     help='cap input data lines (quick test)')
     ap.add_argument('--seed', type=int, default=1)
+    ap.add_argument('--holdout-mod', type=int, default=2000,
+                    help='hold out positions with crc32(key) %% N == 0 as '
+                         'val_holdout.bin (0 disables)')
     args = ap.parse_args()
 
     print(f'input   : {args.data}')
@@ -335,16 +397,17 @@ def main():
     print()
 
     print('=== Pass A: dedup scan ===', flush=True)
-    keep, n_lines, n_unique = pass_a(args.data, args.sample)
-    n_chunks = max(1, (n_unique + args.chunk_size - 1) // args.chunk_size)
-    print(f'\n-> {n_unique:,} unique positions -> {n_chunks} chunk(s)\n', flush=True)
+    keep, n_lines, n_records = pass_a(args.data, args.sample)
+    n_chunks = max(1, (n_records + args.chunk_size - 1) // args.chunk_size)
+    print(f'\n-> {n_records:,} records (after dedup + weights) -> {n_chunks} chunk(s)\n', flush=True)
 
     print('=== Pass B: parse + scatter ===', flush=True)
     paths, counts = pass_b(args.data, keep, n_lines, args.out_dir, n_chunks,
-                           args.cp_scale, args.max_cp, args.workers, args.seed)
+                           args.cp_scale, args.max_cp, args.workers, args.seed,
+                           args.holdout_mod)
 
     print('\n=== Validate ===', flush=True)
-    validate(paths)
+    validate(paths + ([args.out_dir / 'val_holdout.bin'] if args.holdout_mod else []))
     print(f'\nTOTAL records written: {int(counts.sum()):,}')
 
 

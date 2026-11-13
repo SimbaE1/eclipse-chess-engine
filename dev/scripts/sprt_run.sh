@@ -203,6 +203,31 @@ NEW_OPTS=($NEW_EXTRA)
 # shellcheck disable=SC2206
 OLD_OPTS=($OLD_EXTRA)
 
+# cutechess applies -each AFTER the per-engine options, so a key that is in
+# both (e.g. option.EvalFile, option.AbThreads) silently takes the -each value
+# on BOTH sides -- verified with `-debug all` on 2026-11-07. That voided every
+# -N/-O override of a COMMON key: the small-vs-wide net SPRTs ran the small
+# binary with the wide net (arch mismatch -> no NNUE at all). So: any key that
+# either side overrides is pulled out of -each and handed to each engine
+# directly (its override if it has one, else the shared value).
+opt_key() { local k="${1%%=*}"; echo "$k"; }
+side_has() {  # side_has KEY opt...
+    local key="$1"; shift
+    local o; for o in "$@"; do [[ "$(opt_key "$o")" == "$key" ]] && return 0; done
+    return 1
+}
+KEPT=()
+for o in "${COMMON_OPTS[@]}"; do
+    k="$(opt_key "$o")"
+    if side_has "$k" ${NEW_OPTS[@]+"${NEW_OPTS[@]}"} || side_has "$k" ${OLD_OPTS[@]+"${OLD_OPTS[@]}"}; then
+        side_has "$k" ${NEW_OPTS[@]+"${NEW_OPTS[@]}"} || NEW_OPTS+=("$o")
+        side_has "$k" ${OLD_OPTS[@]+"${OLD_OPTS[@]}"} || OLD_OPTS+=("$o")
+    else
+        KEPT+=("$o")
+    fi
+done
+COMMON_OPTS=("${KEPT[@]}")
+
 echo "SPRT: $NEW vs $OLD"
 echo "  tc=$TC elo0=$ELO0 elo1=$ELO1 max_games=$MAXGAMES conc=$CONC"
 echo "  threads=$THREADS abthreads=$ABTHREADS treemb=$TREEMB"
@@ -211,7 +236,7 @@ echo "  book=$BOOK"
 [[ -n "$OLD_EXTRA" ]] && echo "  old-only: $OLD_EXTRA"
 echo "  out=$OUT"
 
-cutechess-cli \
+${SPRT_DRYRUN:+echo} cutechess-cli \
     -engine name=new cmd="$NEW" dir="$REPO" ${NEW_OPTS[@]+"${NEW_OPTS[@]}"} \
     -engine name=old cmd="$OLD" dir="$REPO" ${OLD_OPTS[@]+"${OLD_OPTS[@]}"} \
     -each "${COMMON_OPTS[@]}" \
