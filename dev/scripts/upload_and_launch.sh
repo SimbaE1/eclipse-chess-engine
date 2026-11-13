@@ -4,7 +4,7 @@
 # version` (all-or-nothing), killing an attempt that stalls on finalize, until
 # one run gets all 192 sub-files through. Then pushes the training kernel and
 # sets the `launched` flag so the hourly babysit takes over.
-export KAGGLE_API_TOKEN=KGAT_eb6669ac1f5d79234bb07341c23a7285
+export KAGGLE_API_TOKEN=${KAGGLE_API_TOKEN:-$(cat "$HOME/.kaggle/eclipse_token")}  # never commit the token
 export PATH="/usr/local/bin:$PATH"
 REPO=/Users/ezra/eclipse-chess-engine
 STATE=/Users/ezra/.eclipse_train_babysit
