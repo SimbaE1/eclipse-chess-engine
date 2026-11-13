@@ -5,9 +5,10 @@ Internals, build/test loop, and the net-improvement pipeline. For installing and
 see [`SETUP.md`](../SETUP.md); for training data + GPU training see
 [`KAGGLE.md`](KAGGLE.md).
 
-> **Status:** late proof-of-concept. The search, NNUE, policy, ponder, and
-> Syzygy paths all work; strength tuning and the training-data buildout are the
-> active fronts.
+> **Status (November 2026):** v1.2.0, about 2200–2300 on Lichess. Search,
+> NNUE, ponder, Syzygy and Chess960 all work. The active fronts are net quality
+> (fine-tuning on quiet, endgame-weighted data; next, piece-count layer stacks)
+> and SPRT-gated search tuning.
 
 ## How it plays
 
@@ -20,23 +21,37 @@ see [`SETUP.md`](../SETUP.md); for training data + GPU training see
    time-management head, but the in-tree expansion priors come from the value
    net + heuristics.)
 2. **Search** — NNUE + MCTS (PUCT, multi-threaded) explores for the best move.
-3. **Tactics** — NNUE + alpha-beta runs alongside MCTS; when it finds a tactic
-   the MCTS missed, it raises that move's Q so the tree adopts it
-   (`adjust_root_q` / reconciliation in `src/search.cpp`).
+3. **Alpha-beta** — a Lazy-SMP alpha-beta search (`src/ab.cpp`; SEE, qsearch,
+   LMR, a lockless 4-way-bucket TT) runs **in parallel** with MCTS on its own
+   `AbThreads`. When the two disagree, `src/search.cpp` cross-checks MCTS's move
+   with AB, can extend both searches when AB's eval is still drifting with depth,
+   and runs a short validation MCTS on AB's move.
+4. **Final move** — at the root, AB's move overrides the MCTS visit gate when
+   its Q is within `AbOverrideQMargin` of the tree's best (`src/mcts.cpp`). The
+   default, `-2.0`, means *always play AB's move*: in the 2026-09-30 runs it beat
+   a 0.02 margin by 44-13-11, so MCTS now mainly supplies the second opinion,
+   the time it buys AB through pondering, and the move when AB has nothing.
+
+With `go depth` / `go infinite` (no time budget), or when `Threads` ≤
+`AbThreads`, the two run **sequentially** instead: MCTS first, then AB in a
+small slice of the budget.
 
 **Architecture**
 
-- **Value:** HalfKAv2 `45056 → 1024×2 → 512 → 128 → 1`, int16/int8 quantized
+- **Value:** HalfKAv2 `45056 → 2048×2 → 1024 → 256 → 1`, int16/int8 quantized
   (`src/nnue.cpp`), with incremental accumulator updates and AVX-512/AVX2/NEON
   SIMD inference (scalar fallback). The `.nnue` header carries
   `output_cp_per_unit`, the cp↔win-prob scale the net was trained at —
   **currently 300** (see the pipeline note below).
 - **Policy:** value-net priors near the root (above); optional Lc0 transformer
   via ONNX Runtime (`src/policy.cpp`) for the MLH "moves-left" head.
-- **Search:** MCTS with an AB verifier (`src/mcts.cpp`, `src/ab.cpp`,
+- **Search:** MCTS + parallel AB (`src/mcts.cpp`, `src/ab.cpp`,
   `src/search.cpp`); leaf evals are batched (`nnue::evaluate_batch`) and nodes
-  come from a per-thread pooled allocator; Syzygy tablebase probing at root and
-  interior (`src/syzygy.cpp`).
+  come from a pooled allocator capped by `MctsTreeMB`; Syzygy tablebase probing
+  at root and interior (`src/syzygy.cpp`). cp↔Q conversions use tanh / clamped
+  atanh, so a won position maps near ±1 instead of being squashed. Search
+  threads run on 16 MB stacks and AB recursion is capped at `kMaxSearchPly`
+  (the old 512 KB default stack overflowed mid-game and crashed the bot).
 - **Time mgmt:** MLH-divided budget in `cmd_go` (`src/uci.cpp`), enforced as a
   single absolute deadline across every search phase for both clock and
   movetime searches. The old ~120 ms per-move floor is gone (2026-07-08: the
@@ -51,27 +66,37 @@ All are runtime `setoption`s, so you can A/B them in a match without rebuilding.
 
 | Option | Default | What |
 |---|---|---|
-| `Threads` | 1 | MCTS worker threads |
-| `AbThreads` | 1 | alpha-beta verifier threads (0 disables) |
+| `Threads` | 4 | **Total** search threads (MCTS + AB) |
+| `AbThreads` | derived | AB (Lazy-SMP) threads, carved out of `Threads`. Defaults to `max(1, Threads/4)` until set explicitly; 0 disables AB |
 | `Hash` | 256 | AB transposition table (MB) |
 | `MctsHash` | 64 | MCTS position-value cache (MB) |
+| `MctsTreeMB` | 8192 | Cap on the MCTS node pool (MB). Without it one bot session grew to 48 GB. The bot uses 24576 |
 | `Cpuct` | 1.70 | PUCT exploration coefficient (higher = wider) |
 | `FpuOffset` | 0.20 | First-Play-Urgency discount on unvisited children |
 | `PolicyDepth` | 2 | plies from root that get NNUE-scored priors (`-1` = heuristics everywhere; cost grows ~35×/ply past 2) |
 | `SelectVisitFrac` | 0.60 | final root move is best-value among children with ≥ frac·max visits (1.0 = pure most-visited) |
 | `SelectQMargin` | 0.02 | Q margin below which selection prefers more visits |
+| `AbOverrideQMargin` | -2.0 | AB's root move replaces the tree's pick if `Q(ab) ≥ Q(best) − margin`. -2.0 = always, 0.0 = when strictly better, 2.0 = never |
+| `OverrideMargin` | 50 | cp gap at which `search.cpp` treats AB and MCTS as disagreeing (triggers the deeper cross-check / validation) |
 | `SyzygyPath` | — | Syzygy tablebase directory |
-| `EvalFile` / `PolicyFile` | — | NNUE / ONNX policy paths |
+| `EvalFile` | dev path | NNUE file. The compiled-in default is the developer's checkout, so always set it |
+| `PolicyFile` / `PolicyMode` | — / `nnue` | Optional Lc0 ONNX policy net (root info + MLH moves-left time management). `PolicyMode onnx` uses it for priors too (~1000× slower; A/B only) |
+| `UCI_Chess960` | false | Chess960 castling notation (king-takes-rook) |
+
+The production bot runs `Threads 8`, `AbThreads 2`, `MctsTreeMB 24576`, 5-man
+Syzygy, ponder on, PGO build.
 
 ## Repo layout
 
 | Path | What |
 |---|---|
-| `src/` | Engine (C++20): search, NNUE, policy, UCI, movegen, Syzygy |
-| `tests/` | Unit + smoke tests (`ctest`) |
+| `src/` | Engine (C++20): search, NNUE, policy, UCI, movegen, SEE, TT, Syzygy |
+| `tests/` | 14 unit + smoke tests (`ctest`), plus dev tools: `data_filter` (training-data quiet filter), `nnue_eval_server`, `tactic_trace_tool` |
 | `dev/scripts/` | Data, training, conversion, and **match/eval tooling** |
 | `dev/notebooks/` | `eclipse_wdl_train.ipynb` — the Kaggle training notebook |
-| `data/` | Nets (`eclipse.nnue`, `policy.onnx`), books, benchmark PGNs (nets are git-ignored; they ship via GitHub Releases) |
+| `data/` | Nets (`eclipse.nnue`, `eclipse_v*.nnue` candidates), books, benchmark PGNs (nets are git-ignored; they ship via GitHub Releases) |
+| `dev/sprt_runs/` | SPRT output, one directory per run (git-ignored) |
+| `scripts/` | User-facing: `pgo_build.sh`, `play_human.py` |
 | `extern/` | Vendored deps (e.g. Fathom for Syzygy) |
 | [`SETUP.md`](../SETUP.md) | Fresh-machine install → build → run |
 | [`KAGGLE.md`](KAGGLE.md) | End-to-end data + GPU training pipeline |
@@ -85,7 +110,8 @@ Build and test (see [`SETUP.md`](../SETUP.md) for first-time dependencies):
 ```bash
 cmake -S . -B build          # configure (Release by default, -march=native on)
 cmake --build build -j        # -> build/src/eclipse + build/tests/test_*
-ctest --test-dir build        # full unit + smoke suite (should be 100%)
+ECLIPSE_NNUE_PATH=$PWD/data/eclipse.nnue ECLIPSE_SYZYGY_PATH=$HOME/syzygy \
+  ctest --test-dir build      # 14 tests; the net/TB tests SKIP without those env vars
 ```
 
 For an assertions-on build (validates the incremental NNUE accumulator against a
@@ -128,26 +154,28 @@ on macOS with `sample <pid> 6 -mayDie`; watch `__psynch_mutexwait` /
 The loop for making the engine stronger, end to end:
 
 ```
-  data → train (Kaggle GPU) → fetch + pack → test → promote
-   │          │                    │           │        │
-extract   notebook            fetch_latest   run_match  copy winner
-lichess   eclipse_wdl_train   _net.sh        + analyze  to data/eclipse.nnue
-          .ipynb              (cp=300)        accuracy
+  data → train (Kaggle GPU) → fetch + pack → SPRT → release
+   │          │                    │            │        │
+extract   notebook /          fetch_latest   sprt_run  data/eclipse.nnue,
+dedup     fine-tune kernel    _net.sh or      .sh       bot config,
+filter                        convert (cp=300)          GitHub release
 ```
 
 ### 1. Data + training (Kaggle)
 
 Data engineering runs locally (network-bound), training runs on Kaggle's free
-T4s (compute-bound). Full details in [`KAGGLE.md`](KAGGLE.md); the notebook is
-`dev/notebooks/eclipse_wdl_train.ipynb`. Each chunk it trains is checkpointed to the
-Kaggle dataset `simbae11/eclipse-checkpoint` as `halfkav2.pt` +
-`resume_state.pt`.
+T4s (compute-bound). Full details in [`KAGGLE.md`](KAGGLE.md). Long runs use the
+notebook `dev/notebooks/eclipse_wdl_train.ipynb`, which checkpoints to a
+per-run Kaggle dataset (`CKPT_DATASET`, e.g. `simbae11/eclipse-checkpoint-quiet-v2`).
+Short fine-tunes (the current nets) run as small standalone Kaggle script
+kernels that save a `.pt` at each snapshot step.
 
 | Stage | Script |
 |---|---|
-| Extract Lichess positions | `dev/scripts/extract_lichess_wdl.py`, `dev/scripts/sample_lichess.py` |
-| (Optional) Stockfish labels | `dev/scripts/label_with_stockfish.py` |
-| Train HalfKAv2 | `dev/scripts/train_halfkav2.py` (mirrored in the notebook) |
+| Extract Stockfish-labelled positions from Lichess dumps | `dev/scripts/extract_lichess_evals.py` |
+| Quiet filter + endgame weighting | `build/tests/data_filter` (from `tests/data_filter.cpp`) |
+| Dedup + IID shuffle into HKAV2BIN chunks | `dev/scripts/dedup_and_chunk.py` |
+| Train HalfKAv2 | the notebook (`dev/scripts/train_halfkav2.py` is the older standalone copy) |
 | Pack to `.nnue` | `dev/scripts/convert_halfkav2_nnue.py` |
 
 ### 2. Fetch the latest checkpoint → `data/eclipse.nnue`
@@ -157,8 +185,12 @@ scale:
 
 ```bash
 export KAGGLE_API_KEY=KGAT_xxxxxxxx          # Bearer token, not stored in repo
-dev/scripts/fetch_latest_net.sh                  # -> data/eclipse.nnue (cp=300), verified
+dev/scripts/fetch_latest_net.sh --dataset simbae11/eclipse-checkpoint-quiet-v2
+#   -> data/eclipse.nnue (cp=300), verified
 ```
+
+For a fine-tune kernel, download its output (`kaggle kernels output <slug> -p out/`)
+and convert the snapshot you want with `convert_halfkav2_nnue.py from-torch`.
 
 It reports the checkpoint's epoch/chunk, converts `halfkav2.pt` with
 `--output-cp-per-unit 300`, and verifies the value landed in the file header.
@@ -176,59 +208,86 @@ It reports the checkpoint's epoch/chunk, converts `halfkav2.pt` with
 > *not* adapt — see "Switching the engine to a new architecture" in
 > `dev/KAGGLE.md`.
 
-### 3. Test the candidate vs the current net
+### 3. Test the candidate: SPRT
 
-Play the candidate against the incumbent. Use the imbalanced opening book so
-two near-equal nets produce decisive games instead of a draw-fest (fair because
-each opening is played with both colors via `-repeat`):
+Every net and every search change has to earn its place in an **SPRT**
+(sequential probability ratio test) self-play match. `dev/scripts/sprt_run.sh`
+wraps cutechess-cli and stops by itself once the result is decided
+(LLR ≥ +2.94 → H1, the candidate is stronger; LLR ≤ −2.94 → H0, it isn't).
+
+One-time setup: build cutechess-cli and put it on `PATH` (background jobs need
+the `export` in their own script), and fetch an imbalanced opening book so
+near-equal engines produce decisive games:
 
 ```bash
-# one-time: get the UHO book
 curl -sL -o /tmp/uho.zip \
   https://github.com/official-stockfish/books/raw/master/UHO_4060_v2.epd.zip
-unzip -o /tmp/uho.zip -d data/books/
+unzip -o /tmp/uho.zip -d data/books/      # sprt_run.sh finds it automatically
+```
 
+**A net:** pass the *same* binary twice and give each side its own net, so the
+code is held exactly constant:
+
+```bash
+dev/scripts/sprt_run.sh build/src/eclipse build/src/eclipse \
+    -t 60+0.6 -0 -5 -1 5 -c 4 -T 2 -A 1 -M 2048 \
+    -N option.EvalFile=data/eclipse_candidate.nnue \
+    -O option.EvalFile=data/eclipse.nnue \
+    -l cand_vs_cur
+```
+
+**A code change:** build the baseline into a second directory (or a worktree)
+and pass both binaries. `-T/-A` set MCTS/AB threads per engine; use `-T 2 -A 1`
+or more to run AB in parallel like the bot does, and budget `-c` as roughly
+cores ÷ threads-per-engine. `-s` runs a 4-game smoke test first, and
+`SPRT_DRYRUN=1` prints the cutechess command without running it.
+
+Things that have bitten us:
+
+- `-N`/`-O` overrides of a key that is also in the shared options used to be
+  silently overridden by cutechess's `-each`. That's fixed (the harness now
+  moves such keys out of `-each`), but check the run's header lines show the
+  per-side `EvalFile` you expect.
+- Bounds: `-0 0 -1 5` (default) asks "is it ≥5 Elo better"; `-0 -5 -1 5` is the
+  symmetric head-to-head used to pick between two candidates.
+- A run that hits the game cap without deciding is a tie. Between two
+  candidates that is still a choice: take the higher point estimate.
+- Offline metrics (val loss, MAE on held-out positions, ACPL on our own games)
+  have repeatedly disagreed with SPRT results. Use them to pick what to test,
+  never to decide.
+
+Output goes to `dev/sprt_runs/<timestamp>_<label>/` (`games.pgn`, `log.txt`).
+`python3 dev/scripts/sprt_status.py` prints one line per run with the current
+score, Elo and LLR.
+
+**Before a run, stop the Lichess bot if it's on the same machine** (it competes
+for cores). The bot's LaunchAgent is re-bootstrapped hourly by the training
+babysitter, so a full stop needs `launchctl bootout` **and** `launchctl
+disable`. A SIGINT or plain bootout forfeits the game in progress.
+
+#### Quick, unscored matches
+
+For eyeballing behaviour rather than deciding anything, `run_match.sh` plays a
+fixed number of games and the PGN readers summarise them:
+
+```bash
 dev/scripts/run_match.sh \
   --net1 data/eclipse_candidate.nnue --net2 data/eclipse.nnue \
-  --name1 cand --name2 cur \
-  --tc 5+3 --games 40 \
-  --book data/books/UHO_4060_v2.epd \
-  --pgn /tmp/cand_vs_cur.pgn
+  --name1 cand --name2 cur --tc 5+3 --games 40 \
+  --book data/books/UHO_4060_v2.epd --pgn /tmp/cand_vs_cur.pgn
+python3 dev/scripts/match_score.py /tmp/cand_vs_cur.pgn    # running W/D/L
+python3 dev/scripts/match_depth.py /tmp/cand_vs_cur.pgn    # depth + time/move per net
 ```
-
-Watch and analyze (all read the live PGN safely — cutechess only appends a game
-once it finishes):
-
-```bash
-python3 dev/scripts/match_score.py /tmp/cand_vs_cur.pgn          # results + running score
-python3 dev/scripts/match_depth.py /tmp/cand_vs_cur.pgn          # depth + time/move per net
-python3 dev/scripts/analyze_accuracy.py /tmp/cand_vs_cur.pgn \   # SF accuracy + ACPL (cached)
-    --stockfish "$(which stockfish)" --depth 15
-```
-
-`analyze_accuracy.py` caches per game (keyed by PGN path + game + depth), so
-re-running on a growing match only evaluates new games. For ponderhits / nps,
-launch with `dev/scripts/run_match.sh --debug ...` and read the log:
-
-```bash
-dev/scripts/ponderhit_stats.sh /tmp/cand_vs_cur_debug.log
-```
-
-> **Reading the numbers.** Accuracy% saturates near the top and is a poor
-> discriminator between two strong, similar nets — and it's inflated by a
-> shallow SF reference and drawish balanced games. Trust the **match score**
-> for the verdict and **ACPL** as the finer signal; small accuracy gaps are
-> noise. The opening book is what makes a small-N match conclusive.
 
 ### 4. Promote the winner
 
-If the candidate is clearly stronger, make it the engine's net:
+Copy the net into place, point the bot's `EvalFile` at it
+(`~/lichess-bot/config-eclipse.yml`), and ship it as a release asset per
+[`RELEASE_CHECKLIST.md`](RELEASE_CHECKLIST.md):
 
 ```bash
 cp data/eclipse_candidate.nnue data/eclipse.nnue
 ```
-
-(`data/eclipse.nnue` is what UCI `EvalFile` and the test suite default to.)
 
 ---
 
@@ -236,7 +295,9 @@ cp data/eclipse_candidate.nnue data/eclipse.nnue
 
 | Script | Purpose |
 |---|---|
-| `dev/scripts/run_match.sh` | cutechess launcher; `--book` for imbalanced openings, `--debug`, `--dry-run` |
+| `dev/scripts/sprt_run.sh` | SPRT self-play harness (the deciding test); `-N`/`-O` per-side options, `-s` smoke |
+| `dev/scripts/sprt_status.py` | One-screen progress of every run under `dev/sprt_runs/` |
+| `dev/scripts/run_match.sh` | cutechess launcher for fixed-length matches; `--book`, `--debug`, `--dry-run` |
 | `dev/scripts/match_score.py` | Per-game results + running W/D/L score from a PGN |
 | `dev/scripts/match_depth.py` | Per-net avg/max depth and time-per-move from PGN comments |
 | `dev/scripts/analyze_accuracy.py` | Stockfish accuracy% + ACPL per game (cached; `--no-cache`) |

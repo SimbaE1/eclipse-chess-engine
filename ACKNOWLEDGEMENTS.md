@@ -13,11 +13,14 @@ ours, not theirs.
   **HalfKAv2** feature set Eclipse's evaluation net is built on, and for the
   practical conventions we follow (king-relative perspective-doubled features,
   the 127/16 quantization scales, Stockfish-style LMR, make/unmake with a
-  state-info stack). Eclipse's training labels are Stockfish depth-22
-  evaluations.
-- **The Leela Chess Zero (Lc0) team** — Eclipse's move-policy priors come from
-  an Lc0 transformer policy net, and its time management uses that net's
-  **moves-left head (MLH)** to estimate how much game is left.
+  state-info stack), and for the quiet-position filtering of training data.
+  Eclipse's training labels are Stockfish depth-22 evaluations.
+- **The Leela Chess Zero (Lc0) team** — Eclipse can load an Lc0 transformer
+  policy net (the optional `PolicyFile`), whose **moves-left head (MLH)** then
+  informs time management. Eclipse's early move-policy priors came from that
+  net.
+- **The Stockfish team, again** — Eclipse's alpha-beta search follows
+  Stockfish's techniques: Lazy SMP, SEE, LMR and continuation history.
 - **Ronald de Man** — for **Syzygy** endgame tablebases, which give Eclipse
   perfect play once the board is small enough.
 
@@ -40,7 +43,9 @@ ours, not theirs.
 - **python-chess** (Niklas Fiekas) — board logic, PGN parsing, and SVG board
   rendering, used in the training data tooling and the README game card.
 - **PyTorch** & **NumPy** — neural-network training.
-- **ONNX Runtime** — inference for the Lc0 policy/MLH net at runtime.
+- **ONNX Runtime** — inference for the optional Lc0 policy/MLH net.
+- **cutechess-cli** — the match runner behind Eclipse's SPRT testing.
+- **Stockfish's opening books** (UHO) — the imbalanced openings used in testing.
 - **lichess-bot** ([lichess-bot-devs](https://github.com/lichess-bot-devs/lichess-bot))
   — the bridge that runs Eclipse as a Lichess bot.
 - **CMake** & the **GCC/Clang** toolchains — build, LTO, and PGO.

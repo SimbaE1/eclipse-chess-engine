@@ -2,24 +2,26 @@
 
 > ## ⚠️ Superseded — do not follow this to launch a run
 >
-> This documents the **net2widernet** run that produced the currently deployed
-> `2048x2 -> 1024 -> 256 -> 1` net, and it is kept only as a record of that
-> lineage and of the Kaggle mechanics that were verified the hard way (§1, §4
-> and §6 are still accurate about Kaggle itself).
+> This documents the **net2widernet** run that produced the
+> `2048x2 -> 1024 -> 256 -> 1` shape every shipped net still uses, and it is kept
+> only as a record of that lineage and of the Kaggle mechanics that were
+> verified the hard way (§1, §4 and §6 are still accurate about Kaggle itself).
 >
 > The widen turned out to be a mistake worth naming: it is *function-preserving*,
 > so it bought a ~4× slower copy of exactly the same evaluation function
 > (36.5 µs per `nnue::evaluate()`, against 0.2–0.5 µs for comparable engines,
-> with the feature-transformer output only ~1.2% nonzero). The current plan
-> retrains **from scratch** at the Stockfish-modern shape
-> `45056 -> 1024x2 -> 16 -> 32 -> 1`, and the `NET2WIDER` code has been removed
-> from the notebook. **Use `dev/KAGGLE.md` for the live procedure.**
+> with the feature-transformer output only ~1.2% nonzero). Since then the wide
+> lineage has gained its strength from warm-restart fine-tunes (ep2c44, then
+> `eclipse_v10_mix20` in v1.2.0); a from-scratch `1024x2 -> 16 -> 32` run exists
+> but is untested. The `NET2WIDER` code has been removed from the notebook.
+> **Use `dev/KAGGLE.md` for the live procedure.**
 >
 > Two things below are stale everywhere they appear: the notebook Secret is now
 > named **`KAGGLE_API_KEY`** (`KAGGLE_API_TOKEN` is still accepted as a
-> fallback), and the checkpoint dataset for the retrain is
-> `simbae11/eclipse-checkpoint-sf16` — `simbae11/eclipse-checkpoint` holds the
-> deployed wide net and must not be overwritten.
+> fallback; CLI-pushed kernels can't read it at all), and each run now has its
+> own checkpoint dataset (latest `simbae11/eclipse-checkpoint-quiet-v2`) —
+> `simbae11/eclipse-checkpoint` holds the original wide net and must not be
+> overwritten.
 
 The exact, verified procedure to push the datasets + notebook to Kaggle and
 kick off the **net2widernet** training run (function-preserving 2× widen of the

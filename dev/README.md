@@ -6,9 +6,11 @@ and [`SETUP.md`](../SETUP.md).
 
 | Path | What |
 |---|---|
-| [`DEVELOPMENT.md`](DEVELOPMENT.md) | Engine internals, the build/test loop, search tunables, source map |
-| [`KAGGLE.md`](KAGGLE.md) | End-to-end NNUE training pipeline (data → GPU → `.nnue`) |
-| [`net2widernet.md`](net2widernet.md) | Runbook: launch the 2× net-widen training run on Kaggle |
-| [`RELEASE_CHECKLIST.md`](RELEASE_CHECKLIST.md) | Criteria-gated v1.0 release checklist |
-| `scripts/` | Training, data extraction, net conversion, and match/evaluation tooling |
-| `notebooks/` | The Kaggle training notebook |
+| [`DEVELOPMENT.md`](DEVELOPMENT.md) | How the search works, UCI tunables, build/test loop, SPRT testing, source map |
+| [`KAGGLE.md`](KAGGLE.md) | NNUE training pipeline (data → filter → GPU → `.nnue`) and what the fine-tune sweeps showed |
+| [`RELEASE_CHECKLIST.md`](RELEASE_CHECKLIST.md) | SPRT → version bump → tag → GitHub release → bot deploy |
+| [`net2widernet.md`](net2widernet.md) | *Historical:* the 2× net-widen run (its Kaggle mechanics are still accurate) |
+| [`PRODUCTION_TESTING.md`](PRODUCTION_TESTING.md) | *Historical:* July 2026 handoff for the AB-bundle SPRT |
+| `scripts/` | Data extraction, chunking, net conversion, SPRT harness, match/evaluation tooling, training babysitter |
+| `notebooks/` | The Kaggle training notebook (long runs) |
+| `sprt_runs/` | SPRT output, one directory per run (git-ignored) |

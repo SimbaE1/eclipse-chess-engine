@@ -1,5 +1,11 @@
 # Production SPRT handoff — AB improvements bundle (2026-07-08)
 
+> **Historical.** A one-off handoff from July 2026, kept for the record of how
+> the AB bundle (`6e79c7b`) was tested. Some details are out of date: the
+> book is now found automatically, `-M` (MctsTreeMB) exists, and AB's move now
+> always overrides at the root (`AbOverrideQMargin -2.0`). For running an SPRT
+> today, use "Test the candidate: SPRT" in [`DEVELOPMENT.md`](DEVELOPMENT.md).
+
 Instructions for the Claude instance (or human) on the production machine to
 run the long time-control SPRT that decides whether main's alpha-beta
 improvements bundle stays or gets split up. Written by the dev-machine session

@@ -11,11 +11,13 @@ Lichess bot.
 
 > **▶ Play it right now on Lichess: [@EclipseBOT](https://lichess.org/@/EclipseBOT)**
 > — challenge it to a rated or casual game.
-> *(Runs 8 threads on an iMac Pro, 5-piece Syzygy, ponder + PGO.)*
+> *(Runs 8 threads — 6 MCTS + 2 alpha-beta — on an iMac Pro, 5-piece Syzygy, ponder + PGO.)*
 
-> **Status:** v1.0.0 — The first complete version of Eclipse without any of the ponder hangs, etc, that plays at ~2100-2200 elo. UCI, multi-threaded
-> search, pondering, and Syzygy tablebases all work. Strength is still climbing as
-> the network improves.
+> **Status:** v1.2.0. Rated about 2200–2300 on Lichess (rapid ~2300, classical
+> ~2250, blitz ~2170 as of November 2026). UCI, multi-threaded search, pondering,
+> Syzygy tablebases and Chess960 all work. Strength is still climbing as the
+> network improves; see the [releases](https://github.com/SimbaE1/eclipse-chess-engine/releases)
+> for what changed in each version.
 
 ---
 
@@ -37,7 +39,7 @@ Lichess bot.
 |---|---|
 | **NNUE value net** | HalfKAv2 architecture (`45056 → 2048×2 → 1024 → 256 → 1`), int8/int16 quantized with an incremental accumulator and AVX-512 / AVX2 / NEON SIMD. This is Eclipse's "judgement." |
 | **MCTS search** | Multi-threaded PUCT tree search explores the most promising lines — the source of its human-like, plan-oriented play. |
-| **Alpha-beta verifier** | A classical tactical search runs alongside MCTS; when it spots a tactic the tree missed, it corrects the move choice. Neural intuition, tactical safety net. |
+| **Alpha-beta search** | A classical Lazy-SMP alpha-beta search (with SEE, qsearch, LMR and a shared transposition table) runs alongside MCTS on its own threads. When it finds a better root move than the tree, Eclipse plays the alpha-beta move. Neural intuition, tactical safety net. |
 | **Syzygy tablebases** | Optional; when the board is small enough, Eclipse plays endgames perfectly. |
 
 ---
@@ -45,7 +47,7 @@ Lichess bot.
 ## Quick start
 
 You'll build Eclipse from source (it's small and fast to build) and download the
-neural net separately. Full step-by-step — including a clean Linux setup and
+neural net (~190 MB) separately. Full step-by-step — including a clean Linux setup and
 troubleshooting — is in **[SETUP.md](SETUP.md)**.
 
 ```bash
@@ -62,8 +64,8 @@ cmake --build build -j
 # -> build/src/eclipse
 
 # 4. download the neural net into data/
-gh release download v1.0.0 --pattern '*.nnue' -D data/
-mv data/eclipse_*.nnue data/eclipse.nnue
+gh release download v1.2.0 --pattern '*.nnue' -D data/
+mv data/eclipse_v10_mix20.nnue data/eclipse.nnue
 ```
 
 No `gh`? Grab the `.nnue` from the [releases page](https://github.com/SimbaE1/eclipse-chess-engine/releases/latest)
@@ -80,8 +82,9 @@ Eclipse is a standard UCI engine, so it drops into **Cute Chess**, **Arena**,
 binary, then set its options:
 
 - **Command:** `…/eclipse-chess-engine/build/src/eclipse`
-- `EvalFile` → `…/eclipse-chess-engine/data/eclipse.nnue` *(required)*
-- `Threads` → number of CPU cores to use (e.g. `4`)
+- `EvalFile` → `…/eclipse-chess-engine/data/eclipse.nnue` *(required: always
+  set it, the built-in default path only exists on the developer's machine)*
+- `Threads` → total CPU threads to use (e.g. `8`)
 - `Hash` → transposition memory in MB (e.g. `256`)
 - `SyzygyPath` → your tablebase folder *(optional, for perfect endgames)*
 
@@ -121,13 +124,15 @@ The settings you'll actually touch as a player:
 | Option | Default | What it does |
 |---|---|---|
 | `EvalFile` | — | Path to the `.nnue` net **(required)** |
-| `Threads` | 1 | CPU cores for search — set to your core count |
-| `Hash` | 256 | Search memory (MB) |
+| `Threads` | 4 | **Total** search threads. About one in four goes to alpha-beta (`AbThreads`), the rest to MCTS. Set to your core count. |
+| `Hash` | 256 | Alpha-beta transposition table (MB) |
+| `MctsTreeMB` | 8192 | Upper bound on the MCTS tree's memory (MB). Lower it on a small machine. |
 | `SyzygyPath` | — | Folder of Syzygy tablebases for perfect endgames |
 | `Ponder` | on | Let it think on your time (the GUI manages this) |
+| `UCI_Chess960` | off | Fischer Random; most GUIs set this for you |
 
-There are additional search-tuning knobs (`Cpuct`, `PolicyDepth`, …) for the
-curious — see [`dev/DEVELOPMENT.md`](dev/DEVELOPMENT.md).
+There are additional search-tuning knobs (`AbThreads`, `Cpuct`, `PolicyDepth`,
+`AbOverrideQMargin`, …) for the curious — see [`dev/DEVELOPMENT.md`](dev/DEVELOPMENT.md).
 
 ---
 
@@ -152,6 +157,7 @@ engine, retrain the network, or run strength tests, everything lives under
 
 - [`dev/DEVELOPMENT.md`](dev/DEVELOPMENT.md) — engine internals, the build/test loop, search tunables
 - [`dev/KAGGLE.md`](dev/KAGGLE.md) — the NNUE training pipeline (data → GPU → `.nnue`)
+- [`dev/RELEASE_CHECKLIST.md`](dev/RELEASE_CHECKLIST.md) — how a version gets tested and shipped
 - `dev/scripts/` — training, data, conversion, and match/evaluation tooling
 - `dev/notebooks/` — the training notebook
 

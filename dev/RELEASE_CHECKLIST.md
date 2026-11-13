@@ -1,47 +1,50 @@
-# Eclipse v1.0 Release Checklist
+# Eclipse release checklist
 
-V1 is **criteria-gated, not date-gated.** Ship when every box below is green —
-a public announcement is a one-shot first impression, so don't rush it.
+How a version gets from "this looks stronger" to a tagged GitHub release. v1.0.0
+(June 2026) shipped against a one-off, criteria-gated checklist (no time
+forfeits over 50+ live games, a settled rating, a validated net). Everything
+since has followed the routine below.
 
-## 1. Time management — proven stable in live play
-The won-game time-flag has regressed 3× (see memory `project_time_flag_regression`);
-the latest fixes (validation-MCTS bound `e29a44e`, AB-verifier ponder-awareness
-`cf8c660`) are verified synthetically but the original failure could not be
-reproduced offline. Trust only after real mileage.
+## 1. It has to win on the board
 
-- [ ] **Zero time-forfeits across ≥50 live games / several days** of continuous play.
-- [ ] Spot-check a won, long-pondered endgame game: bestmove always arrives before the flag.
-- [ ] If it flags even once: stop, capture the engine's own stderr (`info string`
-      lines lichess-bot swallows) during the flag, and diagnose before continuing.
+- [ ] **SPRT against the current release** passes H1, or, when choosing between
+      two candidates, a symmetric `-0 -5 -1 5` run picks the one with the higher
+      point estimate. See "Test the candidate: SPRT" in
+      [`DEVELOPMENT.md`](DEVELOPMENT.md). Val loss, MAE and ACPL don't count.
+- [ ] Record each result (W-L-D, Elo ± error, LLR, game count, TC) for the
+      release notes.
+- [ ] Zero time forfeits in the SPRT PGNs. A loss on time is a timing bug, not
+      a chess result.
+- [ ] If the net changed, it was tested **against the net the bot actually
+      runs**, not only against another candidate. If it wasn't, say so in the
+      notes.
 
-## 2. net2widernet — validated *stronger*, not just bigger
-A function-preserving 2× widen starts equal to ep2c9 and should improve with
-training, but an undertrained/mis-tuned wide net can land neutral or worse.
-"Bigger" is a hypothesis until the games say otherwise.
+## 2. Build and test
 
-- [ ] Wide net trained to convergence (val loss plateaued), checkpoint exported.
-- [ ] Head-to-head vs current ep2c9 net shows a **clear, significant Elo gain**
-      (SPRT pass, or a few hundred games with non-overlapping error bars).
-- [ ] Engine C++ side updated for the wider net (`kFtOutSize` in `src/nnue.hpp`,
-      accumulator width + SIMD ladders in `src/nnue.cpp`/`src/accumulator.hpp`,
-      `dev/scripts/convert_halfkav2_nnue.py`) — and it loads + benches correctly.
-- [ ] Deployed net tagged/published so the README download link is reproducible.
+- [ ] `ECLIPSE_NNUE_PATH=$PWD/data/eclipse.nnue ECLIPSE_SYZYGY_PATH=$HOME/syzygy ctest --test-dir build`:
+      14/14 pass, with the net and tablebase tests actually running, not skipped.
+- [ ] `./scripts/pgo_build.sh` produces the deploy binary from a clean checkout.
+- [ ] `bench` prints the expected `NNUE loaded: … (HalfKAv2-<shape>, output_cp/unit=300)`.
 
-## 3. Rating settled
-- [ ] Live rating has plateaued (low RD, stable over the last ~20 games) after
-      recovering from the pre-fix flag-loss suppression.
-- [ ] Announcement can state an honest strength figure backed by that rating.
+## 3. Version bump (one commit: `chore: bump version to X.Y.Z`)
 
-## 4. Release hygiene
-- [ ] Bump version `0.0.1` → `1.0.0` in **`src/uci.cpp` (`kEngineVersion`)** and
-      **`CMakeLists.txt` (`project(... VERSION ...)`)**.
-- [ ] `git tag v1.0.0` + push the tag; cut a GitHub release with notes.
-- [ ] README accurate end-to-end: build steps, **net download link**, Syzygy setup,
-      feature list, UCI options. Run the documented setup clean to confirm.
-- [ ] `scripts/pgo_build.sh` produces the deploy binary from a clean checkout; 9/9 ctest pass.
-- [ ] Bot survives sustained load: 100-games/day cap, matchmaking loop, no hangs/crashes.
+- [ ] `src/uci.cpp`: `kEngineVersion`
+- [ ] `CMakeLists.txt`: `project(... VERSION X.Y.Z)`
+- [ ] `README.md` + `SETUP.md`: the `gh release download vX.Y.Z` lines, the
+      net's file name, the status line and the strength figure.
 
-## 5. Announcement (only after 1–4 are green)
-- [ ] Bot profile/bio describes it (open-source NNUE + MCTS + AB verifier + Syzygy).
-- [ ] Post where it fits: lichess forum / r/chess / r/ComputerChess — link the repo + release.
-- [ ] Be upfront about strength and that it's open source; invite challenges.
+## 4. Tag and publish
+
+- [ ] `git tag vX.Y.Z && git push origin main vX.Y.Z`
+- [ ] `gh release create vX.Y.Z data/<net>.nnue --title "Eclipse vX.Y.Z: …" --notes-file …`
+      Notes: what the net is (lineage, data, steps, lr), an SPRT results table,
+      search changes with the option names and defaults that changed.
+- [ ] Download the asset from the release and `bench` it once, to check the
+      uploaded file is the one you tested.
+
+## 5. Deploy to the bot
+
+- [ ] Point `EvalFile` in the lichess-bot config at the new net; rebuild the PGO binary.
+- [ ] Stop the bot between games, not mid-game (SIGINT forfeits the game in
+      progress), and restart it.
+- [ ] Watch the first few games for crashes, hangs and time forfeits.

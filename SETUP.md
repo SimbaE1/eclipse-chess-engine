@@ -11,8 +11,10 @@ plus optional tablebases. Budget ~5 minutes.
 
 ## 1. Install dependencies
 
-Eclipse needs **CMake** (build system), a **C++20 compiler**, and **ONNX
-Runtime** (used by the search; required to build).
+Eclipse needs **CMake ≥ 3.20** (build system), a **C++20 compiler**, and **ONNX
+Runtime**. ONNX Runtime only runs the optional Lc0 policy net (`PolicyFile`),
+which normal play doesn't use, but the engine links against it, so it's required
+to build.
 
 ### macOS (Homebrew)
 
@@ -79,14 +81,19 @@ The build is Release with `-march=native` (tuned for your CPU) by default.
 
 ## 4. Get the neural network
 
-The trained NNUE weights ship as a **GitHub Release** asset (~90 MB, too big for
-the repo). The engine looks for it at `data/eclipse.nnue` by default.
+The trained NNUE weights ship as a **GitHub Release** asset (~190 MB, too big for
+the repo). The current net is `eclipse_v10_mix20.nnue` from **v1.2.0**. Save it as
+`data/eclipse.nnue` and point the `EvalFile` option at it.
+
+> **Always set `EvalFile`.** The engine's built-in default path is the
+> developer's own checkout, so on any other machine it starts with no net until
+> you set the option. Every GUI and the commands below do this explicitly.
 
 With the [GitHub CLI](https://cli.github.com/):
 
 ```bash
-gh release download v0.9.0 --pattern '*.nnue' -D data/
-mv data/eclipse_*.nnue data/eclipse.nnue
+gh release download v1.2.0 --pattern '*.nnue' -D data/
+mv data/eclipse_v10_mix20.nnue data/eclipse.nnue
 ```
 
 Without `gh`, download the latest `.nnue` from the
@@ -121,7 +128,8 @@ for dir in 3-4-5-wdl 3-4-5-dtz; do
 done
 ```
 
-Then run Eclipse with `SyzygyPath` set to `~/syzygy`.
+Then run Eclipse with `SyzygyPath` set to the full path of that folder (e.g.
+`/home/you/syzygy`; UCI options don't expand `~`).
 
 ---
 
@@ -133,11 +141,14 @@ Quick sanity check — load the net and run the built-in benchmark:
 printf 'setoption name EvalFile value data/eclipse.nnue\nsetoption name Threads value 4\nisready\nbench\nquit\n' | ./build/src/eclipse
 ```
 
-You should see a `NNUE loaded:` line and a `Benchmark: … nodes … nps` summary. If
-you'd rather run the test suite:
+You should see a `NNUE loaded: … (HalfKAv2-2048x2-1024-256, output_cp/unit=300)`
+line and a `Benchmark: … nodes … nps` summary. If you'd rather run the test suite
+(14 tests). The net and tablebase tests skip themselves unless you point them at
+the files:
 
 ```bash
-ctest --test-dir build
+ECLIPSE_NNUE_PATH=$PWD/data/eclipse.nnue ECLIPSE_SYZYGY_PATH=$HOME/syzygy \
+  ctest --test-dir build
 ```
 
 ---
@@ -160,7 +171,9 @@ The fastest way to try it: load it into a UCI GUI (Cute Chess, Arena, …) with
 | `Could not locate onnxruntime` | `brew install onnxruntime` (macOS), or pass `-DONNXRUNTIME_ROOT=/path/to/onnxruntime` (Linux). |
 | Build errors mentioning `extern/fathom` / `tbprobe` | The submodule wasn't fetched — run `git submodule update --init --recursive`. |
 | `failed to load NNUE` / version mismatch | The `.nnue` is for a different build, or got truncated. Re-download the net for your release and rebuild the engine. |
-| Engine runs but plays instantly / weakly | `EvalFile` isn't set or points at a missing file — confirm `data/eclipse.nnue` exists and the path is correct. |
+| Engine runs but plays instantly / weakly | `EvalFile` isn't set or points at a missing file — confirm `data/eclipse.nnue` exists and set `EvalFile` to its full path. |
+| Memory use climbs into many GB on long thinks | That's the MCTS tree. Cap it with `MctsTreeMB` (default 8192). |
+| Build is slow or the binary crashes on another machine | The default build uses `-march=native`. To build a portable binary, configure with `-DECLIPSE_NATIVE_ARCH=OFF`. |
 
 ---
 
